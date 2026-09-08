@@ -1,17 +1,25 @@
+////////////// macros
+
 #define _sa0(n)                 register long rax asm("rax") = (long)(n);
 #define _sa1(n,a)               \
-    _sa0(n)                     register long rdi asm("rdi") = (long)(a);
+        _sa0(n)                 register long rdi asm("rdi") = (long)(a);
 #define _sa2(n,a,b)             \
-    _sa1(n,a)                   register long rsi asm("rsi") = (long)(b);
+        _sa1(n,a)               register long rsi asm("rsi") = (long)(b);
 #define _sa3(n,a,b,c)           \
-    _sa2(n,a,b)                 register long rdx asm("rdx") = (long)(c);
+        _sa2(n,a,b)             register long rdx asm("rdx") = (long)(c);
+#define _sa4(n,a,b,c,d)         \
+        _sa3(n,a,b,c)           register long r10 asm("r10") = (long)(d);
+#define _sa5(n,a,b,c,d,e)       \
+        _sa4(n,a,b,c,d)         register long r8  asm("r8")  = (long)(e);
+#define _sa6(n,a,b,c,d,e,f)     \
+        _sa5(n,a,b,c,d,e)       register long r9  asm("r9")  = (long)(f);
 
 #define _syscall0(n) _sa0(n)                                           \
     asm volatile( "syscall" : "+r"(rax)                                \
         :: "rcx", "r11", "memory" );                                   \
     return rax;
 
-#define _syscall1(n,a,b) _sa1(n,a)                                     \
+#define _syscall1(n,a) _sa1(n,a)                                       \
     asm volatile( "syscall" : "+r"(rax)                                \
         : "r"(rdi)                                                     \
         : "rcx", "r11", "memory" );                                    \
@@ -29,180 +37,103 @@
         : "rcx", "r11", "memory" );                                    \
     return rax;
 
-#define __NR_read             0
-#define __NR_write            1
-#define __NR_open             2
-#define __NR_close            3
-#define __NR_nanosleep       35
-#define __NR_getpid          39
-#define __NR_exit            60
-#define __NR_clock_gettime  228
-#define __NR_getrandom      318
-
-typedef long         ptr_t;
-
-static inline long read(int fd, void *buf, long count) {
-    register long rax asm("rax") = __NR_read;
-    register long rdi asm("rdi") = (long)fd;
-    register long rsi asm("rsi") = (long)buf;
-    register long rdx asm("rdx") = count;
-
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi), "r"(rdx)
-        : "rcx", "r11", "memory"
-    );
-
+#define _syscall4(n,a,b,c,d) _sa4(n,a,b,c,d)                           \
+    asm volatile( "syscall" : "+r"(rax)                                \
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10)                       \
+        : "rcx", "r11", "memory" );                                    \
     return rax;
+
+#define _syscall5(n,a,b,c,d,e) _sa5(n,a,b,c,d,e)                       \
+    asm volatile( "syscall" : "+r"(rax)                                \
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8)              \
+        : "rcx", "r11", "memory" );                                    \
+    return rax;
+
+#define _syscall6(n,a,b,c,d,e,f) _sa6(n,a,b,c,d,e,f)                   \
+    asm volatile( "syscall" : "+r"(rax)                                \
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)     \
+        : "rcx", "r11", "memory" );                                    \
+    return rax;
+
+////////////// syscalls
+
+static inline void exit(int code) {
+    _sa1(60, code);
+    asm volatile( "syscall" :: "r"(rax), "r"(rdi) : "memory" );
+    __builtin_unreachable();
 }
 
-static inline long write(int fd, const void *buf, long count) {
-    register long rax asm("rax") = __NR_write;
-    register long rdi asm("rdi") = (long)fd;
-    register long rsi asm("rsi") = (long)buf;
-    register long rdx asm("rdx") = count;
+static inline long read(int fd, void *buf, size_t count)
+    { _syscall3(0, fd, buf, count); }
 
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi), "r"(rdx)
-        : "rcx", "r11", "memory"
-    );
+static inline long write(int fd, const void *buf, size_t count)
+    { _syscall3(1, fd, buf, count); }
 
-    return rax;
-}
+static inline long open(const char *pathname, int flags, int mode)
+    { _syscall3(2, pathname, flags, mode); }
 
-static inline long open(const char *pathname, long flags, long mode) {
-    register long rax asm("rax") = __NR_open;
-    register long rdi asm("rdi") = (long)pathname;
-    register long rsi asm("rsi") = flags;
-    register long rdx asm("rdx") = mode;
+static inline long close(int fd)
+    { _syscall1(3, fd); }
 
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi), "r"(rdx)
-        : "rcx", "r11", "memory"
-    );
+static inline long poll(struct pollfd *fds, unsigned long nfds, int timeout)
+    { _syscall3(7, fds, nfds, timeout); }
 
-    return rax;
-}
+static inline long rt_sigaction(int sig, const struct sigaction *act,
+                                struct sigaction *oact, size_t sigsetsize)
+    { _syscall4(13, sig, act, oact, sigsetsize); }
 
-static inline long close(int fd) {
-    register long rax asm("rax") = __NR_close;
-    register long rdi asm("rdi") = (long)fd;
+static inline int ioctl(int fd, unsigned long request, void *arg)
+    { _syscall3(16, fd, request, arg); }
 
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi)
-        : "rcx", "r11", "memory"
-    );
+static inline long dup2(int oldfd, int newfd)
+    { _syscall2(33, oldfd, newfd); }
 
-    return rax;
-}
+static inline pid_t setsid(void)
+    { _syscall0(112); }
+
+static inline long nanosleep(const struct timespec *request,
+                             struct timespec *remain)
+    { _syscall2(35, request, remain); }
+
+static inline long getpid(void)
+    { _syscall0(39); }
+
+static inline long socket(int domain, int type, int protocol)
+    { _syscall3(41, domain, type, protocol); }
+
+static inline long connect(int sockfd,
+                           const struct sockaddr *addr, int addrlen)
+    { _syscall3(42, sockfd, addr, addrlen); }
+
+static inline long sendto(int sockfd,
+                          const void *buf, size_t len, int flags,
+                          const struct sockaddr *dest_addr, int addrlen)
+    { _syscall6(44, sockfd, buf, len, flags, dest_addr, addrlen); }
+
+static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
+                            struct sockaddr *src_addr, int *addrlen)
+    { _syscall6(45, sockfd, buf, len, flags, src_addr, addrlen); }
+
+/* recv does not exist as separate syscall here; express via recvfrom */
+#define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
 static inline long execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(59, pathname, argv, envp); }
 
-static inline void exit(int code)
-{
-    register long rax asm("rax") = __NR_exit;
-    register long rdi asm("rdi") = code;
+static inline long getcwd(char *buf, size_t size)
+    { _syscall2(79, buf, size); }
 
-    asm volatile(
-        "syscall"
-        :
-        : "r"(rax), "r"(rdi)
-        : "memory"
-    );
-    __builtin_unreachable();
-}
+static inline long clock_gettime(clockid_t clk_id, struct timespec *ts)
+    { _syscall2(228, clk_id, ts); }
 
-pid_t setsid(void)
-    { _syscall0(112); }
-
-/*
-struct timespec {
-    long tv_sec;   // seconds
-    long tv_nsec;  // nanoseconds
-}; */
-
-static inline long clock_gettime(clockid_t clk_id, struct timespec *ts) {
-    register long rax asm("rax") = __NR_clock_gettime;
-    register long rdi asm("rdi") = (long)clk_id;
-    register long rsi asm("rsi") = (long)ts;
-
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi)
-        : "rcx", "r11", "memory"
-    );
-
-    return rax;
-}
-
-static inline int ioctl(int fd, unsigned long request, void *arg)
-    { _syscall3(16, fd, request, arg); }
-
-static inline int dup2(int oldfd, int newfd)
-    { _syscall2(33, oldfd, newfd); }
-
-static inline long nanosleep(const struct timespec *request,
-                                   struct timespec *remain) {
-    register long rax asm("rax") = __NR_nanosleep;
-    register long rdi asm("rdi") = (long)request;
-    register long rsi asm("rsi") = (long)remain;
-
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi)
-        : "rcx", "r11", "memory"
-    );
-
-    return rax;
-}
-
-static inline long getpid(void) {
-    register long rax asm("rax") = __NR_getpid;
-
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        :
-        : "rcx", "r11"
-    );
-    return rax;
-}
-
-static inline long getrandom(void *buf,
-                             size_t buflen,
-                             unsigned int flags) {
-    register long rax asm("rax") = __NR_getrandom;
-    register long rdi asm("rdi") = (long)buf;
-    register long rsi asm("rsi") = (long)buflen;
-    register long rdx asm("rdx") = (long)flags;
-
-    asm volatile(
-        "syscall"
-        : "+r"(rax)
-        : "r"(rdi), "r"(rsi), "r"(rdx)
-        : "rcx", "r11", "memory"
-    );
-
-    return rax;
-}
+static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
+    { _syscall3(318, buf, buflen, flags); }
 
 #ifdef EXPORT__START
 // prototype for main
 __attribute__((noreturn)) static void main(int argc, char **argv);
 
-// following are alternative implementations of _start
-// first
 __attribute__((naked)) __attribute__((noreturn)) void _start(void) {
     // argc/argv retrieval from stack
     long *rsp;
@@ -210,59 +141,5 @@ __attribute__((naked)) __attribute__((noreturn)) void _start(void) {
     long argc = rsp[0];
     char ** argv = (char **)(rsp + 1);
     main(argc, argv);
-}
-#endif
-
-//second
-#if 0
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    long argc;
-    char **argv;
-
-    __asm__ volatile (
-        "movq (%%rsp), %0\n\t"
-        "lea 8(%%rsp), %1\n\t"
-        : "=r" (argc), "=r" (argv)
-        :
-        : "memory"
-    );
-    main(argc, argv);
-}
-#endif
-
-//third
-#if 0
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    long argc;
-    char **argv;
-
-    asm volatile (
-        "popq %0\n\t"        // Load argc, RSP += 8
-        "movq %%rsp, %1\n\t" // Load argv
-        "pushq %0\n\t"       // Restore/re-align stack
-        : "=r" (argc), "=r" (argv)
-        :
-        : "memory"
-    );
-
-    main(argc, argv);
-}
-#endif
-
-//fourth, not compatible with inlining
-#if 0
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    long argc;
-    char **argv;
-    // 1. pop argc (1 byte). RSP is now 8-byte aligned (ending in 8).
-    // 2. mov argv, rsp (3 bytes).
-    // 3. jmp main (5 bytes, or 2 if short jump).
-    __asm__ volatile (
-        "popq %0\n\t"
-        "movq %%rsp, %1\n\t"
-        "jmp main\n\t"
-        : "=r" (argc), "=r" (argv) : : "memory"
-    );
-    __builtin_unreachable();
 }
 #endif
