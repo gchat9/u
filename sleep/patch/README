@@ -1,0 +1,8 @@
+The way how we inline main() into _start() saves a few bytes, but it
+makes argc/argv retrieval vulnerable to stack allocation in main()'s
+prologue. This is a problem on some architechtures, but not others.
+
+Patches here work around that by moving stack allocation to slightly
+later point in time.
+
+FIXME, obviously.
