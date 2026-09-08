@@ -34,6 +34,7 @@
 #define __NR_open             2
 #define __NR_close            3
 #define __NR_nanosleep       35
+#define __NR_getcwd          79
 #define __NR_getpid          39
 #define __NR_exit            60
 #define __NR_clock_gettime  228
@@ -191,6 +192,21 @@ static inline long getrandom(void *buf,
         "syscall"
         : "+r"(rax)
         : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory"
+    );
+
+    return rax;
+}
+
+static inline long getcwd(char *buf, size_t size) {
+    register long rax asm("rax") = __NR_getcwd;
+    register long rdi asm("rdi") = (long)buf;
+    register long rsi asm("rsi") = (long)size;
+
+    asm volatile(
+        "syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi)
         : "rcx", "r11", "memory"
     );
 

@@ -107,6 +107,9 @@ static inline long clock_gettime(int clk_id, struct timespec *tp)
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(355, buf, buflen, flags); }
 
+static inline long getcwd(char *buf, size_t size)
+    { _syscall2(183, buf, size); }
+
 static inline long socket(int domain, int type, int protocol)
     { _syscall3(359, domain, type, protocol); }
 

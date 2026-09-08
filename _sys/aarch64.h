@@ -129,6 +129,9 @@ static inline long execve(const char *pathname,
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(278, buf, buflen, flags); }
 
+static inline long getcwd(char *buf, size_t size)
+    { _syscall2(17, buf, size); }
+
 ////////////// main
 
 #ifdef EXPORT__START
