@@ -71,6 +71,12 @@ void *memchr(const void *ptr, int c, size_t n)
 
 //////////////////// strings
 
+static size_t strlen(const char *s) {
+    const char *p=s;
+    while (*p++);
+    return (p-s);
+}
+
 size_t strlcpy(char *dst, const char *src, size_t dsize)
 {
     const char *s = src;

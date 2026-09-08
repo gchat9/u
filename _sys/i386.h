@@ -101,6 +101,9 @@ static inline long rt_sigaction(int sig, const struct sigaction *act,
                                           struct sigaction *oact, size_t sigsetsize)
     { _syscall4(174, sig, act, oact, sigsetsize); }
 
+static inline long getcwd(char *buf, size_t size)
+    { _syscall2(183, buf, size); }
+
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(265, clk_id, tp); }
 

@@ -55,11 +55,8 @@
 
 ////////////// syscalls
 
-static inline void exit(int code) {
-    _sa1(93, code);
-    asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
-    __builtin_unreachable();
-}
+static inline long getcwd(char *buf, size_t size)
+    { _syscall2(17, buf, size); }
 
 static inline long openat(int dirfd, const char *pathname, int flags, int mode)
     { _syscall4(56, dirfd, pathname, flags, mode); }
@@ -90,6 +87,12 @@ poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
     struct timespec ts = { timeout_ms / 1000,
                            (long)(timeout_ms % 1000) * 1000000L };
     _syscall4(73, fds, nfds, &ts, 0);
+}
+
+static inline void exit(int code) {
+    _sa1(93, code);
+    asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
+    __builtin_unreachable();
 }
 
 static inline long nanosleep(const struct timespec *request, struct timespec *remain)
