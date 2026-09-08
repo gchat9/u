@@ -132,48 +132,37 @@ static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
 ////////////// main
 
 #ifdef EXPORT__START
-// prototype for main
+/*
+ * At process entry on Linux/AArch64:
+ *
+ *   [sp + 0]  = argc
+ *   [sp + 8]  = argv[0]
+ *   [sp + 16] = argv[1]
+ *
+ * We place &argc into x0 (the standard argument register for AAPCS64).
+ */
+__asm__ (
+    ".pushsection .text.startup\n"
+    ".globl _start\n"
+    ".type _start, %function\n"
+    "_start:\n"
+    "mov x0, sp\n"
+    ".popsection\n"
+);
+
+// forward declaration of main prototype, suitable for inlining
 __attribute__((noreturn)) static void main(int argc, char **argv);
 
-// broken, requires assembly patching
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    register void *sp asm("sp");
-    long argc = ((long *)sp)[0];
-    char **argv = (char **)((long *)sp + 1);
+/* Previous code falls through here.
+ * - 'used' prevents the compiler from optimizing it out.
+ * - 'section(".text.startup")' so this is placed next to our assembly block.
+ * - 'aligned(4)' guarantees no NOP padding is inserted.
+ */
+__attribute__((used, section(".text.startup"), aligned(4)))
+static void _start_c(int *argc_pointer) {
+    int argc = *argc_pointer;
+    char **argv = (char **)((char *)argc_pointer + 8);
     main(argc, argv);
     __builtin_unreachable();
-}
-//
-#endif
-
-// not compatible with inlining
-#if 0
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    __asm__ volatile(
-        "ldr x0, [sp]       \n"  // argc is at [sp]
-        "add x1, sp, #8     \n"  // argv is at [sp + 8]
-        "bl  main           \n"
-        "brk #0             \n"  // should never reach here
-        ::: "x0", "x1", "memory"
-    );
-    __builtin_unreachable();
-}
-#endif
-
-#if 0
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    long argc;
-    char **argv;
-
-    __asm__ volatile (
-        "ldr %x0, [sp]\n\t"
-        "add %x1, sp, #8\n\t"
-        "mov x29, #0\n\t"
-        "mov x30, #0\n\t"
-        : "=r" (argc), "=r" (argv)
-        :
-        : "memory", "x29", "x30"
-    );
-    main(argc, argv);
 }
 #endif

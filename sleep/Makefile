@@ -4,12 +4,12 @@ ARCH   := $(shell $(CC) -dumpmachine|cut -d- -f1)
 sleep:  sleep.c atosecnsec.h
 	$(CC) $(CFLAGS) -static -nostdlib -fno-pic -fno-pie -no-pie \
 	  -S -o sleep.s sleep.c
-	if [ -f patch/$(ARCH) ]; then patch -p0 <patch/$(ARCH); fi
 	$(CC) -static -nostdlib \
 	  -Wl,-z,max-page-size=0x100 \
 	  -Wl,--nmagic          \
 	  -Wl,--build-id=none \
 	  -Wl,-z,noprop \
+	  -Wl,-T,../_sys/cleanup-re.ld \
 	  -o sleep sleep.s
 	rm -f sleep.s
 

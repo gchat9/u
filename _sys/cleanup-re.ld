@@ -1,3 +1,5 @@
+/* linker script for text + read-only data */
+
 ENTRY(_start)
 
 PHDRS
@@ -7,14 +9,13 @@ PHDRS
 
 SECTIONS
 {
-    /*. = 0x08048000 + SIZEOF_HEADERS;*/
     . = 0x00010000 + SIZEOF_HEADERS;
     .text  : { *(.text .text.*) } :text
     .rodata : { *(.rodata .rodata.*) } :text
-    .data  : { *(.data .data.*) } :text
-    .bss   : { *(.bss .bss.* COMMON) } :text
 
     /DISCARD/ : {
+        *(.data*)
+        *(.bss*)
         *(.comment)
         *(.note*)
         *(.gnu*)
