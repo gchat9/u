@@ -1,3 +1,26 @@
+///// sizes
+
+#ifdef __SIZE_TYPE__
+/* horrible kludge to make sure size_t and ssize_t are both long or both int */
+#define unsigned signed
+typedef __SIZE_TYPE__ ssize_t;
+#undef unsigned
+#else
+typedef signed long ssize_t;            /* Used for a count of bytes or an error indication. */
+#endif
+
+///// clock / time
+
+typedef int32_t clockid_t;
+
+struct timespec {
+    long tv_sec;   // seconds
+    long tv_nsec;  // nanoseconds
+};
+
+#define CLOCK_REALTIME           0
+#define CLOCK_MONOTONIC          1
+
 /////
 
 typedef int32_t pid_t;        /* Used for process IDs and process group IDs. */
@@ -6,7 +29,7 @@ typedef uint32_t clock_t;     /* Used for system times in
                                  clock ticks or CLOCKS_PER_SEC
                                  (see <time.h>). */
 
-#if defined(__aarch64__) || defined(__x86_64__)
+#if defined(__aarch64__) || defined(__x86_64__) || (defined(__riscv) && __riscv_xlen == 64)
     typedef uint32_t gid_t;   /* Used for group IDs. */
     typedef uint32_t mode_t;  /* Used for some file attributes. */
     typedef uint32_t nlink_t; /* Used for link counts. */

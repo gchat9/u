@@ -1,5 +1,5 @@
-#ifndef _SYS_LIB_NET_H
-#define _SYS_LIB_NET_H
+#ifndef _LIB_NET_H
+#define _LIB_NET_H
 
 #include <stdint.h>  // or define uint8_t etc. yourself
 
@@ -54,4 +54,4 @@ static inline struct sockaddr_in ipv4_with_port(
 }
 #endif
 
-#endif // _SYS_LIB_NET_H
+#endif // _LIB_NET_H

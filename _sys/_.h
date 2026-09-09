@@ -4,28 +4,9 @@
 //#include <sys/types.h>
 #include "types.h"
 
-#include "_lib_net.h"
-
-//#define NULL ((void*)0)
-
-#ifdef __SIZE_TYPE__
-/* horrible kludge to make sure size_t and ssize_t are both long or both int */
-#define unsigned signed
-typedef __SIZE_TYPE__ ssize_t;
-#undef unsigned
-#else
-typedef signed long ssize_t;            /* Used for a count of bytes or an error indication. */
-#endif
-
-typedef int32_t clockid_t;
-
-struct timespec {
-    long tv_sec;   // seconds
-    long tv_nsec;  // nanoseconds
-};
-
-#define CLOCK_REALTIME           0
-#define CLOCK_MONOTONIC          1
+#include "../_lib/net.h"
+#include "../_lib/mem.h"
+#include "../_lib/str.h"
 
 // fcntl.h - open() and friends
 #define O_RDONLY             00
@@ -49,21 +30,15 @@ struct timespec {
 #define GRND_NONBLOCK       0x0001
 
 #if defined(__x86_64__)
-  #include "x86_64.h"
+  #include "../_arch/x86_64.h"
 #elif defined(__i386__)
-  #include "i386.h"
+  #include "../_arch/i386.h"
 #elif defined(__aarch64__)
-  #include "aarch64.h"
+  #include "../_arch/aarch64.h"
 #elif defined(__arm__)
-  #include "arm.h"
+  #include "../_arch/arm.h"
+#elif defined(__riscv) && __riscv_xlen == 64
+  #include "../_arch/riscv64.h"
 #else
     #error "Target architecture not supported"
 #endif
-
-
-///// lib_mem
-void *memset(void *ptr, int c, size_t n);
-void *memchr(const void *ptr, int c, size_t n);
-static void *memmem(const void *haystack, size_t haystacklen, 
-                    const void *needle,   size_t needlelen);
-int strcasecmp(const char *s1, const char *s2);
