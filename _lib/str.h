@@ -3,19 +3,19 @@
 
 #include <stddef.h>
 
-static size_t strlen(const char *s);
-size_t strlcpy(char *dst, const char *src, size_t dsize);
-int strcasecmp(const char *s1, const char *s2);
+static inline size_t strlen(const char *s);
+static inline size_t strlcpy(char *dst, const char *src, size_t dsize);
+static inline int strcasecmp(const char *s1, const char *s2);
 
 #ifdef EXPORT_IMPLEMENTATIONS
 
-static size_t strlen(const char *s) {
+static inline size_t strlen(const char *s) {
     const char *p=s;
     while (*p++);
     return (p-s);
 }
 
-size_t strlcpy(char *dst, const char *src, size_t dsize)
+static inline size_t strlcpy(char *dst, const char *src, size_t dsize)
 {
     const char *s = src;
 
@@ -39,7 +39,7 @@ size_t strlcpy(char *dst, const char *src, size_t dsize)
     return (size_t)(s - src - 1);
 }
 
-int strcasecmp(const char *s1, const char *s2) {
+static inline int strcasecmp(const char *s1, const char *s2) {
     int c1, c2;
     while (1) {
         c1 = *s1++;

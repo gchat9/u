@@ -3,16 +3,16 @@
 
 #include <stddef.h>
 
-void *memcpy(void *dest, const void *src, size_t n);
-void *memset(void *ptr, int c, size_t n);
-void *memchr(const void *ptr, int c, size_t n);
-static void *memmem(const void *haystack, size_t haystacklen,
+static inline void *memcpy(void *dest, const void *src, size_t n);
+static inline void *memset(void *ptr, int c, size_t n);
+static inline void *memchr(const void *ptr, int c, size_t n);
+static inline void *memmem(const void *haystack, size_t haystacklen,
                     const void *needle,   size_t needlelen);
 
 #ifdef EXPORT_IMPLEMENTATIONS
 
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-void *memcpy(void *dest, const void *src, size_t n) {
+static inline void *memcpy(void *dest, const void *src, size_t n) {
     if (dest == NULL || src == NULL) return dest;
 
     char *d = (char *)dest;
@@ -24,7 +24,7 @@ void *memcpy(void *dest, const void *src, size_t n) {
 }
 
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-static void *memmem(const void *haystack, size_t haystacklen, 
+static inline void *memmem(const void *haystack, size_t haystacklen, 
                     const void *needle,   size_t needlelen) 
 {
     if (needlelen == 0) {
@@ -54,7 +54,7 @@ static void *memmem(const void *haystack, size_t haystacklen,
     return 0;
 }
 
-void *memset(void *ptr, int c, size_t n)
+static inline void *memset(void *ptr, int c, size_t n)
 {
     unsigned char *p = (unsigned char *)ptr;
     unsigned char byte = (unsigned char)c;
@@ -65,7 +65,7 @@ void *memset(void *ptr, int c, size_t n)
     return ptr;
 }
 
-void *memchr(const void *ptr, int c, size_t n)
+static inline void *memchr(const void *ptr, int c, size_t n)
 {
     const unsigned char *p = (const unsigned char *)ptr;
     unsigned char byte = (unsigned char)c;
