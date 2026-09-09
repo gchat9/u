@@ -6,6 +6,7 @@
 static inline size_t strlen(const char *s);
 static inline size_t strlcpy(char *dst, const char *src, size_t dsize);
 static inline int strcasecmp(const char *s1, const char *s2);
+static inline size_t utoa(unsigned long v, char *buf);
 
 #ifdef EXPORT_IMPLEMENTATIONS
 
@@ -49,6 +50,25 @@ static inline int strcasecmp(const char *s1, const char *s2) {
         if (c1 != c2) return c1 - c2;
         if (c1 == '\0') return 0;
     }
+}
+
+/* Writes the decimal representation of v into buf (NOT NUL-terminated).
+ * buf must be at least 20 bytes. Returns the number of bytes written. */
+static inline size_t utoa(unsigned long v, char *buf)
+{
+    size_t n = 0;
+
+    do {
+        buf[n++] = (char)('0' + (v % 10));
+    } while (v /= 10);
+
+    for (size_t i = 0, j = n - 1; i < j; ++i, --j) {
+        char c = buf[i];
+        buf[i] = buf[j];
+        buf[j] = c;
+    }
+
+    return n;
 }
 
 #endif // EXPORT_IMPLEMENTATIONS

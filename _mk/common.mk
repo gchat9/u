@@ -30,6 +30,9 @@ _SYS := ../_sys
 CFLAGS := -static -nostdlib -flto -Os -fno-stack-clash-protection \
           -fno-stack-protector -fno-exceptions -ffreestanding \
           -ffunction-sections -fdata-sections -Wl,--gc-sections
+ifneq ($(shell $(CC) -dM -E - < /dev/null | egrep __arm__),)
+    CFLAGS += -mcpu=cortex-a15 -mthumb
+endif
 
 ifeq ($(RW),1)
 LDSCRIPT     := $(_SYS)/cleanup-re+rw.ld
