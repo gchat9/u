@@ -1,6 +1,6 @@
 #include "../_sys/_main.h"
 
-#define BUFSZ 8192
+#define BUFSZ 4096
 
 // TODO: accept options -n, -A, -s etc. Currently just concatenates raw bytes.
 
