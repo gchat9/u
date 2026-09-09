@@ -10,7 +10,7 @@ Main goal is to produce smallest possible executable for each supported platform
 
 ## Undefined but harmless behaviour
 
-Example: user runs "sleep" tool with some exceptionally long and/or corrupted argv[1].
+Example: user runs "sleep" tool with some exceptionally long and/or corrupted argv[1], or "cat" on a file that vanishes mid-read.
 
 - allowed behaviour: exit immideately, do what the tool normally does (sleep) for some undefined amount of time;
 

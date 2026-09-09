@@ -10,9 +10,9 @@ static inline int strcasecmp(const char *s1, const char *s2);
 #ifdef EXPORT_IMPLEMENTATIONS
 
 static inline size_t strlen(const char *s) {
-    const char *p=s;
-    while (*p++);
-    return (p-s);
+    const char *p = s;
+    while (*p) p++;
+    return (size_t)(p - s);
 }
 
 static inline size_t strlcpy(char *dst, const char *src, size_t dsize)

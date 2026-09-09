@@ -12,7 +12,7 @@ __attribute__((noreturn)) inline static void main(int argc, char **argv)
         exit(1);
     }
     
-    l=strlen(buf)-1;
+    l=strlen(buf);
     buf[l]='\n';
     write(1, buf, l+1);
     exit(0);
