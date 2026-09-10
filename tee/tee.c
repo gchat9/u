@@ -5,17 +5,6 @@
 
 // TODO: accept -i (ignore SIGINT), --output-error, other long option forms.
 
-static int write_all(int fd, const char *buf, long n)
-{
-    long off = 0, w;
-    while (off < n) {
-        w = write(fd, buf + off, n - off);
-        if (w <= 0) return 1;
-        off += w;
-    }
-    return 0;
-}
-
 __attribute__((noreturn)) static void main(int argc, char **argv)
 {
     int fds[MAXOUT];
@@ -59,11 +48,11 @@ __attribute__((noreturn)) static void main(int argc, char **argv)
         if (n < 0) { status = 1; break; }
         if (n == 0) break;
 
-        if (write_all(1, buf, n))
+        if (write_all_fd(1, buf, (size_t)n))
             status = 1;
 
         for (int i = 0; i < nfds; i++) {
-            if (write_all(fds[i], buf, n))
+            if (write_all_fd(fds[i], buf, (size_t)n))
                 status = 1;
         }
     }

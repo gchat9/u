@@ -38,6 +38,19 @@ static inline int arena_grow(struct arena *a, size_t needed)
     return 0;
 }
 
+static inline int arena_read_all(struct arena *a, int fd, size_t *used)
+{
+    long n;
+
+    for (;;) {
+        if (*used == a->size && arena_grow(a, *used + 1)) return 1;
+        n = read(fd, (char *)a->base + *used, a->size - *used);
+        if (n < 0) return 1;
+        if (!n) return 0;
+        *used += (size_t)n;
+    }
+}
+
 static inline int arena_destroy(struct arena *a)
 {
     if (a->base == MAP_FAILED) return 0;

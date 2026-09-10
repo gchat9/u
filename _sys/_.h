@@ -4,6 +4,9 @@
 //#include <sys/types.h>
 #include "types.h"
 
+/* The architecture syscall prototypes only need this forward declaration. */
+struct sockaddr;
+
 // fcntl.h - open() and friends
 #define O_RDONLY             00
 #define O_WRONLY             01
@@ -47,7 +50,8 @@
     #error "Target architecture not supported"
 #endif
 
-#include "../_lib/net.h"
-#include "../_lib/mem.h"
-#include "../_lib/str.h"
 #include "../_lib/arena.h"
+#include "../_lib/io.h"
+#include "../_lib/mem.h"
+#include "../_lib/net.h"
+#include "../_lib/str.h"

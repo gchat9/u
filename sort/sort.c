@@ -17,17 +17,6 @@ struct options {
     int unique;
 };
 
-static int write_all(int fd, const char *buf, size_t len)
-{
-    while (len) {
-        long n = write(fd, buf, len);
-        if (n <= 0) return 1;
-        buf += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
 static int folded(unsigned char c, int fold_case)
 {
     if (fold_case && c >= 'A' && c <= 'Z') c += 'a' - 'A';
@@ -204,8 +193,8 @@ static int sort_buffer(size_t used, const struct options *o, char *input,
     for (size_t i = 0; i < nlines; i++) {
         if (o->unique && i && compare_lines(&lines[i - 1], &lines[i], input, o) == 0)
             continue;
-        if (write_all(1, input + lines[i].off, lines[i].len) ||
-            write_all(1, "\n", 1))
+        if (write_all_fd(1, input + lines[i].off, lines[i].len) ||
+            write_all_fd(1, "\n", 1))
             return 1;
     }
     return 0;
