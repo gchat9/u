@@ -98,6 +98,9 @@ static inline long munmap(void *addr, size_t length)
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(99, path, buf); }
 
+static inline long sysinfo(struct sysinfo *buf)
+    { _syscall1(116, buf); }
+
 static inline long nanosleep(const struct timespec *request, struct timespec *remain)
     { _syscall2(162, request, remain); }
 

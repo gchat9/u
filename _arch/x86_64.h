@@ -146,6 +146,9 @@ static inline long getcwd(char *buf, size_t size)
 static inline long readlink(const char *pathname, char *buf, size_t bufsize)
     { _syscall3(89, pathname, buf, bufsize); }
 
+static inline long sysinfo(struct sysinfo *buf)
+    { _syscall1(99, buf); }
+
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(137, path, buf); }
 

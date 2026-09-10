@@ -117,6 +117,9 @@ static inline long rt_sigaction(int sig, const struct sigaction *act,
 static inline long getpid(void)
     { _syscall0(172); }
 
+static inline long sysinfo(struct sysinfo *buf)
+    { _syscall1(179, buf); }
+
 static inline long socket(int domain, int type, int protocol)
     { _syscall3(198, domain, type, protocol); }
 

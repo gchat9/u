@@ -34,6 +34,24 @@ struct statfs {
     long f_spare[4];
 };
 
+/* Linux sysinfo(2) result layout. */
+struct sysinfo {
+    long uptime;
+    unsigned long loads[3];
+    unsigned long totalram;
+    unsigned long freeram;
+    unsigned long sharedram;
+    unsigned long bufferram;
+    unsigned long totalswap;
+    unsigned long freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    unsigned long totalhigh;
+    unsigned long freehigh;
+    uint32_t mem_unit;
+    char _f[8];
+};
+
 #define CLOCK_REALTIME           0
 #define CLOCK_MONOTONIC          1
 
