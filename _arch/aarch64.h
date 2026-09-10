@@ -92,6 +92,9 @@ poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
     _syscall4(73, fds, nfds, &ts, 0);
 }
 
+static inline long readlink(const char *pathname, char *buf, size_t bufsize)
+    { _syscall2(78, pathname, buf); }
+
 static inline void exit(int code) {
     _sa1(93, code);
     asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");

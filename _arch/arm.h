@@ -89,6 +89,9 @@ static inline int dup2(int oldfd, int newfd)
 static inline pid_t setsid(void)
     { _syscall0(66); }
 
+static inline long readlink(const char *pathname, char *buf, size_t bufsize)
+    { _syscall3(85, pathname, buf, bufsize); }
+
 static inline long munmap(void *addr, size_t length)
     { _syscall2(91, addr, length); }
 

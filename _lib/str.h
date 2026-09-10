@@ -5,6 +5,7 @@
 
 static inline size_t strlen(const char *s);
 static inline size_t strlcpy(char *dst, const char *src, size_t dsize);
+static inline size_t strlcat(char *dst, const char *src, size_t dsize);
 static inline int strcasecmp(const char *s1, const char *s2);
 static inline size_t utoa(unsigned long v, char *buf);
 
@@ -38,6 +39,35 @@ static inline size_t strlcpy(char *dst, const char *src, size_t dsize)
         ;
 
     return (size_t)(s - src - 1);
+}
+
+static inline size_t strlcat(char *dst, const char *src, size_t dsize)
+{
+    char *d = dst;
+    const char *s = src;
+    size_t nleft = dsize;
+
+    /* Find the end of dst and adjust bytes left but don't go past end. */
+    while (nleft != 0 && *d != '\0') {
+        d++;
+        nleft--;
+    }
+
+    /* If no space left, just return what would have been copied. */
+    if (nleft == 0)
+        return dsize + strlen(src);
+
+    /* Copy as many bytes as will fit. */
+    while (--nleft != 0) {
+        if ((*d++ = *s++) == '\0')
+            return (size_t)(d - dst - 1);
+    }
+
+    /* No space left for NUL, terminate anyway. */
+    *d = '\0';
+
+    /* Return total length attempted to copy. */
+    return (size_t)(d - dst - 1) + strlen(s) + 1;
 }
 
 static inline int strcasecmp(const char *s1, const char *s2) {
