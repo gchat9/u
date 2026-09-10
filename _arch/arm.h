@@ -89,8 +89,19 @@ static inline int dup2(int oldfd, int newfd)
 static inline pid_t setsid(void)
     { _syscall0(66); }
 
+static inline long munmap(void *addr, size_t length)
+    { _syscall2(91, addr, length); }
+
 static inline long nanosleep(const struct timespec *request, struct timespec *remain)
     { _syscall2(162, request, remain); }
+
+static inline long mremap_raw(void *old_address, size_t old_size,
+                              size_t new_size, int flags)
+    { _syscall4(163, old_address, old_size, new_size, flags); }
+
+static inline void *mremap(void *old_address, size_t old_size,
+                           size_t new_size, int flags)
+    { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
 
 static inline long poll(struct pollfd *fds, unsigned long nfds, int timeout)
     { _syscall3(168, fds, nfds, timeout); }
@@ -101,6 +112,14 @@ static inline long rt_sigaction(int sig, const struct sigaction *act,
 
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(183, buf, size); }
+
+static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
+                            int fd, long offset)
+    { _syscall6(192, addr, length, prot, flags, fd, offset); }
+
+static inline void *mmap(void *addr, size_t length, int prot, int flags,
+                         int fd, long offset)
+    { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
 
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(263, clk_id, tp); }

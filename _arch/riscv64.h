@@ -128,9 +128,28 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
 /* recv does not exist on riscv64; express via recvfrom with addr=NULL */
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
+static inline long munmap(void *addr, size_t length)
+    { _syscall2(215, addr, length); }
+
+static inline long mremap_raw(void *old_address, size_t old_size,
+                              size_t new_size, int flags)
+    { _syscall4(216, old_address, old_size, new_size, flags); }
+
+static inline void *mremap(void *old_address, size_t old_size,
+                           size_t new_size, int flags)
+    { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
+
 static inline long execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(221, pathname, argv, envp); }
+
+static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
+                            int fd, long offset)
+    { _syscall6(222, addr, length, prot, flags, fd, offset); }
+
+static inline void *mmap(void *addr, size_t length, int prot, int flags,
+                         int fd, long offset)
+    { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(278, buf, buflen, flags); }

@@ -4,10 +4,6 @@
 //#include <sys/types.h>
 #include "types.h"
 
-#include "../_lib/net.h"
-#include "../_lib/mem.h"
-#include "../_lib/str.h"
-
 // fcntl.h - open() and friends
 #define O_RDONLY             00
 #define O_WRONLY             01
@@ -29,6 +25,14 @@
 
 #define GRND_NONBLOCK       0x0001
 
+// mmap
+#define PROT_READ           0x1
+#define PROT_WRITE          0x2
+#define MAP_PRIVATE         0x2
+#define MAP_ANONYMOUS       0x20
+#define MAP_FAILED          ((void *)-1)
+#define MREMAP_MAYMOVE      0x1
+
 #if defined(__x86_64__)
   #include "../_arch/x86_64.h"
 #elif defined(__i386__)
@@ -42,3 +46,8 @@
 #else
     #error "Target architecture not supported"
 #endif
+
+#include "../_lib/net.h"
+#include "../_lib/mem.h"
+#include "../_lib/str.h"
+#include "../_lib/arena.h"

@@ -78,12 +78,31 @@ static inline long close(int fd)
 static inline long poll(struct pollfd *fds, unsigned long nfds, int timeout)
     { _syscall3(7, fds, nfds, timeout); }
 
+static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
+                            int fd, long offset)
+    { _syscall6(9, addr, length, prot, flags, fd, offset); }
+
+static inline void *mmap(void *addr, size_t length, int prot, int flags,
+                         int fd, long offset)
+    { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
+
+static inline long munmap(void *addr, size_t length)
+    { _syscall2(11, addr, length); }
+
 static inline long rt_sigaction(int sig, const struct sigaction *act,
                                 struct sigaction *oact, size_t sigsetsize)
     { _syscall4(13, sig, act, oact, sigsetsize); }
 
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(16, fd, request, arg); }
+
+static inline long mremap_raw(void *old_address, size_t old_size,
+                              size_t new_size, int flags)
+    { _syscall4(25, old_address, old_size, new_size, flags); }
+
+static inline void *mremap(void *old_address, size_t old_size,
+                           size_t new_size, int flags)
+    { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
 
 static inline long dup2(int oldfd, int newfd)
     { _syscall2(33, oldfd, newfd); }
