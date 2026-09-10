@@ -18,6 +18,22 @@ struct timespec {
     long tv_nsec;  // nanoseconds
 };
 
+/* Linux statfs(2) result layout.  long deliberately follows the target ABI. */
+struct statfs {
+    long f_type;
+    long f_bsize;
+    unsigned long f_blocks;
+    unsigned long f_bfree;
+    unsigned long f_bavail;
+    unsigned long f_files;
+    unsigned long f_ffree;
+    int32_t f_fsid[2];
+    long f_namelen;
+    long f_frsize;
+    long f_flags;
+    long f_spare[4];
+};
+
 #define CLOCK_REALTIME           0
 #define CLOCK_MONOTONIC          1
 
@@ -149,4 +165,3 @@ struct sigaction {
   void (*sa_restorer)(void);
   sigset_t sa_mask;
 };
-

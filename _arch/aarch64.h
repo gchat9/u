@@ -58,6 +58,9 @@
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(17, buf, size); }
 
+static inline long statfs(const char *path, struct statfs *buf)
+    { _syscall2(43, path, buf); }
+
 static inline long openat(int dirfd, const char *pathname, int flags, int mode)
     { _syscall4(56, dirfd, pathname, flags, mode); }
 
