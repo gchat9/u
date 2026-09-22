@@ -54,6 +54,7 @@ static inline void *memmem(const void *haystack, size_t haystacklen,
     return 0;
 }
 
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
 static inline void *memset(void *ptr, int c, size_t n)
 {
     unsigned char *p = (unsigned char *)ptr;
@@ -65,6 +66,7 @@ static inline void *memset(void *ptr, int c, size_t n)
     return ptr;
 }
 
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
 static inline void *memchr(const void *ptr, int c, size_t n)
 {
     const unsigned char *p = (const unsigned char *)ptr;

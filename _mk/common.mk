@@ -24,6 +24,7 @@
 #              builds and links cleanly but segfaults at runtime, so this
 #              is deliberately one toggle rather than several separate
 #              knobs to keep in sync.
+#   EXTRA_OBJS optional additional object files linked into $(TARGET).
 
 _SYS := ../_sys
 
@@ -48,14 +49,14 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): $(TARGET).c $(DEPS)
+$(TARGET): $(TARGET).c $(DEPS) $(EXTRA_OBJS)
 	$(CC) $(CFLAGS) -static -nostdlib -fno-pic -fno-pie -no-pie \
 	  -Wl,-z,max-page-size=$(PAGE_SIZE) \
 	  $(NMAGIC_FLAGS) \
 	  -Wl,--build-id=none \
 	  -Wl,-z,noprop \
 	  -Wl,-T,$(LDSCRIPT) \
-	  -o $(TARGET) $(TARGET).c
+	  -o $(TARGET) $(TARGET).c $(EXTRA_OBJS)
 
 clean:
-	rm -f $(TARGET) 2>/dev/null
+	rm -f $(TARGET) $(EXTRA_OBJS) 2>/dev/null
