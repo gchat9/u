@@ -108,6 +108,96 @@ static void put_image(uint32_t draw, uint32_t gc,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Keyboard
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* GetKeyboardMapping (opcode 101): fixed reply header is 32 bytes, then
+ * keysyms_per_keycode * count KEYSYMs (4 bytes each) follow. */
+#define KEYSYM_TABLE_MAX (256 * 8)
+
+static uint8_t  min_keycode, max_keycode, keysyms_per_kc;
+static uint32_t keysym_table[KEYSYM_TABLE_MAX];
+
+static void load_keyboard_mapping(void)
+{
+    int count = (int)max_keycode - (int)min_keycode + 1;
+    if (count < 1) return;
+
+    uint8_t req[8] = {0};
+    uint16_t len = 2;
+    req[0] = 101;
+    memcpy(req+2, &len, 2);
+    req[4] = min_keycode;
+    req[5] = (uint8_t)count;
+    xwrite(req, 8);
+
+    uint8_t hdr[32];
+    xread(hdr, 32);
+    if (hdr[0] != 1) return;   /* error reply: leave keysyms_per_kc == 0 */
+    uint32_t words; memcpy(&words, hdr+4, 4);
+    size_t n = (size_t)words;  /* count * keysyms-per-keycode, in words */
+    if (n > KEYSYM_TABLE_MAX) { xdrain(n * 4); return; }
+    xread(keysym_table, n * 4);
+    keysyms_per_kc = hdr[1];
+}
+
+static uint32_t keysym_for(uint8_t keycode, int shifted)
+{
+    if (!keysyms_per_kc || keycode < min_keycode || keycode > max_keycode)
+        return 0;
+    int idx = (keycode - min_keycode) * keysyms_per_kc +
+              (shifted && keysyms_per_kc > 1 ? 1 : 0);
+    return keysym_table[idx];
+}
+
+#define KEY_QUEUE_CAP 256
+static uint8_t key_queue[KEY_QUEUE_CAP];
+static int key_head, key_tail;
+
+static void key_push(uint8_t b)
+{
+    int next = (key_tail + 1) % KEY_QUEUE_CAP;
+    if (next == key_head) return;   /* queue full: drop, harmless */
+    key_queue[key_tail] = b;
+    key_tail = next;
+}
+
+/* Translate one KeyPress event (32 bytes) into 0+ output bytes. Covers
+ * printable Latin-1, Ctrl-letter control codes, and the common control
+ * keys/arrows as ANSI/VT sequences. Anything else is silently ignored. */
+static void handle_keypress(const uint8_t *ev)
+{
+    uint8_t keycode = ev[1];
+    uint16_t state; memcpy(&state, ev+28, 2);
+    int shift = (state & 0x0001) != 0;
+    int ctrl  = (state & 0x0004) != 0;
+
+    uint32_t ks = keysym_for(keycode, shift);
+    if (!ks) return;
+
+    if (ctrl) {
+        uint32_t up = ks;
+        if (up >= 'a' && up <= 'z') up -= 'a' - 'A';
+        if (up >= '@' && up <= '_') { key_push((uint8_t)(up & 0x1f)); return; }
+    }
+
+    if (ks >= 0x20 && ks <= 0x7e) { key_push((uint8_t)ks); return; }
+
+    switch (ks) {
+    case 0xFF08: key_push(0x7f); return;                              /* BackSpace */
+    case 0xFF09: key_push('\t'); return;                              /* Tab */
+    case 0xFF0D: key_push('\r'); return;                              /* Return */
+    case 0xFF1B: key_push(0x1b); return;                              /* Escape */
+    case 0xFF51: key_push(0x1b); key_push('['); key_push('D'); return; /* Left */
+    case 0xFF52: key_push(0x1b); key_push('['); key_push('A'); return; /* Up */
+    case 0xFF53: key_push(0x1b); key_push('['); key_push('C'); return; /* Right */
+    case 0xFF54: key_push(0x1b); key_push('['); key_push('B'); return; /* Down */
+    case 0xFFFF: key_push(0x1b); key_push('['); key_push('3'); key_push('~'); return; /* Delete */
+    default: return;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * BFNT font
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -275,6 +365,9 @@ int xterm_init(void)
     uint16_t screen_w; memcpy(&screen_w, d+soff+20, 2);
     uint16_t screen_h; memcpy(&screen_h, d+soff+22, 2);
     xterm_depth = d[soff+38];
+    min_keycode = d[26];
+    max_keycode = d[27];
+    load_keyboard_mapping();
     grid_init(screen_w, screen_h, screen_storage, sizeof screen_storage);
 
     xterm_win = new_xid(); xterm_gc = new_xid();
@@ -295,7 +388,30 @@ int xterm_init(void)
     uint8_t gc[16] = {0}; uint16_t gc_len=4; uint32_t mask=0; gc[0]=55;
     memcpy(gc+2,&gc_len,2); memcpy(gc+4,&xterm_gc,4); memcpy(gc+8,&xterm_win,4);
     memcpy(gc+12,&mask,4); xwrite(gc,16);
+
+    /* Claim keyboard focus explicitly (revert to PointerRoot if the window
+     * ever goes away). Without this, key delivery depends entirely on
+     * whatever focus policy the server/WM (if any) happens to be running,
+     * which is fragile — e.g. under a bare Xvnc with no window manager,
+     * focus may or may not already be tracking the pointer. */
+    uint8_t foc[12] = {0}; uint16_t foc_len=3; uint32_t time0=0;
+    foc[0]=42; foc[1]=1; /* revert-to = PointerRoot */
+    memcpy(foc+2,&foc_len,2); memcpy(foc+4,&xterm_win,4); memcpy(foc+8,&time0,4);
+    xwrite(foc,12);
+
     return 0;
+}
+
+int xterm_fd(void) { return xfd; }
+
+int xterm_read_key(uint8_t *buf, int cap)
+{
+    int n = 0;
+    while (n < cap && key_head != key_tail) {
+        buf[n++] = key_queue[key_head];
+        key_head = (key_head + 1) % KEY_QUEUE_CAP;
+    }
+    return n;
 }
 
 void xterm_render(void)
@@ -315,10 +431,13 @@ int xterm_wait(int timeout_ms)
         if (!(p.revents & POLLIN)) break;
         uint8_t ev[32];
         xread(ev, sizeof ev);
-        if ((ev[0] & 0x7f) == 12) {
+        uint8_t etype = ev[0] & 0x7f;
+        if (etype == 12) {
             uint16_t count;
             memcpy(&count, ev + 16, 2);
             if (count == 0) redraw = 1;
+        } else if (etype == 2) {
+            handle_keypress(ev);
         }
         p.revents = 0;
         ready = poll(&p, 1, 0);
