@@ -271,11 +271,16 @@ static inline uint32_t blend(uint8_t a, uint32_t src, uint32_t dst)
                       ((sb*a+db*(255-a))/255));
 }
 
+/* Cursor: a plain full-block inversion (fg/bg swapped for the whole
+ * cell), no blinking. row<0 means "no cursor" (hidden/unfocused etc). */
+static int cursor_row = -1, cursor_col = -1;
+
 static void render_cell(int row, int col,
                         uint32_t draw, uint32_t gc, uint8_t depth)
 {
-    uint32_t bg = C_BG;
-    uint32_t fg = C_FG;
+    int is_cursor = (row == cursor_row && col == cursor_col);
+    uint32_t bg = is_cursor ? C_FG : C_BG;
+    uint32_t fg = is_cursor ? C_BG : C_FG;
     int n = cell_w * cell_h;
     if (depth == 16) {
         size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
@@ -325,11 +330,85 @@ static void render_all(uint32_t draw, uint32_t gc, uint8_t depth)
 static uint8_t screen_storage[GRID_MAX_CELLS];
 static uint8_t cell_storage[64*64*4];
 static uint32_t xterm_win, xterm_gc;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Atoms, window title, close protocol
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Synchronous InternAtom (opcode 16): resolve a name to its ATOM id.
+ *
+ * By the time this is called the window already exists (it's used for
+ * the WM_PROTOCOLS/WM_DELETE_WINDOW setup, right after CreateWindow +
+ * MapWindow + grab_focus's SetInputFocus), so ordinary events -- an
+ * EnterNotify or Expose triggered by any of that -- can legitimately be
+ * sitting in front of our reply on the wire. A reply is always byte0==1
+ * and an error is byte0==0; anything else is an event that arrived
+ * first and simply isn't relevant here (xterm_wait's own loop is what
+ * processes events, once the main loop starts), so skip over it rather
+ * than misreading its bytes as if they were our reply. */
+static uint32_t intern_atom(const char *name, int len)
+{
+    uint8_t req[24] = {0};
+    uint16_t reqlen = (uint16_t)(2 + ((len + 3) / 4));
+    uint16_t nlen = (uint16_t)len;
+    req[0] = 16; req[1] = 0; /* only-if-exists = 0 (create it) */
+    memcpy(req+2, &reqlen, 2);
+    memcpy(req+4, &nlen, 2);
+    memcpy(req+8, name, (size_t)len);
+    xwrite(req, (size_t)reqlen * 4);
+    for (;;) {
+        uint8_t rep[32]; xread(rep, 32);
+        if (rep[0] == 1) { uint32_t atom; memcpy(&atom, rep+8, 4); return atom; }
+        if (rep[0] == 0) return 0; /* error: give up gracefully */
+        /* else: an unrelated event, drop it and keep waiting */
+    }
+}
+
+static uint32_t wm_protocols_atom, wm_delete_window_atom;
+static int close_requested;
+
+/* WM_NAME (STRING, format 8) — bare-minimum window title. */
+void xterm_set_title(const char *name, int len)
+{
+    uint8_t buf[24 + 256];
+    if ((size_t)len > sizeof buf - 24) len = sizeof buf - 24; /* generous cap */
+    uint16_t reqlen = (uint16_t)(6 + ((len + 3) / 4));
+    uint32_t nlen = (uint32_t)len;
+    uint8_t req[24] = {0};
+    req[0] = 18; req[1] = 0; /* ChangeProperty, mode=Replace */
+    memcpy(req+2, &reqlen, 2);
+    memcpy(req+4, &xterm_win, 4);
+    uint32_t prop = 39, type = 31; /* WM_NAME, STRING: predefined atoms */
+    memcpy(req+8, &prop, 4);
+    memcpy(req+12, &type, 4);
+    req[16] = 8; /* format */
+    memcpy(req+20, &nlen, 4);
+    memcpy(buf, req, 24);
+    memcpy(buf + 24, name, (size_t)len);
+    xwrite(buf, (size_t)reqlen * 4);
+}
+
+int xterm_close_requested(void) { return close_requested; }
 static uint8_t xterm_depth;
 
 uint8_t *xterm_framebuffer(void) { return scr; }
 int xterm_columns(void) { return cols; }
 int xterm_rows(void) { return rows; }
+
+/* Claim keyboard focus explicitly (revert to PointerRoot if the window
+ * ever goes away). Without this, key delivery depends entirely on
+ * whatever focus policy the server/WM (if any) happens to be running,
+ * which is fragile — e.g. under a bare Xvnc with no window manager, or
+ * under a real WM whose own focus-on-map policy might race ours. Called
+ * once at startup and again on every EnterNotify so focus reliably
+ * follows the pointer into the window regardless of WM policy. */
+static void grab_focus(void)
+{
+    uint8_t foc[12] = {0}; uint16_t foc_len=3; uint32_t time0=0;
+    foc[0]=42; foc[1]=1; /* revert-to = PointerRoot */
+    memcpy(foc+2,&foc_len,2); memcpy(foc+4,&xterm_win,4); memcpy(foc+8,&time0,4);
+    xwrite(foc,12);
+}
 
 int xterm_init(void)
 {
@@ -376,7 +455,7 @@ int xterm_init(void)
     int16_t x=(int16_t)((screen_w-WIN_W)/2), y=(int16_t)((screen_h-WIN_H)/2);
     uint16_t w=(uint16_t)WIN_W, h=(uint16_t)WIN_H, bw=0, cls=1;
     uint32_t vis=0, vmask=(1u<<1)|(1u<<11), bg=black_px;
-    uint32_t emask=(1u<<15)|(1u<<0);
+    uint32_t emask=(1u<<15)|(1u<<0)|(1u<<4); /* Exposure|KeyPress|EnterWindow */
     r[0]=1;
     memcpy(r+2,&len,2); memcpy(r+4,&xterm_win,4); memcpy(r+8,&root_win,4);
     memcpy(r+12,&x,2); memcpy(r+14,&y,2); memcpy(r+16,&w,2); memcpy(r+18,&h,2);
@@ -389,15 +468,23 @@ int xterm_init(void)
     memcpy(gc+2,&gc_len,2); memcpy(gc+4,&xterm_gc,4); memcpy(gc+8,&xterm_win,4);
     memcpy(gc+12,&mask,4); xwrite(gc,16);
 
-    /* Claim keyboard focus explicitly (revert to PointerRoot if the window
-     * ever goes away). Without this, key delivery depends entirely on
-     * whatever focus policy the server/WM (if any) happens to be running,
-     * which is fragile — e.g. under a bare Xvnc with no window manager,
-     * focus may or may not already be tracking the pointer. */
-    uint8_t foc[12] = {0}; uint16_t foc_len=3; uint32_t time0=0;
-    foc[0]=42; foc[1]=1; /* revert-to = PointerRoot */
-    memcpy(foc+2,&foc_len,2); memcpy(foc+4,&xterm_win,4); memcpy(foc+8,&time0,4);
-    xwrite(foc,12);
+    grab_focus();
+
+    /* Opt into the WM_DELETE_WINDOW handshake so a window-manager-driven
+     * close (clicking the window's close button, Alt-F4, etc) arrives as
+     * an ordinary ClientMessage event instead of the connection just
+     * dying under us. */
+    wm_protocols_atom     = intern_atom("WM_PROTOCOLS", 12);
+    wm_delete_window_atom = intern_atom("WM_DELETE_WINDOW", 16);
+    uint8_t wp[28] = {0}; uint16_t wp_len=7; uint32_t wp_n=1;
+    wp[0]=18; /* ChangeProperty, mode=Replace */
+    memcpy(wp+2,&wp_len,2); memcpy(wp+4,&xterm_win,4);
+    memcpy(wp+8,&wm_protocols_atom,4);
+    uint32_t atom_type=4; memcpy(wp+12,&atom_type,4); /* type=ATOM */
+    wp[16]=32; /* format */
+    memcpy(wp+20,&wp_n,4);
+    memcpy(wp+24,&wm_delete_window_atom,4);
+    xwrite(wp,28);
 
     return 0;
 }
@@ -419,6 +506,14 @@ void xterm_render(void)
     render_all(xterm_win, xterm_gc, xterm_depth);
 }
 
+/* row<0 hides the cursor; otherwise it's shown at (row,col) as a full-block
+ * fg/bg inversion on the next xterm_render() call. No blinking. */
+void xterm_set_cursor(int row, int col)
+{
+    cursor_row = row;
+    cursor_col = col;
+}
+
 /* Wait for X events, returning nonzero when an expose series is complete. */
 int xterm_wait(int timeout_ms)
 {
@@ -438,6 +533,17 @@ int xterm_wait(int timeout_ms)
             if (count == 0) redraw = 1;
         } else if (etype == 2) {
             handle_keypress(ev);
+        } else if (etype == 7) {
+            /* EnterNotify: pointer entered the window. Re-assert focus so
+             * typing works regardless of the WM's own focus policy. */
+            grab_focus();
+        } else if (etype == 33) {
+            /* ClientMessage: check for a WM_DELETE_WINDOW close request. */
+            uint32_t mtype; memcpy(&mtype, ev + 8, 4);
+            if (mtype == wm_protocols_atom) {
+                uint32_t data0; memcpy(&data0, ev + 12, 4);
+                if (data0 == wm_delete_window_atom) close_requested = 1;
+            }
         }
         p.revents = 0;
         ready = poll(&p, 1, 0);

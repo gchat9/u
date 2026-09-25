@@ -7,7 +7,12 @@
 
 int x11_backend_init(void)
 {
-    return xterm_init();
+    int rc = xterm_init();
+    if (rc == 0) {
+        static const char title[] = "u-tmux";
+        xterm_set_title(title, sizeof title - 1);
+    }
+    return rc;
 }
 
 int x11_backend_rows(void) { return xterm_rows(); }
@@ -15,6 +20,7 @@ int x11_backend_columns(void) { return xterm_columns(); }
 int x11_backend_wait(int timeout_ms) { return xterm_wait(timeout_ms); }
 int x11_backend_fd(void) { return xterm_fd(); }
 int x11_backend_read_input(uint8_t *buf, int cap) { return xterm_read_key(buf, cap); }
+int x11_backend_close_requested(void) { return xterm_close_requested(); }
 
 void x11_backend_render(const Screen *s)
 {
@@ -32,6 +38,13 @@ void x11_backend_render(const Screen *s)
         }
         for (int c = w; c < cols; c++) fb[r * cols + c] = ' ';
     }
+    /* This is called on every content update (unlike the status bar,
+     * which is deliberately redrawn far less often — see main.c), so
+     * it's the right place to keep the cursor current: set it from the
+     * Screen we were just handed, every time, rather than needing a
+     * separate call that could easily end up firing before or after
+     * the wrong render and lag a frame behind. */
+    xterm_set_cursor(s->cur_row, s->cur_col);
     xterm_render();
 }
 

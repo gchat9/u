@@ -21,4 +21,15 @@ int xterm_fd(void);
  * written (0 if none pending). */
 int xterm_read_key(uint8_t *buf, int cap);
 
+/* Cursor: full-block fg/bg inversion at (row,col) on the next
+ * xterm_render(). No blinking. Pass row<0 to hide it. */
+void xterm_set_cursor(int row, int col);
+
+/* Set WM_NAME (window title / taskbar label). */
+void xterm_set_title(const char *name, int len);
+
+/* Nonzero once the window manager has sent a WM_DELETE_WINDOW request
+ * (the user closed the window). Sticky — stays set once seen. */
+int xterm_close_requested(void);
+
 #endif

@@ -122,8 +122,15 @@ static void redraw_status(void)
         alive[i]  = (w != NULL && w->alive);
         pids[i]   = (w && w->alive) ? w->pty.child : 0;
     }
+    /* Under X11_BACKEND the cursor is kept current by x11_backend_render()
+     * itself (see render.c / x11_backend.c) — it fires on every content
+     * update, whereas this status-bar redraw deliberately doesn't (see
+     * the "NOT redrawn on every PTY update" comment further down), so
+     * setting the cursor from here would either lag a frame or need its
+     * own staleness tracking for no benefit. */
     status_draw(g_rows, g_cols, g_cur, pids, exist, alive);
 
+#ifndef X11_BACKEND
     /*
      * status_draw leaves the real cursor somewhere on the status row.
      * Re-park it at the window's cursor position immediately so it is
@@ -141,6 +148,7 @@ static void redraw_status(void)
         g_rs.cursor_row = r;
         g_rs.cursor_col = c;
     }
+#endif
 }
 
 /* ================================================================== */
@@ -336,14 +344,22 @@ static void auto_detach(void)
         close(g_observer_fd);
         g_observer_fd = -1;
     }
+#ifndef X11_BACKEND
     (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
     input_restore();
+#endif
     render_free(&g_rs);
     session_detach(g_session_sock, g_wins, g_cur);
 }
 
-#if SCROLLBACK_ENABLED
-/*
+#if SCROLLBACK_ENABLED && !defined(X11_BACKEND)
+/* Scrollback-as-plain-text-over-the-real-terminal isn't meaningful for
+ * X11_BACKEND (there is no "real terminal" it's allowed to write to —
+ * see the X11_BACKEND note by the main select() loop). Disabled here
+ * for now rather than silently misbehaving; an X11-native scrollback
+ * view (rendered into the window like everything else) is a follow-up,
+ * not implemented yet.
+ *
  * Render the scrollback history for the current window.
  * Displays up to child_rows() lines of captured history ending at
  * g_scrollback_offset lines from the most-recent captured line.
@@ -558,10 +574,14 @@ static bool drain_pty(Window *w)
 
 static void cleanup(void)
 {
+#ifndef X11_BACKEND
     /* Ensure cursor is visible in the parent terminal regardless of what
-     * the active window's application had set. */
+     * the active window's application had set. Under X11_BACKEND we never
+     * touch the parent tty in the first place, so there's nothing here to
+     * undo. */
     (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
     input_restore();
+#endif
     render_free(&g_rs);
     for (int i = 0; i < MAX_WINDOWS; i++)
         window_free(i);
@@ -679,9 +699,9 @@ static void handle_event(InputEvent ev)
         for (int i = 0; i < MAX_WINDOWS; i++)
             if (!g_wins[i]) { switch_to(i); break; }
         break;
-#if SCROLLBACK_ENABLED
     case CMD_SCROLLBACK_ENTER:
     case CMD_SCROLLBACK_ENTER_PGUP:
+#if SCROLLBACK_ENABLED && !defined(X11_BACKEND)
         if (g_wins[g_cur] && g_wins[g_cur]->vt.scr.scrollback &&
                 g_wins[g_cur]->vt.scr.scrollback_len > 0) {
             g_scrollback_mode   = true;
@@ -692,8 +712,9 @@ static void handle_event(InputEvent ev)
                                   ? (child_rows() - 1) : 0;
             render_scrollback_view();
         }
-        break;
 #endif
+        /* Not implemented for X11_BACKEND yet (see render_scrollback_view) */
+        break;
     case CMD_CLOSE_WINDOW: window_free(g_cur); {
         int next = -1;
         for (int j = 0; j < MAX_WINDOWS; j++)
@@ -855,7 +876,9 @@ int main(int argc, char *argv[])
         get_term_size(&g_rows, &g_cols);
 #endif
         render_init(&g_rs, child_rows(), g_cols);
+#ifndef X11_BACKEND
         (void)write(STDOUT_FILENO, "\033[?1049h", 8);
+#endif
 
         int crows = child_rows();
         for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -890,7 +913,9 @@ int main(int argc, char *argv[])
         int    win_count = parse_args(argc, argv, win_specs);
 
         render_init(&g_rs, child_rows(), g_cols);
+#ifndef X11_BACKEND
         (void)write(STDOUT_FILENO, "\033[?1049h", 8);
+#endif
 
         int first_slot = -1;
         for (int w = 0; w < win_count; w++) {
@@ -900,7 +925,9 @@ int main(int argc, char *argv[])
             if (slot < 0) break;
 
             if (!window_create(slot, (char *const *)win_specs[w])) {
+#ifndef X11_BACKEND
                 (void)write(STDOUT_FILENO, "\033[?1049l", 8);
+#endif
                 fprintf(stderr, "mux: failed to create window %d\n", w + 1);
                 return 1;
             }
@@ -910,7 +937,9 @@ int main(int argc, char *argv[])
         g_cur = first_slot >= 0 ? first_slot : 0;
     }
 
+#ifndef X11_BACKEND
     input_raw_mode();
+#endif
 
     /* Full redraw on attach (shadow is empty); status-only for fresh start */
     if (attach_mode)
@@ -932,6 +961,12 @@ int main(int argc, char *argv[])
     while (!g_quit) {
 
         if (g_winch) { g_winch = 0; handle_resize(); }
+
+#ifdef X11_BACKEND
+        /* Window manager asked us to close (user clicked the close
+         * button, Alt-F4, etc) — treat it exactly like SIGTERM. */
+        if (x11_backend_close_requested()) g_quit = 1;
+#endif
 
         /* Downgrade to observer after a takeover handshake */
         if (g_become_observer_rows > 0) {
@@ -956,7 +991,11 @@ int main(int argc, char *argv[])
             int obs_ret = session_become_observer(obs_conn, br, bc);
             if (obs_ret == 1) {
                 /* Re-init enough state to run session_attach */
+#ifdef X11_BACKEND
+                g_rows = x11_backend_rows(); g_cols = x11_backend_columns();
+#else
                 get_term_size(&g_rows, &g_cols);
+#endif
                 int ns = -1, of2 = -1;
                 if (session_attach(g_wins, &g_cur, &ns, &of2) < 0) {
                     g_quit = 1; break;
@@ -978,8 +1017,10 @@ int main(int argc, char *argv[])
                 }
                 if (of2 >= 0) g_observer_fd = of2;
                 render_init(&g_rs, child_rows(), g_cols);
+#ifndef X11_BACKEND
                 (void)write(STDOUT_FILENO, "\033[?1049h", 8);
                 input_raw_mode();
+#endif
                 signal(SIGWINCH, on_sigwinch);
                 signal(SIGCHLD,  on_sigchld);
                 signal(SIGTERM,  on_sigterm);
@@ -1041,8 +1082,23 @@ int main(int argc, char *argv[])
         /* Build fd set */
         fd_set rfds;
         FD_ZERO(&rfds);
+#ifdef X11_BACKEND
+        /* X11_BACKEND is a self-contained GUI program: all user
+         * interaction goes through its own window, never through
+         * whatever real terminal happened to launch it (which may not
+         * even have a real user attached — service manager, script,
+         * CI). We deliberately never read the parent tty's stdin at
+         * all. The one exception is Ctrl-C, and that needs no code
+         * here: since we never touch the parent tty's termios (no raw
+         * mode), it stays in its normal cooked/ISIG mode, so the
+         * kernel itself turns a Ctrl-C typed there into a real SIGINT
+         * delivered straight to this process, handled the same as any
+         * other SIGINT (see on_sigterm). */
+        int maxfd = -1;
+#else
         FD_SET(STDIN_FILENO, &rfds);
         int maxfd = STDIN_FILENO;
+#endif
         for (int i = 0; i < MAX_WINDOWS; i++) {
             Window *w = g_wins[i];
             if (w && w->alive && w->pty.master >= 0) {
@@ -1237,6 +1293,7 @@ int main(int argc, char *argv[])
             }
         }
 
+#ifndef X11_BACKEND
         /* stdin */
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
             uint8_t buf[256];
@@ -1267,6 +1324,7 @@ int main(int argc, char *argv[])
                 handle_event(ev);
             }
         }
+#endif
     }
 
     cleanup();
