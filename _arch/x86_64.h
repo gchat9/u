@@ -136,7 +136,7 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
 /* recv does not exist as separate syscall here; express via recvfrom */
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
-static inline long execve(const char *pathname,
+static inline int execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(59, pathname, argv, envp); }
 

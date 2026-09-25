@@ -48,11 +48,6 @@ int pty_open(Pty *pty, int rows, int cols, char *const *argv)
         /* Tell programs what terminal we claim to be */
         setenv("TERM", "xterm-256color", 1);
 
-        /* Unset variables that would confuse programs about their parent */
-        unsetenv("TMUX");
-        unsetenv("TMUX_PANE");
-        unsetenv("STY");          /* GNU screen */
-
         if (argv) {
             execvp(argv[0], argv);
         } else {

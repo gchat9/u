@@ -148,7 +148,7 @@ static inline void *mremap(void *old_address, size_t old_size,
                            size_t new_size, int flags)
     { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
 
-static inline long execve(const char *pathname,
+static inline int execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(221, pathname, argv, envp); }
 

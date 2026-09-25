@@ -263,7 +263,8 @@ static uint8_t *cell_buf;
 
 static inline uint32_t blend(uint8_t a, uint32_t src, uint32_t dst)
 {
-    if (!a) return dst; if (a==255) return src;
+    if (a==  0) return dst;
+    if (a==255) return src;
     unsigned sr=(src>>16)&0xFF, sg=(src>>8)&0xFF, sb=src&0xFF;
     unsigned dr=(dst>>16)&0xFF, dg=(dst>>8)&0xFF, db=dst&0xFF;
     return (uint32_t)(((sr*a+dr*(255-a))/255)<<16|

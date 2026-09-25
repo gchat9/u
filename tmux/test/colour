@@ -1,0 +1,16 @@
+#!/bin/bash
+
+set -e
+source "$(dirname $0)/_test-harness.sh"
+
+xdotool type "\
+ clear; \
+ printf '\e[31mRed\e[0m\n'; \
+ printf '\e[32mGreen\e[0m\n'; \
+ printf '\e[34mBlue\e[0m\n'; \
+ printf '\e[97;41m bright-white-on-red \e[0m\n'; \
+ printf '\e[30;42m black-on-green \e[0m\n'; \
+ printf '\e[33;44m yellow-on-blue \e[0m\n\n'"
+xdotool key Return
+sleep 1
+xwd -root | convert xwd:- "$TESTDIR/$TESTNAME.png"

@@ -74,7 +74,7 @@ static inline long open(const char *pathname, int flags, int mode)
 static inline long close(int fd)
     { _syscall1(6, fd); }
 
-static inline long execve(const char *pathname, char *const argv[], char *const envp[])
+static inline int execve(const char *pathname, char *const argv[], char *const envp[])
     { _syscall3(11, pathname, argv, envp); }
 
 static inline long getpid(void)

@@ -1,0 +1,6 @@
+# dependencies
+
+python3
+python3-xlib
+x11-apps # for xwd
+imagemagick # or graphicsmagick-imagemagick-compat, to covert xwd's output to .png
