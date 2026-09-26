@@ -32,6 +32,41 @@ struct sockaddr_un {
 #define C_FG 0xCDD9E5u
 #define C_CU 0x57AB5Au
 
+/* Standard xterm 256-colour palette (see e.g.
+ * https://www.ditig.com/256-colors-cheat-sheet), matching the encoding
+ * documented in tmux/vt.h for Cell.fg/bg: 0-7 ANSI, 8-15 bright ANSI,
+ * 16-231 the 6x6x6 colour cube, 232-255 the greyscale ramp.
+ *
+ * Slots 0 and 15 (ANSI black / bright white) are overwritten with this
+ * backend's own C_BG/C_FG theme colours: CELL_FG_DFL/CELL_BG_DFL (SGR
+ * "default colour") are resolved to indices 15/0 rather than needing a
+ * separate default-flag byte per cell, so plain unstyled text renders
+ * pixel-identical to before this change. The one cost: literal ANSI
+ * black (SGR 40) and bright white (SGR 97) become indistinguishable
+ * from "default" — a deliberate compactness trade-off. */
+static uint32_t palette[256];
+
+static void build_palette(void)
+{
+    static const uint32_t base16[16] = {
+        0x000000,0x800000,0x008000,0x808000,0x000080,0x800080,0x008080,0xc0c0c0,
+        0x808080,0xff0000,0x00ff00,0xffff00,0x0000ff,0xff00ff,0x00ffff,0xffffff,
+    };
+    for (int i = 0; i < 16; i++) palette[i] = base16[i];
+    static const uint8_t lvl[6] = {0,95,135,175,215,255};
+    for (int r = 0; r < 6; r++)
+        for (int g = 0; g < 6; g++)
+            for (int b = 0; b < 6; b++)
+                palette[16 + r*36 + g*6 + b] =
+                    ((uint32_t)lvl[r] << 16) | ((uint32_t)lvl[g] << 8) | lvl[b];
+    for (int i = 0; i < 24; i++) {
+        uint32_t v = 8 + (uint32_t)i * 10;
+        palette[232 + i] = (v << 16) | (v << 8) | v;
+    }
+    palette[0]  = C_BG;
+    palette[15] = C_FG;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * X11 I/O
  * ═══════════════════════════════════════════════════════════════════ */
@@ -238,6 +273,9 @@ static void font_load(const char *path)
  * ═══════════════════════════════════════════════════════════════════ */
 
 static uint8_t *scr;
+static uint8_t *fgb, *bgb;
+static uint8_t fg_storage[GRID_MAX_CELLS];   /* xterm 256-colour index per cell */
+static uint8_t bg_storage[GRID_MAX_CELLS];
 
 static void grid_init(uint16_t screen_w, uint16_t screen_h,
                       uint8_t *screen, size_t capacity)
@@ -253,6 +291,9 @@ static void grid_init(uint16_t screen_w, uint16_t screen_h,
     if (cells > capacity) die("terminal grid is too large\n");
     scr = screen;
     memset(scr, 0, cells);
+    fgb = fg_storage; bgb = bg_storage;
+    memset(fgb, 15, cells);  /* default fg (palette[15], see build_palette) */
+    memset(bgb, 0,  cells);  /* default bg (palette[0])                     */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -280,8 +321,10 @@ static void render_cell(int row, int col,
                         uint32_t draw, uint32_t gc, uint8_t depth)
 {
     int is_cursor = (row == cursor_row && col == cursor_col);
-    uint32_t bg = is_cursor ? C_FG : C_BG;
-    uint32_t fg = is_cursor ? C_BG : C_FG;
+    int idx = row * cols + col;
+    uint32_t bg = palette[bgb[idx]];
+    uint32_t fg = palette[fgb[idx]];
+    if (is_cursor) { uint32_t t = bg; bg = fg; fg = t; }
     int n = cell_w * cell_h;
     if (depth == 16) {
         size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
@@ -295,7 +338,7 @@ static void render_cell(int row, int col,
         uint32_t *line = (uint32_t *)cell_buf;
         for (int i = 0; i < n; i++) line[i] = bg;
     }
-    uint8_t cp = scr[row*cols + col];
+    uint8_t cp = scr[idx];
     if (cp >= 0x20 && cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
         const uint8_t *g = glyph_data + (size_t)(cp-first_cp)*cell_w*cell_h;
         for (int i = 0; i < n; i++) {
@@ -393,6 +436,11 @@ int xterm_close_requested(void) { return close_requested; }
 static uint8_t xterm_depth;
 
 uint8_t *xterm_framebuffer(void) { return scr; }
+/* Parallel to xterm_framebuffer(): one xterm 256-colour palette index
+ * per cell. Defaults (palette[15]/palette[0], see build_palette) fill
+ * cells the caller never touches. */
+uint8_t *xterm_fg_buffer(void) { return fgb; }
+uint8_t *xterm_bg_buffer(void) { return bgb; }
 int xterm_columns(void) { return cols; }
 int xterm_rows(void) { return rows; }
 
@@ -416,6 +464,7 @@ int xterm_init(void)
     uint8_t setup_storage[SETUP_MAX];
     x_max_request_words = 65535;
     cell_buf = cell_storage;
+    build_palette();
     font_load("/etc/font.bfnt");
 
     xfd = socket(AF_UNIX, SOCK_STREAM, 0);

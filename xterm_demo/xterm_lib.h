@@ -2,6 +2,11 @@
 #define XTERM_LIB_H
 
 uint8_t *xterm_framebuffer(void);
+/* Parallel per-cell xterm 256-colour palette indices (0-255), same
+ * layout as xterm_framebuffer() (row*columns()+col). Index 15 is this
+ * backend's "default fg", index 0 its "default bg" (see xterm_lib.c). */
+uint8_t *xterm_fg_buffer(void);
+uint8_t *xterm_bg_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);
 int xterm_init(void);
