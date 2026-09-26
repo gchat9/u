@@ -570,12 +570,14 @@ static void handle_sgr(VTParser *p)
         case 5: s->cur_attrs |=  ATTR_BLINK;     break;
         case 7: s->cur_attrs |=  ATTR_REVERSE;   break;
         case 8: s->cur_attrs |=  ATTR_INVIS;     break;
+        case 9: s->cur_attrs |=  ATTR_STRIKE;    break;
         case 22: s->cur_attrs &= ~(ATTR_BOLD | ATTR_DIM); break;
         case 23: s->cur_attrs &= ~ATTR_ITALIC;    break;
         case 24: s->cur_attrs &= ~ATTR_UNDERLINE; break;
         case 25: s->cur_attrs &= ~ATTR_BLINK;     break;
         case 27: s->cur_attrs &= ~ATTR_REVERSE;   break;
         case 28: s->cur_attrs &= ~ATTR_INVIS;     break;
+        case 29: s->cur_attrs &= ~ATTR_STRIKE;    break;
         case 39: s->cur_fg = COLOR_DEFAULT; break;
         case 49: s->cur_bg = COLOR_DEFAULT; break;
         /* 8-colour fg */

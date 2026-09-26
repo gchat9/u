@@ -20,6 +20,8 @@
 #include "../_sys/_main.h"
 #endif
 
+#include "xterm_lib.h"
+
 #define AF_UNIX 1
 
 struct sockaddr_un {
@@ -273,9 +275,10 @@ static void font_load(const char *path)
  * ═══════════════════════════════════════════════════════════════════ */
 
 static uint8_t *scr;
-static uint8_t *fgb, *bgb;
+static uint8_t *fgb, *bgb, *atb;
 static uint8_t fg_storage[GRID_MAX_CELLS];   /* xterm 256-colour index per cell */
 static uint8_t bg_storage[GRID_MAX_CELLS];
+static uint8_t attr_storage[GRID_MAX_CELLS]; /* XTERM_ATTR_* bitmask per cell    */
 
 static void grid_init(uint16_t screen_w, uint16_t screen_h,
                       uint8_t *screen, size_t capacity)
@@ -291,9 +294,10 @@ static void grid_init(uint16_t screen_w, uint16_t screen_h,
     if (cells > capacity) die("terminal grid is too large\n");
     scr = screen;
     memset(scr, 0, cells);
-    fgb = fg_storage; bgb = bg_storage;
+    fgb = fg_storage; bgb = bg_storage; atb = attr_storage;
     memset(fgb, 15, cells);  /* default fg (palette[15], see build_palette) */
     memset(bgb, 0,  cells);  /* default bg (palette[0])                     */
+    memset(atb, 0,  cells);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -311,6 +315,28 @@ static inline uint32_t blend(uint8_t a, uint32_t src, uint32_t dst)
     return (uint32_t)(((sr*a+dr*(255-a))/255)<<16|
                       ((sg*a+dg*(255-a))/255)<< 8|
                       ((sb*a+db*(255-a))/255));
+}
+
+static inline uint16_t pack565(uint32_t c)
+{
+    return (uint16_t)(((c >> 8) & 0xf800) | ((c >> 5) & 0x07e0) | ((c >> 3) & 0x001f));
+}
+
+/* Solid horizontal line, full cell width, at cell-local row `r` (0 = top
+ * of cell). Used for ATTR_UNDERLINE / ATTR_STRIKE — cheap structural
+ * marks that a colour change alone can't express. */
+static void fill_row(int r, uint32_t color, uint8_t depth)
+{
+    if (r < 0 || r >= cell_h) return;
+    if (depth == 16) {
+        size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
+        uint16_t *line = (uint16_t *)(cell_buf + (size_t)r * stride);
+        uint16_t p = pack565(color);
+        for (int x = 0; x < cell_w; x++) line[x] = p;
+    } else {
+        uint32_t *line = (uint32_t *)cell_buf + (size_t)r * cell_w;
+        for (int x = 0; x < cell_w; x++) line[x] = color;
+    }
 }
 
 /* Cursor: a plain full-block inversion (fg/bg swapped for the whole
@@ -355,6 +381,14 @@ static void render_cell(int row, int col,
                 ((uint32_t *)cell_buf)[i] = color;
             }
         }
+    }
+    uint8_t rattrs = atb[idx];
+    if (rattrs & XTERM_ATTR_UNDERLINE) {
+        int r = baseline + 1;
+        fill_row(r >= cell_h ? cell_h - 1 : r, fg, depth);
+    }
+    if (rattrs & XTERM_ATTR_STRIKE) {
+        fill_row(baseline / 2, fg, depth);
     }
     put_image(draw, gc, col*cell_w, row*cell_h, cell_w, cell_h, depth,
               depth == 16 ? 2 : 4, cell_buf);
@@ -441,6 +475,7 @@ uint8_t *xterm_framebuffer(void) { return scr; }
  * cells the caller never touches. */
 uint8_t *xterm_fg_buffer(void) { return fgb; }
 uint8_t *xterm_bg_buffer(void) { return bgb; }
+uint8_t *xterm_attr_buffer(void) { return atb; }
 int xterm_columns(void) { return cols; }
 int xterm_rows(void) { return rows; }
 

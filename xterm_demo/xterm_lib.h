@@ -7,6 +7,13 @@ uint8_t *xterm_framebuffer(void);
  * backend's "default fg", index 0 its "default bg" (see xterm_lib.c). */
 uint8_t *xterm_fg_buffer(void);
 uint8_t *xterm_bg_buffer(void);
+
+/* Parallel per-cell structural-attribute bitmask (only attrs that need
+ * extra pixels drawn, not just a colour swap, live here). Independent
+ * of tmux/vt.h's ATTR_* bit values by design — callers translate. */
+#define XTERM_ATTR_UNDERLINE 0x01
+#define XTERM_ATTR_STRIKE    0x02
+uint8_t *xterm_attr_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);
 int xterm_init(void);

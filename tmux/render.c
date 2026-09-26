@@ -80,6 +80,7 @@ static void emit_sgr(RenderState *rs, uint16_t fg, uint16_t bg, uint8_t attrs)
     if (attrs & ATTR_UNDERLINE) { buf[pos++]=';'; buf[pos++]='4'; }
     if (attrs & ATTR_BLINK)     { buf[pos++]=';'; buf[pos++]='5'; }
     if (attrs & ATTR_REVERSE)   { buf[pos++]=';'; buf[pos++]='7'; }
+    if (attrs & ATTR_STRIKE)    { buf[pos++]=';'; buf[pos++]='9'; }
 
     /* Foreground */
     if (fg < 8)
