@@ -1,4 +1,5 @@
 #include "x11_backend.h"
+#include "status.h"
 
 #include "../xterm_demo/xterm_lib.h"
 
@@ -63,7 +64,8 @@ void x11_backend_render(const Screen *s)
             const Cell *cell = &s->cells[r][c];
             uint32_t ch = cell->ch;
             int i = r * cols + c;
-            fb[i] = (ch >= 0x20 && ch < 0x80) ? (uint8_t)ch :
+            fb[i] = (ch >= 0x20 && ch <= 0x7E) ? (uint8_t)ch :
+                    (ch >= 0xA0 && ch <= 0xFF) ? (uint8_t)ch :
                     (ch == 0 ? ' ' : '?');
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
         }
@@ -82,29 +84,53 @@ void x11_backend_render(const Screen *s)
     xterm_render();
 }
 
+/* Context for x11_emit: tracks where the next piece of text lands. */
+typedef struct {
+    uint8_t *fb, *fgb, *bgb, *atb;
+    int row, xcols, cols, col;
+} X11StatusCtx;
+
+/* X11 emit: write each byte's glyph + the piece's own fg/bg straight
+ * into the per-cell buffers. Style already IS the two bytes those
+ * buffers want (see config.h), so there's nothing to parse or convert
+ * -- this is the zero-conversion half promised there. */
+static void x11_emit(void *vctx, const char *s, int n, Style style)
+{
+    X11StatusCtx *ctx = vctx;
+    for (int i = 0; i < n && ctx->col < ctx->cols; i++, ctx->col++) {
+        int idx = ctx->row * ctx->xcols + ctx->col;
+        uint8_t ch = (uint8_t)s[i];
+        ctx->fb[idx]  = (ch >= 0x20 && ch <= 0x7E) ? ch :
+                        (ch >= 0xA0) ? ch : ' ';
+        ctx->fgb[idx] = style.fg;
+        ctx->bgb[idx] = style.bg;
+        ctx->atb[idx] = 0;
+    }
+}
+
 void x11_backend_status(int row, int cols, int active,
                         pid_t child_pids[], bool wins_exist[], bool wins_alive[])
 {
-    (void)active; (void)child_pids; (void)wins_alive;
-    uint8_t *fb  = xterm_framebuffer();
-    uint8_t *fgb = xterm_fg_buffer();
-    uint8_t *bgb = xterm_bg_buffer();
-    uint8_t *atb = xterm_attr_buffer();
     int xcols = xterm_columns();
     int xrows = xterm_rows();
     if (row < 0 || row >= xrows) return;
     if (cols > xcols) cols = xcols;
+
+    X11StatusCtx ctx = {
+        .fb = xterm_framebuffer(), .fgb = xterm_fg_buffer(),
+        .bgb = xterm_bg_buffer(),  .atb = xterm_attr_buffer(),
+        .row = row, .xcols = xcols, .cols = cols, .col = 0,
+    };
+
+    /* Blank the row first: status_layout()'s own padding math already
+     * covers exactly `cols` columns when content fits, but this is a
+     * cheap defensive backstop (e.g. the pathological content-wider-
+     * than-cols case) rather than relying on that invariant alone. */
     for (int c = 0; c < cols; c++) {
         int i = row * xcols + c;
-        fb[i] = ' '; fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+        ctx.fb[i] = ' '; ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
     }
-    int p = 0;
-    for (int i = 0; i < 10 && p + 4 < cols; i++) {
-        if (!wins_exist[i]) continue;
-        fb[row * xcols + p++] = ' ';
-        fb[row * xcols + p++] = (uint8_t)('1' + i);
-        fb[row * xcols + p++] = ':';
-        fb[row * xcols + p++] = ' ';
-    }
+
+    status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive);
     xterm_render();
 }

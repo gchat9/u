@@ -32,19 +32,6 @@ static void proc_name(pid_t pid, char *buf, size_t buflen)
 }
 
 /* ================================================================== */
-/* Colour macros                                                        */
-/* ================================================================== */
-
-/* Colour constants: resolved from config.h style macros at compile time */
-#define C_RESET     _RESET
-#define C_BAR_BG    STATUS_BAR_STYLE
-#define C_WIN_NORM  WINDOW_STATUS_STYLE
-#define C_WIN_ACT   WINDOW_STATUS_CURRENT_STYLE
-#define C_WIN_DEAD  WINDOW_STATUS_ACTIVITY_STYLE
-#define C_HOST      STATUS_LEFT_STYLE
-#define C_CLOCK     STATUS_RIGHT_STYLE
-
-/* ================================================================== */
 /* Output buffer                                                        */
 /* ================================================================== */
 
@@ -55,17 +42,14 @@ static void sb_init(SBuf *b, size_t cap)
 static void sb_cat(SBuf *b, const char *s, size_t n)
     { if (b->pos + n < b->cap) { memcpy(b->data+b->pos, s, n); b->pos += n; } }
 static void sb_str(SBuf *b, const char *s) { sb_cat(b, s, strlen(s)); }
-static void sb_pad(SBuf *b, int n)
-    { for (int i = 0; i < n; i++) sb_cat(b, " ", 1); }
 static void sb_free(SBuf *b) { free(b->data); b->data = NULL; }
 
 /* ================================================================== */
 /* Public API                                                           */
 /* ================================================================== */
 
-int status_render(char *_out, size_t _outlen,
-                  int rows, int cols, int active,
-                  pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+void status_layout(StatusEmit emit, void *ctx, int cols, int active,
+                   pid_t child_pids[], bool wins_exist[], bool wins_alive[])
 {
     /* ---- hostname (cached - won't change during a session) ---- */
     static char hostname[64] = "";
@@ -86,7 +70,6 @@ int status_render(char *_out, size_t _outlen,
     /* ---- tab labels ---- */
     char tab_text[MAX_WINDOWS][24];
     int  tab_w   [MAX_WINDOWS];
-    int  tabs_total = 0;
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!wins_exist[i]) { tab_text[i][0]='\0'; tab_w[i]=0; continue; }
@@ -96,16 +79,69 @@ int status_render(char *_out, size_t _outlen,
         else
             snprintf(pname, sizeof(pname), "dead");
         if (strlen(pname) > 10) pname[10] = '\0';
-        int n = snprintf(tab_text[i], sizeof(tab_text[i]),
-                         "%d:%s", i + 1, pname);
-        tab_w[i]    = n;
-        tabs_total += n + 1;
+        tab_w[i] = snprintf(tab_text[i], sizeof(tab_text[i]),
+                            "%d:%s", i + 1, pname);
     }
 
     int host_w  = (int)strlen(hostname) + 2;
     int clock_w = (int)strlen(clock_str) + 2;
 
-    /* ---- assemble ---- */
+    /* Left: hostname */
+    emit(ctx, " ", 1, STATUS_LEFT_COLOR);
+    emit(ctx, hostname, (int)strlen(hostname), STATUS_LEFT_COLOR);
+    int printed = host_w - 1;  /* no trailing space on hostname */
+
+    /* Window tabs: separator space is always bar-bg; only the label
+     * itself gets the tab highlight colour. */
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!wins_exist[i]) continue;
+        emit(ctx, " ", 1, STATUS_BAR_COLOR);        /* unhighlighted gap */
+        Style st = (i == active) ? WINDOW_STATUS_CURRENT_COLOR :
+                   !wins_alive[i] ? WINDOW_STATUS_ACTIVITY_COLOR :
+                                    WINDOW_STATUS_COLOR;
+        emit(ctx, tab_text[i], tab_w[i], st);
+        printed += tab_w[i] + 1;                    /* label + separator */
+    }
+
+    /* One space after the last tab before the padding region */
+    emit(ctx, " ", 1, STATUS_BAR_COLOR);
+    printed += 1;
+
+    /* Padding, in chunks -- may be wider than any single fixed buffer */
+    int pad = cols - printed - clock_w;
+    static const char spaces[64] =
+        "                                                                ";
+    while (pad > 0) {
+        int chunk = pad < (int)sizeof spaces ? pad : (int)sizeof spaces;
+        emit(ctx, spaces, chunk, STATUS_BAR_COLOR);
+        pad -= chunk;
+    }
+
+    /* Right: clock */
+    emit(ctx, " ", 1, STATUS_RIGHT_COLOR);
+    emit(ctx, clock_str, (int)strlen(clock_str), STATUS_RIGHT_COLOR);
+    emit(ctx, " ", 1, STATUS_RIGHT_COLOR);
+}
+
+/* VT-to-VT emit: one combined SGR sequence per piece of text, then the
+ * text itself. A style fully specifies both fg and bg, so each call is
+ * self-contained -- no "reset to bar colour" bookkeeping needed between
+ * pieces the way separate _FG()/_BG() macro pairs would have required. */
+static void vt_emit(void *vctx, const char *s, int n, Style style)
+{
+    if (n <= 0) return;
+    SBuf *b = vctx;
+    char sgr[24];
+    int m = snprintf(sgr, sizeof sgr, "\033[38;5;%u;48;5;%um",
+                     style.fg, style.bg);
+    sb_cat(b, sgr, (size_t)m);
+    sb_cat(b, s, (size_t)n);
+}
+
+int status_render(char *_out, size_t _outlen,
+                  int rows, int cols, int active,
+                  pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+{
     size_t _need = (size_t)(cols * 8 + 512);
     SBuf b;
     sb_init(&b, _need);
@@ -117,45 +153,10 @@ int status_render(char *_out, size_t _outlen,
     snprintf(move, sizeof(move), "\033[%d;1H\033[?7l", rows);
     sb_str(&b, move);
 
-    /* Left: hostname */
-    sb_str(&b, C_BAR_BG);
-    sb_str(&b, C_HOST);
-    sb_cat(&b, " ", 1);
-    sb_str(&b, hostname);
-    sb_str(&b, C_BAR_BG);
-    int printed = host_w - 1;  /* no trailing space on hostname */
-
-    /* Window tabs: separator space is always bar-bg; only the label
-     * itself gets the tab highlight colour. */
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!wins_exist[i]) continue;
-        sb_str(&b, C_BAR_BG);
-        sb_cat(&b, " ", 1);                         /* unhighlighted gap */
-        if (i == active)         sb_str(&b, C_WIN_ACT);
-        else if (!wins_alive[i]) sb_str(&b, C_WIN_DEAD);
-        else                     sb_str(&b, C_WIN_NORM);
-        sb_str(&b, tab_text[i]);
-        sb_str(&b, C_BAR_BG);
-        printed += tab_w[i] + 1;                    /* label + separator */
-    }
-
-    /* One space after the last tab before the padding region */
-    sb_str(&b, C_BAR_BG);
-    sb_cat(&b, " ", 1);
-    printed += 1;
-
-    /* Padding */
-    int pad = cols - printed - clock_w;
-    if (pad > 0) sb_pad(&b, pad);
-
-    /* Right: clock */
-    sb_str(&b, C_CLOCK);
-    sb_cat(&b, " ", 1);
-    sb_str(&b, clock_str);
-    sb_cat(&b, " ", 1);
+    status_layout(vt_emit, &b, cols, active, child_pids, wins_exist, wins_alive);
 
     /* Reset colours and re-enable auto-wrap */
-    sb_str(&b, C_RESET "\033[?7h");
+    sb_str(&b, _RESET "\033[?7h");
 
     int _ret = -1;
     if (b.pos <= _outlen) {

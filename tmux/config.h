@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <stdint.h>  /* uint8_t, for Style below */
+
 /* ================================================================== */
 /* Session                                                              */
 /* ================================================================== */
@@ -69,38 +71,68 @@
 /* Naming mirrors tmux's option names so the mapping is obvious to     */
 /* anyone familiar with tmux.conf:                                      */
 /*                                                                      */
-/*   status-left           → STATUS_LEFT_STYLE                         */
-/*   status-right          → STATUS_RIGHT_STYLE                        */
-/*   status (bar bg/fg)    → STATUS_BAR_STYLE                          */
-/*   window-status-style          → WINDOW_STATUS_STYLE                */
-/*   window-status-current-style  → WINDOW_STATUS_CURRENT_STYLE        */
-/*   window-status-activity-style → WINDOW_STATUS_ACTIVITY_STYLE       */
+/*   status-left           → STATUS_LEFT_*                             */
+/*   status-right          → STATUS_RIGHT_*                             */
+/*   status (bar bg/fg)    → STATUS_BAR_*                              */
+/*   window-status-style          → WINDOW_STATUS_*                    */
+/*   window-status-current-style  → WINDOW_STATUS_CURRENT_*            */
+/*   window-status-activity-style → WINDOW_STATUS_ACTIVITY_*           */
+/*                                                                      */
+/* Each style is one xterm 256-colour fg/bg pair, given as plain        */
+/* numbers exactly once below, in two compile-time-only forms so        */
+/* neither backend does any runtime parsing or conversion:              */
+/*                                                                      */
+/*   *_STYLE  a ready-made ANSI string (via _FG/_BG above), for the    *
+ *            VT-to-VT backend and anywhere else building escape text   *
+ *            at compile time (see main.c's scrollback banner).         *
+ *   *_COLOR  the same fg/bg as a Style{fg,bg} struct literal -- the    *
+ *            exact two bytes the X11 backend's per-cell colour         *
+ *            buffers want (see vt.h's identical Cell.fg/bg encoding),  *
+ *            written in directly with nothing to parse.                */
 /* ================================================================== */
 
+typedef struct { uint8_t fg, bg; } Style;
+
 /* Background that fills the whole status bar (gaps, padding, etc.)    */
-#define STATUS_BAR_STYLE \
-    _BG(234) _FG(250)
+#define STATUS_BAR_FG 250
+#define STATUS_BAR_BG 234
+#define STATUS_BAR_STYLE  _FG(STATUS_BAR_FG) _BG(STATUS_BAR_BG)
+#define STATUS_BAR_COLOR  ((Style){ STATUS_BAR_FG, STATUS_BAR_BG })
 
 /* Left section: hostname                                               */
-#define STATUS_LEFT_STYLE \
-    _BG(237) _FG(78)
+#define STATUS_LEFT_FG 78
+#define STATUS_LEFT_BG 237
+#define STATUS_LEFT_STYLE _FG(STATUS_LEFT_FG) _BG(STATUS_LEFT_BG)
+#define STATUS_LEFT_COLOR ((Style){ STATUS_LEFT_FG, STATUS_LEFT_BG })
 
 /* Right section: clock                                                 */
-#define STATUS_RIGHT_STYLE \
-    _BG(237) _FG(78)
+#define STATUS_RIGHT_FG 78
+#define STATUS_RIGHT_BG 237
+#define STATUS_RIGHT_STYLE _FG(STATUS_RIGHT_FG) _BG(STATUS_RIGHT_BG)
+#define STATUS_RIGHT_COLOR ((Style){ STATUS_RIGHT_FG, STATUS_RIGHT_BG })
 
 /* Inactive window tab                                                  */
-#define WINDOW_STATUS_STYLE \
-    _BG(0) _FG(78)
+#define WINDOW_STATUS_FG 78
+#define WINDOW_STATUS_BG 0
+#define WINDOW_STATUS_STYLE _FG(WINDOW_STATUS_FG) _BG(WINDOW_STATUS_BG)
+#define WINDOW_STATUS_COLOR ((Style){ WINDOW_STATUS_FG, WINDOW_STATUS_BG })
 
 /* Currently active (focused) window tab                               */
+#define WINDOW_STATUS_CURRENT_FG 0
+#define WINDOW_STATUS_CURRENT_BG 72
 #define WINDOW_STATUS_CURRENT_STYLE \
-    _BG(72)  _FG(0)
+    _FG(WINDOW_STATUS_CURRENT_FG) _BG(WINDOW_STATUS_CURRENT_BG)
+#define WINDOW_STATUS_CURRENT_COLOR \
+    ((Style){ WINDOW_STATUS_CURRENT_FG, WINDOW_STATUS_CURRENT_BG })
 
 /* Dead/exited window tab  (tmux calls this "activity" but we use it   *
  * for zombie windows since we don't implement real activity flags yet) */
+#define WINDOW_STATUS_ACTIVITY_FG 240
+#define WINDOW_STATUS_ACTIVITY_BG 236
 #define WINDOW_STATUS_ACTIVITY_STYLE \
-    _BG(236) _FG(240)
+    _FG(WINDOW_STATUS_ACTIVITY_FG) _BG(WINDOW_STATUS_ACTIVITY_BG)
+#define WINDOW_STATUS_ACTIVITY_COLOR \
+    ((Style){ WINDOW_STATUS_ACTIVITY_FG, WINDOW_STATUS_ACTIVITY_BG })
 
 /* ================================================================== */
 /* Scrollback                                                           */

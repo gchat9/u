@@ -149,11 +149,24 @@ static void put_image(uint32_t draw, uint32_t gc,
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* GetKeyboardMapping (opcode 101): fixed reply header is 32 bytes, then
- * keysyms_per_keycode * count KEYSYMs (4 bytes each) follow. */
-#define KEYSYM_TABLE_MAX (256 * 8)
-
+ * keysyms_per_keycode * count KEYSYMs (4 bytes each) follow.
+ *
+ * keysyms_per_keycode is chosen by the server, not us, and grows with
+ * every extra shift level or layout group the system has configured
+ * (AltGr, a second language group, compose, ...) -- a real desktop's
+ * XKB config routinely reports 6-8+ where a bare test server reports
+ * 2. This translator only looks at the first four columns of any
+ * keycode's row -- the standard 4-level model (base, shift, AltGr,
+ * AltGr+shift) that covers every plain accented-letter layout -- so
+ * rather than sizing a table for the server's worst case (and
+ * silently losing all keyboard input for the rest of the run if some
+ * system's config exceeds it -- the previous bug here), stream the
+ * reply one keycode-row at a time and keep just those four columns.
+ * Table size is then a fixed 256*4 regardless of what the server
+ * actually sends. Levels beyond 4 (further layout groups, 5th-level
+ * shift, ...) aren't reachable through this translator. */
 static uint8_t  min_keycode, max_keycode, keysyms_per_kc;
-static uint32_t keysym_table[KEYSYM_TABLE_MAX];
+static uint32_t keysym_table[256][4];
 
 static void load_keyboard_mapping(void)
 {
@@ -171,20 +184,43 @@ static void load_keyboard_mapping(void)
     uint8_t hdr[32];
     xread(hdr, 32);
     if (hdr[0] != 1) return;   /* error reply: leave keysyms_per_kc == 0 */
-    uint32_t words; memcpy(&words, hdr+4, 4);
-    size_t n = (size_t)words;  /* count * keysyms-per-keycode, in words */
-    if (n > KEYSYM_TABLE_MAX) { xdrain(n * 4); return; }
-    xread(keysym_table, n * 4);
-    keysyms_per_kc = hdr[1];
+    uint8_t kspc = hdr[1];
+    if (!kspc) return;
+
+    uint8_t row[4 * 32];  /* 32 keysyms/keycode is already far more than
+                            * any real config uses; if some server still
+                            * exceeds it, drain the rest of that row
+                            * rather than losing wire-format sync. */
+    size_t rowbytes = (size_t)kspc * 4;
+    for (int i = 0; i < count; i++) {
+        if (rowbytes <= sizeof row) {
+            xread(row, rowbytes);
+        } else {
+            xread(row, sizeof row);
+            xdrain(rowbytes - sizeof row);
+        }
+        uint32_t v[4] = {0, 0, 0, 0};
+        for (int col = 0; col < kspc && col < 4; col++)
+            memcpy(&v[col], row + col * 4, 4);
+        if (kspc == 1) v[1] = v[0];  /* no distinct shift level: mirror base,
+                                       * matching the pre-AltGr behaviour */
+        keysym_table[i][0] = v[0]; keysym_table[i][1] = v[1];
+        keysym_table[i][2] = v[2]; keysym_table[i][3] = v[3];
+    }
+    keysyms_per_kc = kspc;
 }
 
-static uint32_t keysym_for(uint8_t keycode, int shifted)
+/* level: 0=base, 1=shift, 2=AltGr, 3=AltGr+shift. Returns 0 (NoSymbol)
+ * if the keymap doesn't define that level for this key -- e.g. any
+ * layout with no AltGr configured at all simply never populated
+ * columns 2/3, so keysym_for(kc, 2) is already a safe, silent no-op. */
+static uint32_t keysym_for(uint8_t keycode, int level)
 {
     if (!keysyms_per_kc || keycode < min_keycode || keycode > max_keycode)
         return 0;
-    int idx = (keycode - min_keycode) * keysyms_per_kc +
-              (shifted && keysyms_per_kc > 1 ? 1 : 0);
-    return keysym_table[idx];
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    return keysym_table[keycode - min_keycode][level];
 }
 
 #define KEY_QUEUE_CAP 256
@@ -200,17 +236,43 @@ static void key_push(uint8_t b)
 }
 
 /* Translate one KeyPress event (32 bytes) into 0+ output bytes. Covers
- * printable Latin-1, Ctrl-letter control codes, and the common control
- * keys/arrows as ANSI/VT sequences. Anything else is silently ignored. */
+ * printable Latin-1 (ASCII pushed as-is, 0xA0-0xFF UTF-8-encoded since
+ * that's what everything downstream expects on the wire), Ctrl-letter
+ * control codes, an Alt meta-prefix, and the common control keys/
+ * arrows as ANSI/VT sequences. Anything else is silently ignored.
+ *
+ * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to
+ * their Unicode code points, so ks doubles as the code point here with
+ * no translation table needed. */
 static void handle_keypress(const uint8_t *ev)
 {
     uint8_t keycode = ev[1];
     uint16_t state; memcpy(&state, ev+28, 2);
     int shift = (state & 0x0001) != 0;
     int ctrl  = (state & 0x0004) != 0;
+    int alt   = (state & 0x0008) != 0;  /* Mod1: conventional "Alt" binding */
+    int altgr = (state & 0x0080) != 0;  /* Mod5: conventional AltGr /
+                                          * ISO_Level3_Shift binding, as
+                                          * produced by e.g. xkb option
+                                          * "lv3:ralt_switch" */
 
-    uint32_t ks = keysym_for(keycode, shift);
+    uint32_t ks = keysym_for(keycode, (altgr ? 2 : 0) + (shift ? 1 : 0));
     if (!ks) return;
+
+    /* Meta-prefix: makes Alt+key reach the multiplexer's own shortcuts
+     * (e.g. Alt+2 -> ESC '2' -> input.c's FSM_ESC -> CMD_SELECT_WINDOW)
+     * exactly like a real terminal's metaSendsEscape.
+     *
+     * Suppressed when altgr is also set: some real XKB configs leave
+     * Right-Alt bound into Mod1 even after lv3:ralt_switch repurposes
+     * it as level-3 shift, so a genuine AltGr press can carry both
+     * bits. AltGr's intent (an alternate-level character) and Alt's
+     * (a meta-prefixed shortcut) are mutually exclusive, and an
+     * unwanted ESC here would otherwise get misparsed downstream and
+     * silently eat the accented character (see input.c's FSM_ESC,
+     * which forwards ESC+one-byte as a pair -- orphaning the second
+     * half of what should be a 2-byte UTF-8 sequence). */
+    if (alt && !altgr) key_push(0x1B);
 
     if (ctrl) {
         uint32_t up = ks;
@@ -218,7 +280,15 @@ static void handle_keypress(const uint8_t *ev)
         if (up >= '@' && up <= '_') { key_push((uint8_t)(up & 0x1f)); return; }
     }
 
-    if (ks >= 0x20 && ks <= 0x7e) { key_push((uint8_t)ks); return; }
+    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) {
+        if (ks <= 0x7F) {
+            key_push((uint8_t)ks);
+        } else {
+            key_push((uint8_t)(0xC0 | (ks >> 6)));
+            key_push((uint8_t)(0x80 | (ks & 0x3F)));
+        }
+        return;
+    }
 
     switch (ks) {
     case 0xFF08: key_push(0x7f); return;                              /* BackSpace */
