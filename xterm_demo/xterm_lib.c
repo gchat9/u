@@ -22,6 +22,20 @@
 
 #include "xterm_lib.h"
 
+#ifdef X11_BACKEND
+/* Only meaningful (and only linkable) when built into tmux: that build
+ * links against real glibc, unlike the standalone xterm_demo, which is
+ * -nostdlib/-ffreestanding and has no getenv symbol at all. A plain
+ * forward declaration rather than #include <stdlib.h>: this file's
+ * _sys/_.h type universe (see above) conflicts with glibc's own headers
+ * (duplicate clock_t/sigset_t/struct timespec definitions), the same
+ * reason memcpy/strlen/etc. below get away with no <string.h> either --
+ * unlike those, though, getenv isn't a GCC-recognized builtin, so it
+ * needs an explicit declaration to avoid an implicit-declaration
+ * warning (and, on a 64-bit build, a truncated pointer). */
+extern char *getenv(const char *name);
+#endif
+
 #define AF_UNIX 1
 
 struct sockaddr_un {
@@ -435,7 +449,7 @@ static void render_cell(int row, int col,
         for (int i = 0; i < n; i++) line[i] = bg;
     }
     uint8_t cp = scr[idx];
-    if (cp >= 0x20 && cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
+    if (cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
         const uint8_t *g = glyph_data + (size_t)(cp-first_cp)*cell_w*cell_h;
         for (int i = 0; i < n; i++) {
             uint8_t a = g[i];
@@ -575,7 +589,28 @@ int xterm_init(void)
     xfd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un sa;
     sa.sun_family = AF_UNIX;
-    strlcpy(sa.sun_path, "/tmp/.X11-unix/X2", sizeof sa.sun_path);
+    strlcpy(sa.sun_path, "/tmp/.X11-unix/X", sizeof sa.sun_path);
+    /* $DISPLAY is ":N" or ":NN" (optionally ".screen", which we don't
+     * need -- only the display number selects the socket). Assume N is
+     * 0-99 (true of any real X display) and copy its 1-2 digit
+     * characters straight out of the environment string; there's
+     * nothing to compute, so no atoi()/snprintf() round-trip. Falls
+     * back to display 2 (the old hardcoded default) if $DISPLAY is
+     * unset or doesn't look like ":<digits>". */
+    size_t plen = strlen(sa.sun_path);
+#ifdef X11_BACKEND
+    const char *disp = getenv("DISPLAY");
+#else
+    const char *disp = NULL;  /* standalone demo: no libc, no $DISPLAY */
+#endif
+    if (disp && disp[0] == ':' && disp[1] >= '0' && disp[1] <= '9') {
+        sa.sun_path[plen++] = disp[1];
+        if (disp[2] >= '0' && disp[2] <= '9') sa.sun_path[plen++] = disp[2];
+        sa.sun_path[plen] = '\0';
+    } else {
+        sa.sun_path[plen]   = '2';
+        sa.sun_path[plen+1] = '\0';
+    }
     int sa_len = (int)(sizeof sa.sun_family + strlen(sa.sun_path) + 1);
     if (connect(xfd, (struct sockaddr *)&sa, sa_len) < 0)
         die("could not connect to X11\n");

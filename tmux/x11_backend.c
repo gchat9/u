@@ -2,6 +2,7 @@
 #include "status.h"
 
 #include "../xterm_demo/xterm_lib.h"
+#include "../xterm_demo/charset.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -49,6 +50,19 @@ static void resolve_colors(const Cell *cell, uint8_t *out_fg, uint8_t *out_bg,
     *out_attr = attr;
 }
 
+/* Maps a decoded Unicode codepoint to this font's glyph slot (see
+ * charset.h): ch==0 (an empty/never-written cell) reads as a blank
+ * space, and anything the charset has no glyph for falls back to '?'.
+ * Neither ' ' nor '?' are valid slot numbers by themselves any more
+ * now that the charset isn't identity-mapped -- this is the only
+ * place that needs to know that. */
+static inline uint8_t glyph_slot(uint32_t ch)
+{
+    int slot = charset_slot(ch ? ch : ' ');
+    if (slot < 0) slot = charset_slot('?');
+    return (uint8_t)slot;
+}
+
 void x11_backend_render(const Screen *s)
 {
     uint8_t *fb  = xterm_framebuffer();
@@ -64,14 +78,12 @@ void x11_backend_render(const Screen *s)
             const Cell *cell = &s->cells[r][c];
             uint32_t ch = cell->ch;
             int i = r * cols + c;
-            fb[i] = (ch >= 0x20 && ch <= 0x7E) ? (uint8_t)ch :
-                    (ch >= 0xA0 && ch <= 0xFF) ? (uint8_t)ch :
-                    (ch == 0 ? ' ' : '?');
+            fb[i] = glyph_slot(ch);
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
         }
         for (int c = w; c < cols; c++) {
             int i = r * cols + c;
-            fb[i] = ' '; fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+            fb[i] = glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
         }
     }
     /* This is called on every content update (unlike the status bar,
@@ -99,9 +111,7 @@ static void x11_emit(void *vctx, const char *s, int n, Style style)
     X11StatusCtx *ctx = vctx;
     for (int i = 0; i < n && ctx->col < ctx->cols; i++, ctx->col++) {
         int idx = ctx->row * ctx->xcols + ctx->col;
-        uint8_t ch = (uint8_t)s[i];
-        ctx->fb[idx]  = (ch >= 0x20 && ch <= 0x7E) ? ch :
-                        (ch >= 0xA0) ? ch : ' ';
+        ctx->fb[idx]  = glyph_slot((uint8_t)s[i]);
         ctx->fgb[idx] = style.fg;
         ctx->bgb[idx] = style.bg;
         ctx->atb[idx] = 0;
@@ -128,7 +138,7 @@ void x11_backend_status(int row, int cols, int active,
      * than-cols case) rather than relying on that invariant alone. */
     for (int c = 0; c < cols; c++) {
         int i = row * xcols + c;
-        ctx.fb[i] = ' '; ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
+        ctx.fb[i] = glyph_slot(0); ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
     }
 
     status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive);

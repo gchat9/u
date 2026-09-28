@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <wchar.h>
 
 /* ================================================================== */
 /* Helpers                                                              */
@@ -434,14 +433,20 @@ static void put_char(VTParser *p, uint32_t ch)
 {
     Screen *s = &p->scr;
 
-    /* Determine display width */
+    /* Every codepoint is currently single-width: the font has no
+     * double-wide glyphs (see charset.h), so there's no width table to
+     * consult here. Using libc's wcwidth() for this used to be actively
+     * wrong: it's locale-dependent, returning -1 (silently discarding
+     * the character right here) for anything outside ASCII whenever no
+     * UTF-8 locale is configured -- not a safe assumption for a minimal
+     * target system, and confirmed to misbehave that way in practice.
+     * Whether a codepoint can actually be drawn is decided once, at
+     * render time, by charset_slot() (see x11_backend.c), which falls
+     * back to '?' rather than disappearing the character. When real
+     * double-width glyphs are added, this is where a small compile-time
+     * width table -- in the same spirit as charset.h -- should replace
+     * the flat 1. */
     int width = 1;
-    if (ch >= 0x80) {
-        int w = wcwidth((wchar_t)ch);
-        if (w < 0) return;   /* non-printable (e.g. combining) */
-        if (w == 0) return;  /* zero-width combining – skip for now */
-        width = w;
-    }
 
     /* Handle pending wrap: wrap to next line before placing char */
     if (s->pending_wrap) {

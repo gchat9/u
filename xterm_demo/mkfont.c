@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "charset.h"
+
 #define FONT_PATH   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 #define FONT_PX     26
 #define NUM_GLYPHS  256
@@ -68,23 +70,25 @@ int main(void)
 
     /* ── render glyphs ────────────────────────────────────────────── */
     /*
-     * For each codepoint we produce a cell_w × cell_h alpha bitmap.
-     * Control characters and C1 bytes (0x80–0x9F) stay all-zero.
-     * We use "max" blending so glyphs that overflow their cell edge
-     * don't just get clipped — the brightest value wins.
+     * For each glyph slot (0..255) we look up which Unicode codepoint
+     * it holds (see charset.h -- ASCII, then Latin-1 supplement, then
+     * box-drawing/block/arrow extras) and produce a cell_w × cell_h
+     * alpha bitmap for it. A slot past the end of the charset (a
+     * codepoint of 0) stays all-zero. We use "max" blending so glyphs
+     * that overflow their cell edge don't just get clipped — the
+     * brightest value wins.
      */
     uint8_t *cell = calloc(cell_w * cell_h, 1);
 
-    for (int cp = 0; cp < NUM_GLYPHS; cp++) {
+    for (int slot = 0; slot < NUM_GLYPHS; slot++) {
         memset(cell, 0, cell_w * cell_h);
 
-        int printable = (cp >= 0x20 && cp <= 0x7E)   /* ASCII        */
-                     || (cp >= 0xA0 && cp <= 0xFF);  /* Latin-1 supp */
+        uint32_t cp = charset_codepoint(slot);
 
-        if (printable) {
+        if (cp) {
             int gw, gh, xoff, yoff;
             uint8_t *bm = stbtt_GetCodepointBitmap(
-                            &fi, scale, scale, cp, &gw, &gh, &xoff, &yoff);
+                            &fi, scale, scale, (int)cp, &gw, &gh, &xoff, &yoff);
             /*
              * xoff : horizontal pen→bitmap-left offset (usually ≥ 0)
              * yoff : baseline→bitmap-top  offset (usually negative)
