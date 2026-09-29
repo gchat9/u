@@ -13,6 +13,17 @@ uint8_t *xterm_bg_buffer(void);
  * of tmux/vt.h's ATTR_* bit values by design — callers translate. */
 #define XTERM_ATTR_UNDERLINE 0x01
 #define XTERM_ATTR_STRIKE    0x02
+/* Emoji occupy two adjacent cells (see emoji.bfnt / emoji_charset.h).
+ * For a cell flagged EMOJI_L or EMOJI_R, the byte in xterm_framebuffer()
+ * is the emoji's *index* (not a glyph slot), and the cell draws the left
+ * or right half of that emoji's colour bitmap; transparent pixels show
+ * the cell's bg colour. Both halves of a pair must be flagged. */
+#define XTERM_ATTR_EMOJI_L   0x04
+#define XTERM_ATTR_EMOJI_R   0x08
+/* The glyph byte for this (single-width) cell has no meaning: the font
+ * has nothing for the character, so draw a placeholder outline box in
+ * the cell's fg colour instead of any glyph. */
+#define XTERM_ATTR_MISSING   0x10
 uint8_t *xterm_attr_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);

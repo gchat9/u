@@ -3,6 +3,7 @@
 
 #include "../xterm_demo/xterm_lib.h"
 #include "../xterm_demo/charset.h"
+#include "../xterm_demo/emoji_charset.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -52,15 +53,15 @@ static void resolve_colors(const Cell *cell, uint8_t *out_fg, uint8_t *out_bg,
 
 /* Maps a decoded Unicode codepoint to this font's glyph slot (see
  * charset.h): ch==0 (an empty/never-written cell) reads as a blank
- * space, and anything the charset has no glyph for falls back to '?'.
- * Neither ' ' nor '?' are valid slot numbers by themselves any more
- * now that the charset isn't identity-mapped -- this is the only
- * place that needs to know that. */
-static inline uint8_t glyph_slot(uint32_t ch)
+ * space. Returns -1 if the charset has no glyph for it, in which case
+ * the caller stores slot 0 and sets XTERM_ATTR_MISSING on the cell, and
+ * xterm_lib draws a placeholder box (rather than substituting some
+ * other glyph, which would silently change what's on screen). Slot 0
+ * is a valid slot number for a real space, so it's only ever meaningful
+ * alongside that flag. */
+static inline int glyph_slot(uint32_t ch)
 {
-    int slot = charset_slot(ch ? ch : ' ');
-    if (slot < 0) slot = charset_slot('?');
-    return (uint8_t)slot;
+    return charset_slot(ch ? ch : ' ');
 }
 
 void x11_backend_render(const Screen *s)
@@ -78,12 +79,31 @@ void x11_backend_render(const Screen *s)
             const Cell *cell = &s->cells[r][c];
             uint32_t ch = cell->ch;
             int i = r * cols + c;
-            fb[i] = glyph_slot(ch);
+            /* A wide cell is an emoji (see vt.c put_char): a CELL_WIDE
+             * cell plus a CELL_WIDE_CONT cell. Both halves store the
+             * emoji's bitmap index instead of a glyph slot and flag
+             * which half they are. No bitmap for it (emoji_index() is
+             * -1) gets index 255, which xterm_lib draws as a placeholder
+             * box. A continuation cell whose left neighbour isn't wide
+             * (orphaned by an overwrite) falls back to a blank. */
+            int e = -1; uint8_t half = 0;
+            if (cell->flags & CELL_WIDE) {
+                e = emoji_index(ch); if (e < 0) e = 255;
+                half = XTERM_ATTR_EMOJI_L;
+            } else if ((cell->flags & CELL_WIDE_CONT) && c > 0 &&
+                       (s->cells[r][c-1].flags & CELL_WIDE)) {
+                e = emoji_index(s->cells[r][c-1].ch); if (e < 0) e = 255;
+                half = XTERM_ATTR_EMOJI_R;
+            }
+            int g = e >= 0 ? e : glyph_slot(ch);
+            fb[i] = g < 0 ? 0 : (uint8_t)g;
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
+            if (e >= 0)     atb[i] = half;
+            else if (g < 0) atb[i] |= XTERM_ATTR_MISSING;  /* after resolve_colors, which sets atb */
         }
         for (int c = w; c < cols; c++) {
             int i = r * cols + c;
-            fb[i] = glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+            fb[i] = (uint8_t)glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
         }
     }
     /* This is called on every content update (unlike the status bar,
@@ -111,10 +131,11 @@ static void x11_emit(void *vctx, const char *s, int n, Style style)
     X11StatusCtx *ctx = vctx;
     for (int i = 0; i < n && ctx->col < ctx->cols; i++, ctx->col++) {
         int idx = ctx->row * ctx->xcols + ctx->col;
-        ctx->fb[idx]  = glyph_slot((uint8_t)s[i]);
+        int g = glyph_slot((uint8_t)s[i]);
+        ctx->fb[idx]  = g < 0 ? 0 : (uint8_t)g;
         ctx->fgb[idx] = style.fg;
         ctx->bgb[idx] = style.bg;
-        ctx->atb[idx] = 0;
+        ctx->atb[idx] = g < 0 ? XTERM_ATTR_MISSING : 0;
     }
 }
 
@@ -138,7 +159,7 @@ void x11_backend_status(int row, int cols, int active,
      * than-cols case) rather than relying on that invariant alone. */
     for (int c = 0; c < cols; c++) {
         int i = row * xcols + c;
-        ctx.fb[i] = glyph_slot(0); ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
+        ctx.fb[i] = (uint8_t)glyph_slot(0); ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
     }
 
     status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive);

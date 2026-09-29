@@ -249,6 +249,8 @@ static void key_push(uint8_t b)
     key_tail = next;
 }
 
+static void push_str(const char *s) { while (*s) key_push((uint8_t)*s++); }
+
 /* Translate one KeyPress event (32 bytes) into 0+ output bytes. Covers
  * printable Latin-1 (ASCII pushed as-is, 0xA0-0xFF UTF-8-encoded since
  * that's what everything downstream expects on the wire), Ctrl-letter
@@ -305,15 +307,36 @@ static void handle_keypress(const uint8_t *ev)
     }
 
     switch (ks) {
-    case 0xFF08: key_push(0x7f); return;                              /* BackSpace */
-    case 0xFF09: key_push('\t'); return;                              /* Tab */
-    case 0xFF0D: key_push('\r'); return;                              /* Return */
-    case 0xFF1B: key_push(0x1b); return;                              /* Escape */
-    case 0xFF51: key_push(0x1b); key_push('['); key_push('D'); return; /* Left */
-    case 0xFF52: key_push(0x1b); key_push('['); key_push('A'); return; /* Up */
-    case 0xFF53: key_push(0x1b); key_push('['); key_push('C'); return; /* Right */
-    case 0xFF54: key_push(0x1b); key_push('['); key_push('B'); return; /* Down */
-    case 0xFFFF: key_push(0x1b); key_push('['); key_push('3'); key_push('~'); return; /* Delete */
+    case 0xFF08: key_push(0x7f); return;   /* BackSpace */
+    case 0xFF09: key_push('\t');  return;   /* Tab */
+    case 0xFF0D: key_push('\r');  return;   /* Return */
+    case 0xFF1B: key_push(0x1b); return;   /* Escape */
+    /* The rest are all ANSI/VT escape sequences -- exactly what the
+     * child's TERM=xterm-256color terminfo (see pty.c) expects, so
+     * readline/ncurses there recognize them the same way a real xterm's
+     * keys would be recognized. */
+    case 0xFF51: push_str("\x1b[D");   return;  /* Left */
+    case 0xFF52: push_str("\x1b[A");   return;  /* Up */
+    case 0xFF53: push_str("\x1b[C");   return;  /* Right */
+    case 0xFF54: push_str("\x1b[B");   return;  /* Down */
+    case 0xFF50: push_str("\x1bOH");   return;  /* Home */
+    case 0xFF57: push_str("\x1bOF");   return;  /* End */
+    case 0xFF55: push_str("\x1b[5~");  return;  /* Page_Up */
+    case 0xFF56: push_str("\x1b[6~");  return;  /* Page_Down */
+    case 0xFF63: push_str("\x1b[2~");  return;  /* Insert */
+    case 0xFFFF: push_str("\x1b[3~");  return;  /* Delete */
+    case 0xFFBE: push_str("\x1bOP");   return;  /* F1  */
+    case 0xFFBF: push_str("\x1bOQ");   return;  /* F2  */
+    case 0xFFC0: push_str("\x1bOR");   return;  /* F3  */
+    case 0xFFC1: push_str("\x1bOS");   return;  /* F4  */
+    case 0xFFC2: push_str("\x1b[15~"); return;  /* F5  */
+    case 0xFFC3: push_str("\x1b[17~"); return;  /* F6  */
+    case 0xFFC4: push_str("\x1b[18~"); return;  /* F7  */
+    case 0xFFC5: push_str("\x1b[19~"); return;  /* F8  */
+    case 0xFFC6: push_str("\x1b[20~"); return;  /* F9  */
+    case 0xFFC7: push_str("\x1b[21~"); return;  /* F10 */
+    case 0xFFC8: push_str("\x1b[23~"); return;  /* F11 */
+    case 0xFFC9: push_str("\x1b[24~"); return;  /* F12 */
     default: return;
     }
 }
@@ -352,6 +375,30 @@ static void font_load(const char *path)
     size_t glyph_bytes = (size_t)cell_w * cell_h * num_glyphs;
     if (glyph_bytes > FONT_MAX - 16) die("font is too large\n");
     glyph_data = mmap_base + 16;
+}
+
+/* emoji.bfnt (see mkemoji.c): optional -- if it's missing or doesn't
+ * match the font's cell size, every emoji draws as a placeholder box
+ * (see draw_box) rather than killing the terminal. */
+#define EMOJI_MAX (32 * 1024)
+static const uint8_t *emoji_data;   /* NULL = no emoji available */
+static uint16_t emoji_count;
+static size_t   emoji_rec;          /* bytes per record: 45 palette + packed 4bpp pixels */
+
+static void emoji_load(const char *path)
+{
+    int fd = (int)open(path, O_RDONLY, 0);
+    if (fd < 0) return;
+    uint8_t *m = mmap(0, EMOJI_MAX, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    uint16_t w, h, n;
+    memcpy(&w, m + 4, 2); memcpy(&h, m + 6, 2); memcpy(&n, m + 8, 2);
+    size_t rec = 45 + ((size_t)w * 2 * h + 1) / 2;
+    if (m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != 'J' ||
+        w != cell_w || h != cell_h || 12 + (size_t)n * rec > EMOJI_MAX)
+        return;
+    emoji_data = m; emoji_count = n; emoji_rec = rec;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -423,6 +470,58 @@ static void fill_row(int r, uint32_t color, uint8_t depth)
     }
 }
 
+/* Store one pixel (i = y*cell_w + x) into cell_buf at the window depth. */
+static inline void put_px(int i, uint32_t color, uint8_t depth)
+{
+    if (depth == 16) {
+        size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
+        uint16_t *line = (uint16_t *)(cell_buf + (size_t)(i / cell_w) * stride);
+        line[i % cell_w] = pack565(color);
+    } else {
+        ((uint32_t *)cell_buf)[i] = color;
+    }
+}
+
+/* Draw the left (half=0) or right (half=1) half of emoji k over the
+ * already-bg-filled cell_buf. Each record is 15 RGB palette entries
+ * (index 0 = transparent, implicit) then 4-bit indices, row-major over
+ * the full two-cell-wide bitmap, first pixel in the high nibble. */
+/* Placeholder for a character we have no glyph for: a 1px outline in
+ * the cell's foreground colour, inset 1px from the edge of a w-pixel-
+ * wide glyph area, of which this cell shows the columns starting at
+ * pixel `off` -- so a double-width emoji (w = 2 cells) draws its left
+ * and right halves as two pieces of one rectangle, and an ordinary
+ * cell (off = 0, w = 1 cell) draws the whole thing. Drawn rather than
+ * stored, so it needs no data (and works with no emoji.bfnt at all)
+ * and follows fg colour, including the cursor's inversion. */
+static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
+{
+    int last = w - 2;                          /* rightmost line column */
+    for (int y = 1; y < cell_h - 1; y++)
+        for (int x = 0; x < cell_w; x++) {
+            int X = off + x;
+            if (X >= 1 && X <= last && (X == 1 || X == last || y == 1 || y == cell_h - 2))
+                put_px(y * cell_w + x, fg, depth);
+        }
+}
+
+static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
+{
+    if (!emoji_data || k >= emoji_count) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
+    const uint8_t *rec = emoji_data + 12 + (size_t)k * emoji_rec;
+    const uint8_t *pix = rec + 45;
+    int gw = cell_w * 2;
+    for (int y = 0; y < cell_h; y++)
+        for (int x = 0; x < cell_w; x++) {
+            int p  = y * gw + half * cell_w + x;
+            int ix = (p & 1) ? pix[p >> 1] & 15 : pix[p >> 1] >> 4;
+            if (!ix) continue;
+            const uint8_t *c = rec + (ix - 1) * 3;
+            put_px(y * cell_w + x,
+                   (uint32_t)c[0] << 16 | (uint32_t)c[1] << 8 | c[2], depth);
+        }
+}
+
 /* Cursor: a plain full-block inversion (fg/bg swapped for the whole
  * cell), no blinking. row<0 means "no cursor" (hidden/unfocused etc). */
 static int cursor_row = -1, cursor_col = -1;
@@ -430,8 +529,16 @@ static int cursor_row = -1, cursor_col = -1;
 static void render_cell(int row, int col,
                         uint32_t draw, uint32_t gc, uint8_t depth)
 {
-    int is_cursor = (row == cursor_row && col == cursor_col);
     int idx = row * cols + col;
+    uint8_t rattrs = atb[idx];
+    /* An emoji is one character over two cells: the cursor inverts both
+     * halves whichever of the two it's on, never just half. */
+    int half = (rattrs & XTERM_ATTR_EMOJI_R) != 0;
+    int pair = col - half;
+    int is_emoji = (rattrs & (XTERM_ATTR_EMOJI_L | XTERM_ATTR_EMOJI_R)) != 0;
+    int is_cursor = row == cursor_row &&
+        (is_emoji ? (cursor_col == pair || cursor_col == pair + 1)
+                  : cursor_col == col);
     uint32_t bg = palette[bgb[idx]];
     uint32_t fg = palette[fgb[idx]];
     if (is_cursor) { uint32_t t = bg; bg = fg; fg = t; }
@@ -449,24 +556,17 @@ static void render_cell(int row, int col,
         for (int i = 0; i < n; i++) line[i] = bg;
     }
     uint8_t cp = scr[idx];
-    if (cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
+    if (is_emoji) {
+        draw_emoji(cp, half, fg, depth);
+    } else if (rattrs & XTERM_ATTR_MISSING) {
+        draw_box(0, cell_w, fg, depth);
+    } else if (cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
         const uint8_t *g = glyph_data + (size_t)(cp-first_cp)*cell_w*cell_h;
         for (int i = 0; i < n; i++) {
             uint8_t a = g[i];
-            if (!a) continue;
-            uint32_t color = blend(a, fg, bg);
-            if (depth == 16) {
-                size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
-                uint16_t *line = (uint16_t *)(cell_buf + (size_t)(i / cell_w) * stride);
-                line[i % cell_w] = (uint16_t)(((color >> 8) & 0xf800) |
-                                                ((color >> 5) & 0x07e0) |
-                                                ((color >> 3) & 0x001f));
-            } else {
-                ((uint32_t *)cell_buf)[i] = color;
-            }
+            if (a) put_px(i, blend(a, fg, bg), depth);
         }
     }
-    uint8_t rattrs = atb[idx];
     if (rattrs & XTERM_ATTR_UNDERLINE) {
         int r = baseline + 1;
         fill_row(r >= cell_h ? cell_h - 1 : r, fg, depth);
@@ -585,6 +685,7 @@ int xterm_init(void)
     cell_buf = cell_storage;
     build_palette();
     font_load("/etc/font.bfnt");
+    emoji_load("/etc/emoji.bfnt");
 
     xfd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un sa;
