@@ -24,6 +24,11 @@ uint8_t *xterm_bg_buffer(void);
  * has nothing for the character, so draw a placeholder outline box in
  * the cell's fg colour instead of any glyph. */
 #define XTERM_ATTR_MISSING   0x10
+/* Like EMOJI_L/R, but the glyph byte is an ordinary glyph slot: a
+ * double-width character drawn by centring that one narrow glyph across
+ * the two cells (fullwidth punctuation, see charset.h). */
+#define XTERM_ATTR_FW_L      0x20
+#define XTERM_ATTR_FW_R      0x40
 uint8_t *xterm_attr_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);

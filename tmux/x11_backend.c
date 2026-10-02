@@ -79,26 +79,35 @@ void x11_backend_render(const Screen *s)
             const Cell *cell = &s->cells[r][c];
             uint32_t ch = cell->ch;
             int i = r * cols + c;
-            /* A wide cell is an emoji (see vt.c put_char): a CELL_WIDE
-             * cell plus a CELL_WIDE_CONT cell. Both halves store the
-             * emoji's bitmap index instead of a glyph slot and flag
-             * which half they are. No bitmap for it (emoji_index() is
-             * -1) gets index 255, which xterm_lib draws as a placeholder
-             * box. A continuation cell whose left neighbour isn't wide
+            /* A wide cell is a CELL_WIDE cell plus a CELL_WIDE_CONT cell
+             * (see vt.c put_char), drawn as two halves of one thing: an
+             * emoji, or a fullwidth punctuation mark standing in for its
+             * ASCII twin's glyph. Both halves store the same glyph byte
+             * and flag which half they are. A wide character with
+             * neither a bitmap nor an ASCII twin gets emoji index 255,
+             * which xterm_lib draws as a two-cell placeholder box. A
+             * continuation cell whose left neighbour isn't wide
              * (orphaned by an overwrite) falls back to a blank. */
-            int e = -1; uint8_t half = 0;
-            if (cell->flags & CELL_WIDE) {
-                e = emoji_index(ch); if (e < 0) e = 255;
-                half = XTERM_ATTR_EMOJI_L;
-            } else if ((cell->flags & CELL_WIDE_CONT) && c > 0 &&
-                       (s->cells[r][c-1].flags & CELL_WIDE)) {
-                e = emoji_index(s->cells[r][c-1].ch); if (e < 0) e = 255;
-                half = XTERM_ATTR_EMOJI_R;
+            uint32_t wch = 0; int right = 0;
+            if (cell->flags & CELL_WIDE) wch = ch;
+            else if ((cell->flags & CELL_WIDE_CONT) && c > 0 &&
+                     (s->cells[r][c-1].flags & CELL_WIDE)) {
+                wch = s->cells[r][c-1].ch; right = 1;
             }
-            int g = e >= 0 ? e : glyph_slot(ch);
+            uint8_t wattr = 0; int g;
+            uint32_t twin = wch ? charset_fullwidth_alias(wch) : 0;
+            if (twin) {
+                g = glyph_slot(twin);
+                wattr = right ? XTERM_ATTR_FW_R : XTERM_ATTR_FW_L;
+            } else if (wch) {
+                g = emoji_index(wch); if (g < 0) g = 255;
+                wattr = right ? XTERM_ATTR_EMOJI_R : XTERM_ATTR_EMOJI_L;
+            } else {
+                g = glyph_slot(ch);
+            }
             fb[i] = g < 0 ? 0 : (uint8_t)g;
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
-            if (e >= 0)     atb[i] = half;
+            if (wattr)      atb[i] |= wattr;   /* OR: keeps underline/strike */
             else if (g < 0) atb[i] |= XTERM_ATTR_MISSING;  /* after resolve_colors, which sets atb */
         }
         for (int c = w; c < cols; c++) {

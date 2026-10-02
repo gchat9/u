@@ -81,3 +81,24 @@ static inline int charset_slot(uint32_t cp)
         if (charset_extra[i] == cp) return CHARSET_EXTRA_BASE + i;
     return -1;
 }
+
+/* Fullwidth forms, U+FF01..U+FF60: CJK-era duplicates of ASCII, all
+ * double-width. Programs (readline, ncurses, ...) size lines by that, so
+ * every one of them must take two cells whether or not we can draw it. */
+static inline int charset_fullwidth(uint32_t cp)
+{
+    return cp >= 0xFF01 && cp <= 0xFF60;
+}
+
+/* What we can draw of them: U+FF01..U+FF5E are exactly ASCII 0x21..0x7E
+ * at a fixed offset of 0xFEE0, so a fullwidth punctuation mark is drawn
+ * with its ASCII twin's existing glyph, centred in the two-cell area --
+ * no new font data at all. Returns that ASCII code, or 0 for anything
+ * not drawn this way: the fullwidth letters and digits (which draw as a
+ * placeholder box) and U+FF5F/FF60. */
+static inline uint32_t charset_fullwidth_alias(uint32_t cp)
+{
+    if (cp < 0xFF01 || cp > 0xFF5E) return 0;
+    uint32_t a = cp - 0xFEE0, l = a | 0x20;
+    return (a >= '0' && a <= '9') || (l >= 'a' && l <= 'z') ? 0 : a;
+}

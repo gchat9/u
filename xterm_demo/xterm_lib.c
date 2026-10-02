@@ -531,14 +531,16 @@ static void render_cell(int row, int col,
 {
     int idx = row * cols + col;
     uint8_t rattrs = atb[idx];
-    /* An emoji is one character over two cells: the cursor inverts both
-     * halves whichever of the two it's on, never just half. */
-    int half = (rattrs & XTERM_ATTR_EMOJI_R) != 0;
+    /* A wide character (emoji or fullwidth form) is one character over
+     * two cells: the cursor inverts both halves whichever of the two
+     * it's on, never just half. */
+    int half = (rattrs & (XTERM_ATTR_EMOJI_R | XTERM_ATTR_FW_R)) != 0;
     int pair = col - half;
     int is_emoji = (rattrs & (XTERM_ATTR_EMOJI_L | XTERM_ATTR_EMOJI_R)) != 0;
+    int is_fw = (rattrs & (XTERM_ATTR_FW_L | XTERM_ATTR_FW_R)) != 0;
     int is_cursor = row == cursor_row &&
-        (is_emoji ? (cursor_col == pair || cursor_col == pair + 1)
-                  : cursor_col == col);
+        (is_emoji || is_fw ? (cursor_col == pair || cursor_col == pair + 1)
+                           : cursor_col == col);
     uint32_t bg = palette[bgb[idx]];
     uint32_t fg = palette[fgb[idx]];
     if (is_cursor) { uint32_t t = bg; bg = fg; fg = t; }
@@ -562,10 +564,17 @@ static void render_cell(int row, int col,
         draw_box(0, cell_w, fg, depth);
     } else if (cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
         const uint8_t *g = glyph_data + (size_t)(cp-first_cp)*cell_w*cell_h;
-        for (int i = 0; i < n; i++) {
-            uint8_t a = g[i];
-            if (a) put_px(i, blend(a, fg, bg), depth);
-        }
+        /* A fullwidth character reuses its narrow twin's glyph, centred
+         * across the two cells; this cell shows glyph columns x - sh
+         * (left half: shifted right by half a cell; right half: the
+         * remainder). Ordinary cells: sh = 0, every column in range. */
+        int sh = is_fw ? cell_w / 2 - half * cell_w : 0;
+        for (int y = 0; y < cell_h; y++)
+            for (int x = 0; x < cell_w; x++) {
+                int gx = x - sh;
+                uint8_t a = gx >= 0 && gx < cell_w ? g[y * cell_w + gx] : 0;
+                if (a) put_px(y * cell_w + x, blend(a, fg, bg), depth);
+            }
     }
     if (rattrs & XTERM_ATTR_UNDERLINE) {
         int r = baseline + 1;
