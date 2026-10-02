@@ -1,11 +1,11 @@
 /*
- * mkfont.c — bake DejaVuSansMono.ttf → font.bfnt
+ * mkfont.c — bake a monospace TTF into font.bfnt, one glyph per slot of
+ * the layout defined in charset.h.
  *
- * Build:
- *   curl -O https://raw.githubusercontent.com/nothings/stb/master/stb_truetype.h
- *   cc -O2 -o mkfont mkfont.c -lm
- * Run:
- *   ./mkfont
+ * Normally run via this directory's Makefile (which also fetches
+ * stb_truetype.h). By hand:
+ *   cc -O2 -o mkfont mkfont.c -lm && ./mkfont [path/to/font.ttf]
+ * The TTF defaults to DejaVu Sans Mono; any monospace font works.
  */
 
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -18,7 +18,7 @@
 
 #include "charset.h"
 
-#define FONT_PATH   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+#define DEFAULT_TTF "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 #define FONT_PX     26
 #define NUM_GLYPHS  256
 
@@ -27,11 +27,12 @@ static void w16(FILE *f, uint16_t v) {          /* write LE uint16 */
     fwrite(b, 1, 2, f);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     /* ── load TTF ─────────────────────────────────────────────────── */
-    FILE *f = fopen(FONT_PATH, "rb");
-    if (!f) { perror(FONT_PATH); return 1; }
+    const char *ttf_path = argc > 1 ? argv[1] : DEFAULT_TTF;
+    FILE *f = fopen(ttf_path, "rb");
+    if (!f) { perror(ttf_path); return 1; }
     fseek(f, 0, SEEK_END);
     long fsz = ftell(f); rewind(f);
     uint8_t *ttf = malloc(fsz);

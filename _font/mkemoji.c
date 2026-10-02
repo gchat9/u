@@ -1,8 +1,8 @@
 /*
  * mkemoji.c — builds emoji.bfnt from Twemoji PNG source art.
  *
- * Run after mkfont.c's ./mkfont (needs font.bfnt to already exist, to
- * read its cell_w/cell_h from -- see below). Expects emoji_src/<hex
+ * Needs font.bfnt to already exist, to read its cell_w/cell_h from (see
+ * below); the Makefile builds it first. Expects emoji_src/<hex
  * codepoint>.png for every entry in emoji_charset.h; the exact files
  * used were fetched from https://github.com/jdecked/twemoji
  * (assets/72x72/<codepoint>.png), which is Twemoji artwork, CC-BY 4.0.

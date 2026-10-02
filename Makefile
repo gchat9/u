@@ -11,9 +11,13 @@
 #                          same thing, for an arch/cross-compiler not in
 #                          the built-in table below
 #   make clean             clean every tool's build directory
-#   make distclean          clean, and remove _release/ too
+#   make distclean         clean, and remove _release/ plus _font/'s
+#                          downloaded stb_*.h and generated *.bfnt
 
-TOOLS := $(sort $(patsubst %/Makefile,%,$(wildcard */Makefile)))
+# Every directory with a Makefile is a tool, except the _-prefixed ones,
+# which are shared infrastructure (e.g. _font) rather than tools that
+# build a <dir>/<dir> binary.
+TOOLS := $(sort $(filter-out _%,$(patsubst %/Makefile,%,$(wildcard */Makefile))))
 
 ARCHES     := x86_64 i386 aarch64 armhf riscv64
 CC_x86_64  := x86_64-linux-gnu-gcc
@@ -57,7 +61,8 @@ release:
 	@echo "$(RELEASE_DIR)/$(ARCH): $(TOOLS)"
 
 clean:
-	@for t in $(TOOLS); do $(MAKE) -C $$t clean; done
+	@for t in $(TOOLS) _font; do $(MAKE) -C $$t clean; done
 
 distclean: clean
+	$(MAKE) -C _font distclean
 	rm -rf $(RELEASE_DIR)

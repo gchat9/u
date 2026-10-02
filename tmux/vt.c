@@ -1,6 +1,6 @@
 #include "vt.h"
-#include "../xterm_demo/emoji_charset.h"
-#include "../xterm_demo/charset.h"
+#include "../_font/emoji_charset.h"
+#include "../_font/charset.h"
 
 #include <stdlib.h>
 #include <string.h>

@@ -1,6 +1,6 @@
 #include "../_sys/_main.h"
-#include "xterm_lib.h"
-#include "charset.h"
+#include "../_lib/xterm.h"
+#include "../_font/charset.h"
 
 static void fill_framebuffer(uint32_t shift)
 {

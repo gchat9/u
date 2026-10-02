@@ -1,9 +1,9 @@
 #include "x11_backend.h"
-#include "status.h"
+#include "../tmux/status.h"
 
-#include "../xterm_demo/xterm_lib.h"
-#include "../xterm_demo/charset.h"
-#include "../xterm_demo/emoji_charset.h"
+#include "../_lib/xterm.h"
+#include "../_font/charset.h"
+#include "../_font/emoji_charset.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -27,9 +27,9 @@ int x11_backend_close_requested(void) { return xterm_close_requested(); }
 
 /* Resolve a Cell's colour down to two xterm-256-palette index bytes,
  * plus a small structural-attr bitmask (drawn as extra pixels, not a
- * colour swap — see xterm_lib.c's fill_row).
+ * colour swap — see xterm.c's fill_row).
  * CELL_FG_DFL/CELL_BG_DFL -> 15/0 (this backend's default fg/bg, see
- * xterm_lib.c's build_palette). ATTR_BOLD brightens an 0-7 fg into its
+ * xterm.c's build_palette). ATTR_BOLD brightens an 0-7 fg into its
  * 8-15 counterpart (there's no separate bold glyph, so colour is the
  * only bold cue available). ATTR_REVERSE swaps the pair last, matching
  * how a real terminal composites reverse video. ATTR_UNDERLINE and
@@ -55,7 +55,7 @@ static void resolve_colors(const Cell *cell, uint8_t *out_fg, uint8_t *out_bg,
  * charset.h): ch==0 (an empty/never-written cell) reads as a blank
  * space. Returns -1 if the charset has no glyph for it, in which case
  * the caller stores slot 0 and sets XTERM_ATTR_MISSING on the cell, and
- * xterm_lib draws a placeholder box (rather than substituting some
+ * xterm draws a placeholder box (rather than substituting some
  * other glyph, which would silently change what's on screen). Slot 0
  * is a valid slot number for a real space, so it's only ever meaningful
  * alongside that flag. */
@@ -85,7 +85,7 @@ void x11_backend_render(const Screen *s)
              * ASCII twin's glyph. Both halves store the same glyph byte
              * and flag which half they are. A wide character with
              * neither a bitmap nor an ASCII twin gets emoji index 255,
-             * which xterm_lib draws as a two-cell placeholder box. A
+             * which xterm draws as a two-cell placeholder box. A
              * continuation cell whose left neighbour isn't wide
              * (orphaned by an overwrite) falls back to a blank. */
             uint32_t wch = 0; int right = 0;

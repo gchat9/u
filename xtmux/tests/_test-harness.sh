@@ -39,7 +39,7 @@ sleep .1
 export DISPLAY=:2
 run "$TESTDIR/_zerowm.py"
 sleep .1
-run $BINDIR/tmux
+run $BINDIR/../xtmux/xtmux
 sleep .1
 
 ## done with setup, caller can now perform tests

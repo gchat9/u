@@ -1,9 +1,9 @@
 /*
- * xterm_lib.c — render-only X11 terminal surface
+ * xterm.c — render-only X11 terminal surface
  *
  *   - Pure libc, zero X11 libraries
  *   - Raw X11 wire protocol over Unix socket
- *   - BFNT bitmap font (produced by mkfont.c)
+ *   - BFNT bitmap font (produced by _font/mkfont.c)
  *   - File-backed BFNT font mapping; protocol buffers supplied by main's stack frame
  *   - Per-cell PutImage (no full-screen framebuffer)
  *   - Dirty-cell tracking (typically 2-3 PutImage calls per keypress)
@@ -20,19 +20,10 @@
 #include "../_sys/_main.h"
 #endif
 
-#include "xterm_lib.h"
+#include "xterm.h"
 
+/* Ugly workaround for xtmux that uses both dietlibc and _sys/ buildsystem */
 #ifdef X11_BACKEND
-/* Only meaningful (and only linkable) when built into tmux: that build
- * links against real glibc, unlike the standalone xterm_demo, which is
- * -nostdlib/-ffreestanding and has no getenv symbol at all. A plain
- * forward declaration rather than #include <stdlib.h>: this file's
- * _sys/_.h type universe (see above) conflicts with glibc's own headers
- * (duplicate clock_t/sigset_t/struct timespec definitions), the same
- * reason memcpy/strlen/etc. below get away with no <string.h> either --
- * unlike those, though, getenv isn't a GCC-recognized builtin, so it
- * needs an explicit declaration to avoid an implicit-declaration
- * warning (and, on a 64-bit build, a truncated pointer). */
 extern char *getenv(const char *name);
 #endif
 
@@ -377,7 +368,7 @@ static void font_load(const char *path)
     glyph_data = mmap_base + 16;
 }
 
-/* emoji.bfnt (see mkemoji.c): optional -- if it's missing or doesn't
+/* emoji.bfnt (see _font/mkemoji.c): optional -- if it's missing or doesn't
  * match the font's cell size, every emoji draws as a placeholder box
  * (see draw_box) rather than killing the terminal. */
 #define EMOJI_MAX (32 * 1024)
