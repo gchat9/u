@@ -93,6 +93,13 @@ static long ms_to_next_minute(void)
 
 static void get_term_size(int *rows, int *cols)
 {
+#ifdef X11_BACKEND
+    /* The "terminal" is our own X window; whatever tty launched us is
+     * irrelevant (and may not exist, or be a different size). */
+    *rows = x11_backend_rows();
+    *cols = x11_backend_columns();
+    return;
+#endif
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0
             && ws.ws_row > 0 && ws.ws_col > 0) {
@@ -1189,12 +1196,17 @@ int main(int argc, char *argv[])
 #ifdef X11_BACKEND
         /* X11 activity: Expose (needs a repaint — the server may have
          * discarded the window's contents while another window covered
-         * it) and/or KeyPress (queued as translated bytes by xterm_wait,
+         * it), a resize (new grid size: tell every window and pty) and/or KeyPress (queued as translated bytes by xterm_wait,
          * fed through the same FSM as real-stdin bytes below). */
         if (FD_ISSET(x11fd, &rfds)) {
-            if (x11_backend_wait(0) && g_wins[g_cur]) {
-                render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
-                redraw_status();
+            if (x11_backend_wait(0)) {
+                if (x11_backend_rows() != g_rows ||
+                    x11_backend_columns() != g_cols)
+                    handle_resize();     /* the window was resized */
+                else if (g_wins[g_cur]) {
+                    render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
+                    redraw_status();
+                }
             }
             uint8_t kbuf[64];
             int kn = x11_backend_read_input(kbuf, sizeof kbuf);

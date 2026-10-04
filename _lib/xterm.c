@@ -86,11 +86,22 @@ __attribute__((noreturn)) static void die(const char *msg)
     __builtin_unreachable();
 }
 
+/* read() and write() here are the raw syscalls, which return -errno.
+ * EINTR is not a failure: it only means a signal handler ran while we
+ * were blocked (say SIGWINCH, when the terminal that launched us is
+ * resized -- a tiling WM does that whenever it rearranges windows), and
+ * the kernel restarts the call only if the host program's handler was
+ * installed with SA_RESTART, which not every libc's signal() does.  Any
+ * program linking this must survive handlers of its own, so retry. */
+#ifndef EINTR
+#define EINTR 4
+#endif
 static void xread(void *buf, size_t n)
 {
     char *p = buf;
     while (n) {
         long r = read(xfd, p, n);
+        if (r == -EINTR) continue;
         if (r <= 0) die("xread failed\n");
         p += r; n -= r;
     }
@@ -101,6 +112,7 @@ static void xwrite(const void *buf, size_t n)
     const char *p = buf;
     while (n) {
         long r = write(xfd, p, n);
+        if (r == -EINTR) continue;
         if (r <= 0) die("xwrite failed\n");
         p += r; n -= r;
     }
@@ -351,6 +363,7 @@ static size_t    mmap_size;
 static uint16_t  cell_w, cell_h, baseline, first_cp, num_glyphs;
 static uint8_t  *glyph_data;
 static int       WIN_W, WIN_H, cols, rows;
+static int       cfg_w, cfg_h;    /* window size as last reported by the server */
 
 static void font_load(const char *path)
 {
@@ -668,6 +681,25 @@ static void render_all(uint32_t draw, uint32_t gc, uint8_t depth)
 static uint8_t screen_storage[GRID_MAX_CELLS];
 static uint32_t xterm_win, xterm_gc;
 
+/* Re-derive the grid from a window size in pixels.  Unlike the initial
+ * grid_init() this never dies: a window can be made arbitrarily small or
+ * large, so the result is clamped to between one cell and what the
+ * buffers hold.  Returns nonzero if the grid dimensions changed (the
+ * cell buffers are then reset: their row stride changed with `cols`, and
+ * the caller is about to rewrite every cell anyway). */
+static int regrid(int w, int h)
+{
+    if (w < cell_w) w = cell_w;
+    if (h < cell_h) h = cell_h;
+    int c = w / cell_w, r = h / cell_h;
+    if ((size_t)c * r > sizeof screen_storage) r = (int)(sizeof screen_storage) / c;
+    if (c == cols && r == rows) return 0;
+    grid_init((uint16_t)(c * cell_w), (uint16_t)(r * cell_h),
+              screen_storage, sizeof screen_storage);
+    synced = 0;
+    return 1;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Atoms, window title, close protocol
  * ═══════════════════════════════════════════════════════════════════ */
@@ -682,7 +714,11 @@ static uint32_t xterm_win, xterm_gc;
  * and an error is byte0==0; anything else is an event that arrived
  * first and simply isn't relevant here (xterm_wait's own loop is what
  * processes events, once the main loop starts), so skip over it rather
- * than misreading its bytes as if they were our reply. */
+ * than misreading its bytes as if they were our reply.  They are not
+ * thrown away, though: a window manager that resizes the window right
+ * after mapping it can have its ConfigureNotify arrive here, and
+ * handle_event() records it for xterm_init to apply. */
+static void handle_event(const uint8_t *ev);
 static uint32_t intern_atom(const char *name, int len)
 {
     uint8_t req[24] = {0};
@@ -697,7 +733,7 @@ static uint32_t intern_atom(const char *name, int len)
         uint8_t rep[32]; xread(rep, 32);
         if (rep[0] == 1) { uint32_t atom; memcpy(&atom, rep+8, 4); return atom; }
         if (rep[0] == 0) return 0; /* error: give up gracefully */
-        /* else: an unrelated event, drop it and keep waiting */
+        handle_event(rep);         /* else an event that beat the reply */
     }
 }
 
@@ -823,8 +859,9 @@ int xterm_init(void)
     uint16_t len=10;
     int16_t x=(int16_t)((screen_w-WIN_W)/2), y=(int16_t)((screen_h-WIN_H)/2);
     uint16_t w=(uint16_t)WIN_W, h=(uint16_t)WIN_H, bw=0, cls=1;
+    cfg_w = WIN_W; cfg_h = WIN_H;
     uint32_t vis=0, vmask=(1u<<1)|(1u<<11), bg=black_px;
-    uint32_t emask=(1u<<15)|(1u<<0)|(1u<<4); /* Exposure|KeyPress|EnterWindow */
+    uint32_t emask=(1u<<17)|(1u<<15)|(1u<<0)|(1u<<4); /* StructureNotify|Exposure|KeyPress|EnterWindow */
     r[0]=1;
     memcpy(r+2,&len,2); memcpy(r+4,&xterm_win,4); memcpy(r+8,&root_win,4);
     memcpy(r+12,&x,2); memcpy(r+14,&y,2); memcpy(r+16,&w,2); memcpy(r+18,&h,2);
@@ -855,6 +892,7 @@ int xterm_init(void)
     memcpy(wp+24,&wm_delete_window_atom,4);
     xwrite(wp,28);
 
+    regrid(cfg_w, cfg_h);   /* a ConfigureNotify may have beaten the atom replies */
     return 0;
 }
 
@@ -883,40 +921,62 @@ void xterm_set_cursor(int row, int col)
     cursor_col = col;
 }
 
-/* Wait for X events, returning nonzero when an expose series is complete. */
+static uint8_t redraw_pending;
+
+/* One 32-byte server event.  Key presses are queued; everything else only
+ * records state for xterm_wait() to act on. */
+static void handle_event(const uint8_t *ev)
+{
+    uint8_t etype = ev[0] & 0x7f;
+    if (etype == 12) {
+        uint16_t count;
+        memcpy(&count, ev + 16, 2);
+        if (count == 0) { redraw_pending = 1; synced = 0; }
+    } else if (etype == 22) {
+        /* ConfigureNotify: new geometry (a window manager's resize, or
+         * ours being moved).  Only the latest size matters, so just note
+         * it: a drag produces dozens of these, and xterm_wait() regrids
+         * once after reading them all. */
+        uint16_t w, h;
+        memcpy(&w, ev + 20, 2); memcpy(&h, ev + 22, 2);
+        cfg_w = w; cfg_h = h;
+    } else if (etype == 2) {
+        handle_keypress(ev);
+    } else if (etype == 7) {
+        /* EnterNotify: pointer entered the window. Re-assert focus so
+         * typing works regardless of the WM's own focus policy. */
+        grab_focus();
+    } else if (etype == 33) {
+        /* ClientMessage: check for a WM_DELETE_WINDOW close request. */
+        uint32_t mtype; memcpy(&mtype, ev + 8, 4);
+        if (mtype == wm_protocols_atom) {
+            uint32_t data0; memcpy(&data0, ev + 12, 4);
+            if (data0 == wm_delete_window_atom) close_requested = 1;
+        }
+    }
+}
+
+/* Wait for X events.  Returns nonzero when everything must be repainted:
+ * an expose series completed, or the window was resized -- in which case
+ * xterm_columns()/xterm_rows() have changed and the cell buffers have
+ * been reset, so the caller has to refill them before xterm_render(). */
 int xterm_wait(int timeout_ms)
 {
     struct pollfd p = { .fd = xfd, .events = POLLIN, .revents = 0 };
     long ready = poll(&p, 1, timeout_ms);
     if (ready <= 0) return 0;
 
-    int redraw = 0;
     for (;;) {
         if (!(p.revents & POLLIN)) break;
         uint8_t ev[32];
         xread(ev, sizeof ev);
-        uint8_t etype = ev[0] & 0x7f;
-        if (etype == 12) {
-            uint16_t count;
-            memcpy(&count, ev + 16, 2);
-            if (count == 0) { redraw = 1; synced = 0; }
-        } else if (etype == 2) {
-            handle_keypress(ev);
-        } else if (etype == 7) {
-            /* EnterNotify: pointer entered the window. Re-assert focus so
-             * typing works regardless of the WM's own focus policy. */
-            grab_focus();
-        } else if (etype == 33) {
-            /* ClientMessage: check for a WM_DELETE_WINDOW close request. */
-            uint32_t mtype; memcpy(&mtype, ev + 8, 4);
-            if (mtype == wm_protocols_atom) {
-                uint32_t data0; memcpy(&data0, ev + 12, 4);
-                if (data0 == wm_delete_window_atom) close_requested = 1;
-            }
-        }
+        handle_event(ev);
         p.revents = 0;
         ready = poll(&p, 1, 0);
         if (ready <= 0) break;
     }
+    if (regrid(cfg_w, cfg_h)) redraw_pending = 1;
+    int redraw = redraw_pending;
+    redraw_pending = 0;
     return redraw;
 }

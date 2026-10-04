@@ -34,6 +34,14 @@ int xterm_columns(void);
 int xterm_rows(void);
 int xterm_init(void);
 void xterm_render(void);
+/* Process pending X events, waiting up to timeout_ms for the first.
+ * Returns nonzero if the window's contents must be repainted: it was
+ * exposed, or it was resized.  After a resize xterm_columns() and
+ * xterm_rows() return the new grid size and all per-cell buffers have
+ * been reset (their row stride is the column count), so callers must
+ * refill them in full, from scratch, before the next xterm_render().
+ * The grid is the window size in whole cells, at least 1x1, and capped
+ * at 32K cells in total. */
 int xterm_wait(int timeout_ms);
 
 /* The underlying X11 connection socket, for callers that want to select()/

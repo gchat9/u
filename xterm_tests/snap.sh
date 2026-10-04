@@ -9,4 +9,4 @@ for n in 0 1 2 3 4 5; do
     ./xt_test $n & BP=$!; sleep 0.8
     printf '%s ' "$(md5sum $FB/Xvfb_screen0 | cut -c1-8)"; wait $BP
 done; echo
-kill $XP; rm -rf $FB
+kill $XP; wait $XP 2>/dev/null; rm -rf $FB

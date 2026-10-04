@@ -3,8 +3,8 @@ and Xvfb. Build with `make`.
 
 xt_test   Renders 6 frames of a random stress grid (glyphs, colours, underline/strike, fullwidth,
           emoji, missing-glyph boxes, cursor, partial redraws) and idles ~1.5s so a screenshot can
-          be taken. ./snap.sh [depth] prints one hash per frame. Build it from two versions of
-          xterm.c and compare the output: identical hashes = identical pixels.
+          be taken. ./snap.sh [depth] prints one hash per frame. Build this from two versions of
+          _lib/xterm.c and compare the output: identical hashes = identical pixels.
 
 xt_bench  300 frames, mode in argv[1]:
             a  every cell changes, default colours (like xterm_demo)

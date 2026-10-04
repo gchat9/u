@@ -15,4 +15,4 @@ for b in bins:
         t1 = time.time(); r1 = resource.getrusage(resource.RUSAGE_CHILDREN); time.sleep(0.25)
         if rc == 0: cpu.append(r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime); wall.append(t1 - t0)
     print(f"{b} d{depth} mode {mode}: cpu {min(cpu):.3f}s  wall {min(wall):.3f}s")
-xv.kill()
+xv.kill(); xv.wait()
