@@ -5,8 +5,7 @@
  *   - Raw X11 wire protocol over Unix socket
  *   - BFNT bitmap font (produced by _font/mkfont.c)
  *   - File-backed BFNT font mapping; protocol buffers supplied by main's stack frame
- *   - Per-cell PutImage (no full-screen framebuffer)
- *   - Dirty-cell tracking (typically 2-3 PutImage calls per keypress)
+ *   - One PutImage per tile of cells (no full-screen framebuffer)
  *
  * The font is fixed at /etc/font.bfnt.  xterm_init() creates the
  * surface; callers update xterm_framebuffer() and call xterm_render().
@@ -121,11 +120,15 @@ static uint32_t xid_base, xid_mask, xid_seq;
 static uint32_t x_max_request_words;
 static uint32_t new_xid(void) { return xid_base | (xid_seq++ & xid_mask); }
 
-/* ── PutImage (opcode 72, ZPixmap), auto-striped ─────────────────── */
+/* ── PutImage (opcode 72, ZPixmap), auto-striped ───────────────────
+ * The request header is built in the PUT_HDR bytes just in front of the
+ * pixels (`px` must have them writable), so header and pixels leave in a
+ * single write(). */
+#define PUT_HDR 24
 static void put_image(uint32_t draw, uint32_t gc,
                       int dstx, int dsty,
                       int w, int h, uint8_t depth, int bytes_per_pixel,
-                      const uint8_t *px)
+                      uint8_t *px)
 {
     /* PutImage has a six-word fixed header.  Servers may advertise a
        substantially smaller request limit than the protocol maximum. */
@@ -138,14 +141,17 @@ static void put_image(uint32_t draw, uint32_t gc,
         uint16_t rlen = (uint16_t)(6 + dsz / 4);
         uint16_t uw = (uint16_t)w, ur = (uint16_t)rows;
         int16_t  sx = (int16_t)dstx, sy = (int16_t)(dsty + y0);
-        uint8_t  hdr[24] = {0};
+        uint8_t *hdr = px + (size_t)y0 * stride - PUT_HDR;
+        uint8_t  save[PUT_HDR];
+        memcpy(save, hdr, PUT_HDR);     /* pixels, if a previous stripe */
+        memset(hdr, 0, PUT_HDR);
         hdr[0] = 72; hdr[1] = 2;
         memcpy(hdr+ 2, &rlen, 2); memcpy(hdr+ 4, &draw, 4);
         memcpy(hdr+ 8, &gc,   4); memcpy(hdr+12, &uw,   2);
         memcpy(hdr+14, &ur,   2); memcpy(hdr+16, &sx,   2);
         memcpy(hdr+18, &sy,   2); hdr[21] = depth;
-        xwrite(hdr, 24);
-        xwrite(px + (size_t)y0 * stride, dsz);
+        xwrite(hdr, PUT_HDR + dsz);
+        memcpy(hdr, save, PUT_HDR);
     }
 }
 
@@ -426,7 +432,15 @@ static void grid_init(uint16_t screen_w, uint16_t screen_h,
  * Per-cell rendering
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* Cells of one text row are drawn side by side into a tile that is sent
+ * with a single PutImage; cell_buf is the current cell's top-left corner
+ * inside it and cell_stride the tile's scanline pitch.  The tile is also
+ * the only pixel storage: there is no full-screen framebuffer. */
+static uint8_t cell_storage[PUT_HDR + 64*64*4] __attribute__((aligned(4)));
+#define TILE (cell_storage + PUT_HDR)
 static uint8_t *cell_buf;
+static size_t   cell_stride;
+static int      batch;          /* cells per tile, set by xterm_init */
 
 static inline uint32_t blend(uint8_t a, uint32_t src, uint32_t dst)
 {
@@ -444,34 +458,73 @@ static inline uint16_t pack565(uint32_t c)
     return (uint16_t)(((c >> 8) & 0xf800) | ((c >> 5) & 0x07e0) | ((c >> 3) & 0x001f));
 }
 
+/* Glyph coverage (0-255) -> final pixel, for the fg/bg pair of the cell
+ * being drawn.  Entries are computed on first use and the table is
+ * invalidated only when that pair changes (runs of same-coloured text,
+ * i.e. nearly everything, reuse it), so blending costs one table load per
+ * pixel and the background fill shares the glyph's single pass: entry 0
+ * is the plain background.  A glyph only uses a few dozen of the 256
+ * coverage values, which is why filling lazily beats building it whole
+ * when the colours change from cell to cell.  ~0 marks an empty entry (no
+ * pixel value, 0x00RRGGBB or RGB565, can be that). */
+static uint32_t lut[256];
+static uint32_t lut_key = ~0u;
+static uint32_t lut_fg, lut_bg;
+
+static void lut_set(uint8_t fgi, uint8_t bgi)
+{
+    uint32_t key = (uint32_t)fgi << 8 | bgi;
+    if (key == lut_key) return;
+    lut_key = key;
+    lut_fg = palette[fgi]; lut_bg = palette[bgi];
+    for (int i = 0; i < 256; i++) lut[i] = ~0u;
+}
+
+static uint32_t lut_fill(uint8_t a, uint8_t depth)
+{
+    uint32_t p = blend(a, lut_fg, lut_bg);
+    return lut[a] = depth == 16 ? pack565(p) : p;
+}
+
+/* Store one pixel (x,y in cell-local coordinates) at the window depth. */
+static inline void put_px(int x, int y, uint32_t color, uint8_t depth)
+{
+    uint8_t *line = cell_buf + (size_t)y * cell_stride;
+    if (depth == 16) ((uint16_t *)line)[x] = pack565(color);
+    else             ((uint32_t *)line)[x] = color;
+}
+
 /* Solid horizontal line, full cell width, at cell-local row `r` (0 = top
  * of cell). Used for ATTR_UNDERLINE / ATTR_STRIKE — cheap structural
  * marks that a colour change alone can't express. */
 static void fill_row(int r, uint32_t color, uint8_t depth)
 {
     if (r < 0 || r >= cell_h) return;
-    if (depth == 16) {
-        size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
-        uint16_t *line = (uint16_t *)(cell_buf + (size_t)r * stride);
-        uint16_t p = pack565(color);
-        for (int x = 0; x < cell_w; x++) line[x] = p;
-    } else {
-        uint32_t *line = (uint32_t *)cell_buf + (size_t)r * cell_w;
-        for (int x = 0; x < cell_w; x++) line[x] = color;
-    }
+    for (int x = 0; x < cell_w; x++) put_px(x, r, color, depth);
 }
 
-/* Store one pixel (i = y*cell_w + x) into cell_buf at the window depth. */
-static inline void put_px(int i, uint32_t color, uint8_t depth)
+/* Paint the whole cell from a glyph's coverage bitmap through lut[].
+ * Cell column x shows glyph column x - sh (blank outside the glyph).
+ * Written out per pixel size (GLYPH_ROW) so the depth test is per row,
+ * not per pixel. */
+#define GLYPH_ROW(T)                                                   \
+    for (int x = 0; x < cell_w; x++) {                                 \
+        unsigned gx = (unsigned)(x - sh);                              \
+        uint8_t a = gx < cell_w ? g[gx] : 0;                           \
+        uint32_t p = lut[a];                                           \
+        if (p == ~0u) p = lut_fill(a, depth);                          \
+        ((T *)line)[x] = (T)p;                                         \
+    }
+__attribute__((optimize("O2"))) /* the hot loop: -Os costs ~30% here */
+static void draw_glyph(const uint8_t *g, int sh, uint8_t depth)
 {
-    if (depth == 16) {
-        size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
-        uint16_t *line = (uint16_t *)(cell_buf + (size_t)(i / cell_w) * stride);
-        line[i % cell_w] = pack565(color);
-    } else {
-        ((uint32_t *)cell_buf)[i] = color;
+    for (int y = 0; y < cell_h; y++, g += cell_w) {
+        uint8_t *line = cell_buf + (size_t)y * cell_stride;
+        if (depth == 16) { GLYPH_ROW(uint16_t) }
+        else             { GLYPH_ROW(uint32_t) }
     }
 }
+#undef GLYPH_ROW
 
 /* Draw the left (half=0) or right (half=1) half of emoji k over the
  * already-bg-filled cell_buf. Each record is 15 RGB palette entries
@@ -492,7 +545,7 @@ static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
         for (int x = 0; x < cell_w; x++) {
             int X = off + x;
             if (X >= 1 && X <= last && (X == 1 || X == last || y == 1 || y == cell_h - 2))
-                put_px(y * cell_w + x, fg, depth);
+                put_px(x, y, fg, depth);
         }
 }
 
@@ -508,7 +561,7 @@ static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
             int ix = (p & 1) ? pix[p >> 1] & 15 : pix[p >> 1] >> 4;
             if (!ix) continue;
             const uint8_t *c = rec + (ix - 1) * 3;
-            put_px(y * cell_w + x,
+            put_px(x, y,
                    (uint32_t)c[0] << 16 | (uint32_t)c[1] << 8 | c[2], depth);
         }
 }
@@ -517,8 +570,7 @@ static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
  * cell), no blinking. row<0 means "no cursor" (hidden/unfocused etc). */
 static int cursor_row = -1, cursor_col = -1;
 
-static void render_cell(int row, int col,
-                        uint32_t draw, uint32_t gc, uint8_t depth)
+static void render_cell(int row, int col, uint8_t depth)
 {
     int idx = row * cols + col;
     uint8_t rattrs = atb[idx];
@@ -532,41 +584,30 @@ static void render_cell(int row, int col,
     int is_cursor = row == cursor_row &&
         (is_emoji || is_fw ? (cursor_col == pair || cursor_col == pair + 1)
                            : cursor_col == col);
-    uint32_t bg = palette[bgb[idx]];
-    uint32_t fg = palette[fgb[idx]];
-    if (is_cursor) { uint32_t t = bg; bg = fg; fg = t; }
-    int n = cell_w * cell_h;
-    if (depth == 16) {
-        size_t stride = ((size_t)cell_w * 2 + 3) & ~(size_t)3;
-        for (int y = 0; y < cell_h; y++) {
-            uint16_t *line = (uint16_t *)(cell_buf + (size_t)y * stride);
-            for (int x = 0; x < cell_w; x++) line[x] =
-                (uint16_t)(((bg >> 8) & 0xf800) | ((bg >> 5) & 0x07e0) |
-                           ((bg >> 3) & 0x001f));
-        }
-    } else {
-        uint32_t *line = (uint32_t *)cell_buf;
-        for (int i = 0; i < n; i++) line[i] = bg;
-    }
+    uint8_t fgi = fgb[idx], bgi = bgb[idx];
+    if (is_cursor) { uint8_t t = bgi; bgi = fgi; fgi = t; }
+    lut_set(fgi, bgi);
+    uint32_t fg = palette[fgi];
     uint8_t cp = scr[idx];
-    if (is_emoji) {
-        draw_emoji(cp, half, fg, depth);
-    } else if (rattrs & XTERM_ATTR_MISSING) {
-        draw_box(0, cell_w, fg, depth);
-    } else if (cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
-        const uint8_t *g = glyph_data + (size_t)(cp-first_cp)*cell_w*cell_h;
+    /* Anything that isn't an ordinary glyph (emoji, placeholder box) is
+     * drawn over a plain background, which is what glyph slot 0 gives:
+     * it is the space, see charset.h, so its coverage is all zero. */
+    const uint8_t *g = glyph_data;
+    int sh = 0;
+    if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) &&
+        cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
+        g += (size_t)(cp-first_cp)*cell_w*cell_h;
         /* A fullwidth character reuses its narrow twin's glyph, centred
          * across the two cells; this cell shows glyph columns x - sh
          * (left half: shifted right by half a cell; right half: the
          * remainder). Ordinary cells: sh = 0, every column in range. */
-        int sh = is_fw ? cell_w / 2 - half * cell_w : 0;
-        for (int y = 0; y < cell_h; y++)
-            for (int x = 0; x < cell_w; x++) {
-                int gx = x - sh;
-                uint8_t a = gx >= 0 && gx < cell_w ? g[y * cell_w + gx] : 0;
-                if (a) put_px(y * cell_w + x, blend(a, fg, bg), depth);
-            }
+        if (is_fw) sh = cell_w / 2 - half * cell_w;
     }
+    draw_glyph(g, sh, depth);
+    if (is_emoji)
+        draw_emoji(cp, half, fg, depth);
+    else if (rattrs & XTERM_ATTR_MISSING)
+        draw_box(0, cell_w, fg, depth);
     if (rattrs & XTERM_ATTR_UNDERLINE) {
         int r = baseline + 1;
         fill_row(r >= cell_h ? cell_h - 1 : r, fg, depth);
@@ -574,23 +615,57 @@ static void render_cell(int row, int col,
     if (rattrs & XTERM_ATTR_STRIKE) {
         fill_row(baseline / 2, fg, depth);
     }
-    put_image(draw, gc, col*cell_w, row*cell_h, cell_w, cell_h, depth,
-              depth == 16 ? 2 : 4, cell_buf);
+}
+
+/* Rows whose content is unchanged since they were last sent are skipped.
+ * "Content" is what render_cell reads for the row (glyph, colours and
+ * attributes of every cell, plus the cursor column if the cursor is on
+ * it), folded into a 32-bit FNV-1a hash per row: 4 bytes of state per row
+ * rather than a shadow copy of the grid.  A collision would leave one row
+ * stale until it next changes -- harmless, and ~2^-32 per update.
+ * Rows past ROWS_MAX are simply always drawn.  `synced` is cleared by
+ * Expose (the server dropped our pixels), which forces a full repaint. */
+#define ROWS_MAX 256
+static uint32_t row_hash[ROWS_MAX];
+static uint8_t  synced;
+
+static uint32_t hash_row(int r)
+{
+    uint8_t *const plane[4] = { scr, fgb, bgb, atb };
+    uint32_t h = 2166136261u;
+    if (r == cursor_row) h = (h ^ (uint32_t)(cursor_col + 1)) * 16777619u;
+    for (int i = 0; i < 4; i++)
+        for (int c = 0; c < cols; c++)
+            h = (h ^ plane[i][r * cols + c]) * 16777619u;
+    return h;
 }
 
 static void render_all(uint32_t draw, uint32_t gc, uint8_t depth)
 {
+    int bpp = depth == 16 ? 2 : 4;
     for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            render_cell(r, c, draw, gc, depth);
+        if (r < ROWS_MAX) {
+            uint32_t h = hash_row(r);
+            if (synced && row_hash[r] == h) continue;
+            row_hash[r] = h;
+        }
+        for (int c0 = 0; c0 < cols; c0 += batch) {
+            int nc = cols - c0 < batch ? cols - c0 : batch;
+            cell_stride = ((size_t)nc * cell_w * bpp + 3) & ~(size_t)3;
+            for (int c = 0; c < nc; c++) {
+                cell_buf = TILE + (size_t)c * cell_w * bpp;
+                render_cell(r, c0 + c, depth);
+            }
+            put_image(draw, gc, c0*cell_w, r*cell_h, nc*cell_w, cell_h,
+                      depth, bpp, TILE);
         }
     }
+    synced = 1;
 }
 
 
 /* Library-owned state and backing storage. */
 static uint8_t screen_storage[GRID_MAX_CELLS];
-static uint8_t cell_storage[64*64*4];
 static uint32_t xterm_win, xterm_gc;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -682,7 +757,6 @@ int xterm_init(void)
 {
     uint8_t setup_storage[SETUP_MAX];
     x_max_request_words = 65535;
-    cell_buf = cell_storage;
     build_palette();
     font_load("/etc/font.bfnt");
     emoji_load("/etc/emoji.bfnt");
@@ -735,6 +809,10 @@ int xterm_init(void)
     uint16_t screen_w; memcpy(&screen_w, d+soff+20, 2);
     uint16_t screen_h; memcpy(&screen_h, d+soff+22, 2);
     xterm_depth = d[soff+38];
+    /* Whole cells per tile: each scanline may need up to 3 bytes of padding. */
+    batch = (int)(((sizeof cell_storage - PUT_HDR) / cell_h - 3) /
+                  ((size_t)cell_w * (xterm_depth == 16 ? 2 : 4)));
+    if (batch < 1) die("font cell is too large\n");
     min_keycode = d[26];
     max_keycode = d[27];
     load_keyboard_mapping();
@@ -821,7 +899,7 @@ int xterm_wait(int timeout_ms)
         if (etype == 12) {
             uint16_t count;
             memcpy(&count, ev + 16, 2);
-            if (count == 0) redraw = 1;
+            if (count == 0) { redraw = 1; synced = 0; }
         } else if (etype == 2) {
             handle_keypress(ev);
         } else if (etype == 7) {

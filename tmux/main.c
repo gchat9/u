@@ -1077,6 +1077,10 @@ int main(int argc, char *argv[])
                     break;
                 }
             }
+            /* The last window may just have gone: leave now instead of
+             * blocking in select() until some unrelated event (under
+             * X11_BACKEND, any key press) wakes us up. */
+            if (g_quit) continue;
         }
 
         /* Build fd set */
