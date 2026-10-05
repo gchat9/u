@@ -118,8 +118,17 @@ static int child_rows(void) { return g_rows > 1 ? g_rows - 1 : 1; }
 /* Status bar                                                           */
 /* ================================================================== */
 
+#if SCROLLBACK_ENABLED
+static void render_scrollback_view(void);
+#endif
+
 static void redraw_status(void)
 {
+#if SCROLLBACK_ENABLED
+    /* The scrollback viewer owns the status row (its footer), so a
+     * redraw -- the minute tick, say -- repaints the viewer instead. */
+    if (g_scrollback_mode) { render_scrollback_view(); return; }
+#endif
     pid_t pids[MAX_WINDOWS]  = {0};
     bool  exist[MAX_WINDOWS] = {false};
     bool  alive[MAX_WINDOWS] = {false};
@@ -359,18 +368,30 @@ static void auto_detach(void)
     session_detach(g_session_sock, g_wins, g_cur);
 }
 
-#if SCROLLBACK_ENABLED && !defined(X11_BACKEND)
-/* Scrollback-as-plain-text-over-the-real-terminal isn't meaningful for
- * X11_BACKEND (there is no "real terminal" it's allowed to write to —
- * see the X11_BACKEND note by the main select() loop). Disabled here
- * for now rather than silently misbehaving; an X11-native scrollback
- * view (rendered into the window like everything else) is a follow-up,
- * not implemented yet.
- *
+#if SCROLLBACK_ENABLED
+/* One line of the scrollback view.  On a real terminal (the plain
+ * build) it is written to stdout, dimmed if asked.  Under X11_BACKEND
+ * there is no terminal to write to (see the note by the main select()
+ * loop), so it is drawn into the window's cells instead; the backend
+ * wraps and scrolls just as a terminal would, so the two builds show the
+ * same thing. */
+static void sb_line(const char *p, int n, bool dim)
+{
+#ifdef X11_BACKEND
+    x11_backend_text_line(p, n, (Style){ dim ? 8 : 15, 0 });
+#else
+    if (dim)  (void)write(STDOUT_FILENO, "\033[2m", 4);
+    if (n > 0) (void)write(STDOUT_FILENO, p, (size_t)n);
+    if (dim)  (void)write(STDOUT_FILENO, "\033[m", 3);
+    (void)write(STDOUT_FILENO, "\r\n", 2);
+#endif
+}
+
+/*
  * Render the scrollback history for the current window.
  * Displays up to child_rows() lines of captured history ending at
  * g_scrollback_offset lines from the most-recent captured line.
- * Lines are plain UTF-8 written directly to the terminal.
+ * Lines are plain UTF-8.
  */
 static void render_scrollback_view(void)
 {
@@ -400,14 +421,17 @@ static void render_scrollback_view(void)
     if (skip < 0) skip = 0;
 
     /* Clear screen and home cursor */
+#ifdef X11_BACKEND
+    x11_backend_text_begin();
+#else
     (void)write(STDOUT_FILENO, "\033[2J\033[H", 8);
+#endif
 
     int row = 0;
 
     /* Top-of-history marker */
     if (skip == 0) {
-        const char *top = "\033[2m-- top of scrollback --\033[m\r\n";
-        (void)write(STDOUT_FILENO, top, strlen(top));
+        sb_line("-- top of scrollback --", 23, true);
         row++;
     }
 
@@ -421,9 +445,7 @@ static void render_scrollback_view(void)
     while (row < view_rows && sb_row < sb_lines && pos <= len) {
         int end = pos;
         while (end < len && buf[end] != '\n') end++;
-        if (end > pos)
-            (void)write(STDOUT_FILENO, buf + pos, (size_t)(end - pos));
-        (void)write(STDOUT_FILENO, "\r\n", 2);
+        sb_line(buf + pos, end - pos, false);
         row++; sb_row++;
         pos = end + 1;
     }
@@ -439,29 +461,40 @@ static void render_scrollback_view(void)
             uint32_t cp = cell->ch ? cell->ch : ' ';
             if (cp != ' ') last = c;
         }
-        /* Emit cells up to last non-space */
+        /* Encode cells up to last non-space */
+        char line[(size_t)s->cols * 4];
+        int  ll = 0;
         for (int c = 0; c <= last && c < s->cols; c++) {
             Cell *cell = &s->cells[r][c];
             if (cell->flags & CELL_WIDE_CONT) continue;
             uint32_t cp = cell->ch ? cell->ch : ' ';
-            char utf8[4]; int ulen = 0;
-            if      (cp < 0x80)    { utf8[ulen++] = (char)cp; }
-            else if (cp < 0x800)   { utf8[ulen++] = (char)(0xC0|(cp>>6));
-                                     utf8[ulen++] = (char)(0x80|(cp&0x3F)); }
-            else if (cp < 0x10000) { utf8[ulen++] = (char)(0xE0|(cp>>12));
-                                     utf8[ulen++] = (char)(0x80|((cp>>6)&0x3F));
-                                     utf8[ulen++] = (char)(0x80|(cp&0x3F)); }
-            else                   { utf8[ulen++] = (char)(0xF0|(cp>>18));
-                                     utf8[ulen++] = (char)(0x80|((cp>>12)&0x3F));
-                                     utf8[ulen++] = (char)(0x80|((cp>>6)&0x3F));
-                                     utf8[ulen++] = (char)(0x80|(cp&0x3F)); }
-            (void)write(STDOUT_FILENO, utf8, (size_t)ulen);
+            if      (cp < 0x80)    { line[ll++] = (char)cp; }
+            else if (cp < 0x800)   { line[ll++] = (char)(0xC0|(cp>>6));
+                                     line[ll++] = (char)(0x80|(cp&0x3F)); }
+            else if (cp < 0x10000) { line[ll++] = (char)(0xE0|(cp>>12));
+                                     line[ll++] = (char)(0x80|((cp>>6)&0x3F));
+                                     line[ll++] = (char)(0x80|(cp&0x3F)); }
+            else                   { line[ll++] = (char)(0xF0|(cp>>18));
+                                     line[ll++] = (char)(0x80|((cp>>12)&0x3F));
+                                     line[ll++] = (char)(0x80|((cp>>6)&0x3F));
+                                     line[ll++] = (char)(0x80|(cp&0x3F)); }
         }
-        (void)write(STDOUT_FILENO, "\r\n", 2);
+        sb_line(line, ll, false);
     }
 
-    /* Scrollback status indicator in the status row */
-    /* Draw status indicator using config.h style macros */
+    /* Scrollback status indicator in the status row, in the status
+     * bar's own colours (config.h) */
+    char ind_text[64];
+    int ilen = snprintf(ind_text, sizeof(ind_text),
+                        "  %d/%d lines  (q/Esc to exit) ",
+                        g_scrollback_offset, sb_lines);
+#ifdef X11_BACKEND
+    x11_backend_text_fill(g_rows - 1, STATUS_BAR_COLOR);
+    x11_backend_text_at(g_rows - 1, 0, " SCROLLBACK ", 12,
+                        WINDOW_STATUS_CURRENT_COLOR);
+    x11_backend_text_at(g_rows - 1, 12, ind_text, ilen, STATUS_BAR_COLOR);
+    x11_backend_text_end();
+#else
     static const char sb_prefix[] =
         STATUS_BAR_STYLE "\033[2K"
         WINDOW_STATUS_CURRENT_STYLE " SCROLLBACK "
@@ -470,16 +503,14 @@ static void render_scrollback_view(void)
     snprintf(ind_pos, sizeof(ind_pos), "\033[%d;1H", g_rows);
     (void)write(STDOUT_FILENO, ind_pos, strlen(ind_pos));
     (void)write(STDOUT_FILENO, sb_prefix, sizeof(sb_prefix) - 1);
-    char ind_text[64];
-    int ilen = snprintf(ind_text, sizeof(ind_text),
-                        "  %d/%d lines  (q/Esc to exit) " _RESET,
-                        g_scrollback_offset, sb_lines);
     (void)write(STDOUT_FILENO, ind_text, (size_t)ilen);
+    (void)write(STDOUT_FILENO, _RESET, sizeof(_RESET) - 1);
 
     /* Park cursor out of the way */
     char mv[16];
     snprintf(mv, sizeof(mv), "\033[%d;1H", view_rows);
     (void)write(STDOUT_FILENO, mv, strlen(mv));
+#endif
 }
 
 /*
@@ -525,10 +556,38 @@ static bool scrollback_input_byte(uint8_t b)
     }
     return false;
 }
+
+/* Give a key byte to the scrollback viewer if it is open; returns true
+ * if it consumed the byte.  `last` is true for the final byte of a batch
+ * of input: under X11_BACKEND keys arrive whole (an arrow key is one
+ * batch of three bytes), so an ESC that ends a batch is the Escape key
+ * itself and closes the viewer at once, rather than waiting for a next
+ * key to show it wasn't the start of a sequence.  (Not done for a real
+ * terminal, where a sequence can be split across reads.) */
+static bool scrollback_feed(uint8_t b, bool last)
+{
+    if (!g_scrollback_mode) return false;
+    bool exit_sb = scrollback_input_byte(b);
+#ifdef X11_BACKEND
+    if (b == '\033' && last && _sb_esc == 1) exit_sb = true;
+#else
+    (void)last;
+#endif
+    if (exit_sb) {
+        g_scrollback_mode   = false;
+        g_scrollback_offset = 0;
+        _sb_esc             = 0;
+        full_redraw();
+    }
+    return true;
+}
 #endif /* SCROLLBACK_ENABLED */
 
 static void full_redraw(void)
 {
+#if SCROLLBACK_ENABLED
+    if (g_scrollback_mode) { render_scrollback_view(); return; }
+#endif
     render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
     redraw_status();
     observer_push();
@@ -708,7 +767,7 @@ static void handle_event(InputEvent ev)
         break;
     case CMD_SCROLLBACK_ENTER:
     case CMD_SCROLLBACK_ENTER_PGUP:
-#if SCROLLBACK_ENABLED && !defined(X11_BACKEND)
+#if SCROLLBACK_ENABLED
         if (g_wins[g_cur] && g_wins[g_cur]->vt.scr.scrollback &&
                 g_wins[g_cur]->vt.scr.scrollback_len > 0) {
             g_scrollback_mode   = true;
@@ -720,7 +779,6 @@ static void handle_event(InputEvent ev)
             render_scrollback_view();
         }
 #endif
-        /* Not implemented for X11_BACKEND yet (see render_scrollback_view) */
         break;
     case CMD_CLOSE_WINDOW: window_free(g_cur); {
         int next = -1;
@@ -1204,13 +1262,19 @@ int main(int argc, char *argv[])
                     x11_backend_columns() != g_cols)
                     handle_resize();     /* the window was resized */
                 else if (g_wins[g_cur]) {
-                    render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
-                    redraw_status();
+                    if (!g_scrollback_mode)
+                        render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
+                    redraw_status();   /* (repaints the viewer, if open) */
                 }
             }
             uint8_t kbuf[64];
             int kn = x11_backend_read_input(kbuf, sizeof kbuf);
             for (int i = 0; i < kn; i++) {
+#if SCROLLBACK_ENABLED
+                /* a full buffer might end mid-sequence: not a lone ESC */
+                if (scrollback_feed(kbuf[i], i == kn - 1 && kn < (int)sizeof kbuf))
+                    continue;
+#endif
                 InputEvent ev = input_feed(kbuf[i]);
                 if (!input_esc_pending()) esc_remaining_ms = -1;
                 handle_event(ev);
@@ -1323,16 +1387,7 @@ int main(int argc, char *argv[])
             }
             for (ssize_t i = 0; i < n; i++) {
 #if SCROLLBACK_ENABLED
-                if (g_scrollback_mode) {
-                    bool exit_sb = scrollback_input_byte(buf[i]);
-                    if (exit_sb) {
-                        g_scrollback_mode   = false;
-                        g_scrollback_offset = 0;
-                        _sb_esc             = 0;
-                        full_redraw();
-                    }
-                    continue;
-                }
+                if (scrollback_feed(buf[i], i == n - 1)) continue;
 #endif
                 InputEvent ev = input_feed(buf[i]);
                 /* If ESC resolved (next byte consumed it), cancel the timer */

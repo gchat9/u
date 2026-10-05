@@ -54,10 +54,16 @@
  * _FG / _BG accept 256-colour palette indices.
  * For the 8 standard colours you can use _FG_ANSI(0..7) / _BG_ANSI(0..7).
  */
-#define _FG(n)          "\033[38;5;" #n "m"
-#define _BG(n)          "\033[48;5;" #n "m"
-#define _FG_ANSI(n)     "\033[" #n "m"     /* n = 30-37 or 90-97      */
-#define _BG_ANSI(n)     "\033[" #n "m"     /* n = 40-47 or 100-107    */
+/* _XSTR expands its argument before stringifying it.  A bare #n would
+ * not: _FG(STATUS_BAR_FG) would yield the text "STATUS_BAR_FG" instead of
+ * the number it stands for (and a terminal would read the resulting
+ * "\033[38;5;S" as Scroll Up, wiping the screen). */
+#define _STR(x)         #x
+#define _XSTR(x)        _STR(x)
+#define _FG(n)          "\033[38;5;" _XSTR(n) "m"
+#define _BG(n)          "\033[48;5;" _XSTR(n) "m"
+#define _FG_ANSI(n)     "\033[" _XSTR(n) "m"     /* n = 30-37 or 90-97      */
+#define _BG_ANSI(n)     "\033[" _XSTR(n) "m"     /* n = 40-47 or 100-107    */
 #define _BOLD           "\033[1m"
 #define _DIM            "\033[2m"
 #define _ITALIC         "\033[3m"

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../tmux/vt.h"
+#include "../tmux/config.h"   /* Style */
 #include <sys/types.h>
 
 int  x11_backend_init(void);
@@ -18,3 +19,15 @@ void x11_backend_render(const Screen *screen);
 int  x11_backend_close_requested(void);
 void x11_backend_status(int row, int cols, int active,
                         pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+
+/* Plain-text view, used by the scrollback viewer: UTF-8 drawn into the
+ * window like output to a terminal.  _begin blanks the screen and homes
+ * the text cursor; _line writes a line there (wrapping, scrolling the
+ * screen up when it passes the bottom); _fill / _at draw in a fixed
+ * place (clipped, no wrap), for the footer; _end hides the cursor and
+ * shows the result. */
+void x11_backend_text_begin(void);
+void x11_backend_text_line(const char *utf8, int n, Style st);
+void x11_backend_text_fill(int row, Style st);
+void x11_backend_text_at(int row, int col, const char *utf8, int n, Style st);
+void x11_backend_text_end(void);
