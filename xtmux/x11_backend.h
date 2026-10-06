@@ -17,6 +17,12 @@ void x11_backend_render(const Screen *screen);
 /* Nonzero once the window manager has asked us to close (WM_DELETE_WINDOW),
  * e.g. the user clicked the window's close button. Sticky. */
 int  x11_backend_close_requested(void);
+/* Nonzero once the connection to the X server has been lost (it exited,
+ * the network dropped).  Sticky; everything else becomes a no-op. */
+int  x11_backend_lost(void);
+/* Close the connection, so the window goes away.  Needed before fork()ing
+ * the detached daemon, which would otherwise keep the window on screen. */
+void x11_backend_shutdown(void);
 void x11_backend_status(int row, int cols, int active,
                         pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
 

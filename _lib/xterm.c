@@ -96,24 +96,37 @@ __attribute__((noreturn)) static void die(const char *msg)
 #ifndef EINTR
 #define EINTR 4
 #endif
+/* Once the connection is up (xup), losing it -- the server went away,
+ * an `ssh -X` link dropped -- is not fatal to the program: reads and
+ * writes become no-ops (a read returns zeros, which parse as an ignorable
+ * "error" event) and xterm_lost() reports it, so the application can
+ * decide what to do (xtmux detaches, leaving the session running).
+ * During setup there is nothing to fall back on, so that still dies. */
+static uint8_t xup, xlost;
+
 static void xread(void *buf, size_t n)
 {
     char *p = buf;
     while (n) {
-        long r = read(xfd, p, n);
+        long r = xlost ? 0 : read(xfd, p, n);
         if (r == -EINTR) continue;
-        if (r <= 0) die("xread failed\n");
+        if (r <= 0) {
+            if (!xup) die("xread failed\n");
+            xlost = 1; memset(p, 0, n); return;
+        }
         p += r; n -= r;
     }
 }
-
 static void xwrite(const void *buf, size_t n)
 {
     const char *p = buf;
-    while (n) {
+    while (n && !xlost) {
         long r = write(xfd, p, n);
         if (r == -EINTR) continue;
-        if (r <= 0) die("xwrite failed\n");
+        if (r <= 0) {
+            if (!xup) die("xwrite failed\n");
+            xlost = 1; return;
+        }
         p += r; n -= r;
     }
 }
@@ -797,7 +810,10 @@ int xterm_init(void)
     font_load("/etc/font.bfnt");
     emoji_load("/etc/emoji.bfnt");
 
-    xfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* Close-on-exec (SOCK_CLOEXEC has O_CLOEXEC's value): the shells and
+     * programs we start must not inherit the connection.  They would keep
+     * it, and so the window, alive after we have detached or exited. */
+    xfd = socket(AF_UNIX, SOCK_STREAM | O_CLOEXEC, 0);
     struct sockaddr_un sa;
     sa.sun_family = AF_UNIX;
     strlcpy(sa.sun_path, "/tmp/.X11-unix/X", sizeof sa.sun_path);
@@ -893,10 +909,22 @@ int xterm_init(void)
     xwrite(wp,28);
 
     regrid(cfg_w, cfg_h);   /* a ConfigureNotify may have beaten the atom replies */
+    xup = 1;
     return 0;
 }
 
 int xterm_fd(void) { return xfd; }
+
+int xterm_lost(void) { return xlost; }
+
+/* Drop the connection now.  The server then destroys our window.  Used
+ * before fork()ing a background process: it would otherwise inherit the
+ * connection and keep the (by then dead) window on screen. */
+void xterm_disconnect(void)
+{
+    if (xfd > 0) close(xfd);
+    xfd = -1; xlost = 1;
+}
 
 int xterm_read_key(uint8_t *buf, int cap)
 {
@@ -962,14 +990,18 @@ static void handle_event(const uint8_t *ev)
  * been reset, so the caller has to refill them before xterm_render(). */
 int xterm_wait(int timeout_ms)
 {
+    if (xlost) return 0;
     struct pollfd p = { .fd = xfd, .events = POLLIN, .revents = 0 };
     long ready = poll(&p, 1, timeout_ms);
     if (ready <= 0) return 0;
 
     for (;;) {
-        if (!(p.revents & POLLIN)) break;
+        /* A dead connection can report POLLHUP/POLLERR without POLLIN;
+         * reading is how we find out (see xread). */
+        if (!(p.revents & (POLLIN | POLLHUP | POLLERR))) break;
         uint8_t ev[32];
         xread(ev, sizeof ev);
+        if (xlost) break;          /* (poll would go on saying "readable") */
         handle_event(ev);
         p.revents = 0;
         ready = poll(&p, 1, 0);

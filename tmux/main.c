@@ -365,6 +365,11 @@ static void auto_detach(void)
     input_restore();
 #endif
     render_free(&g_rs);
+#ifdef X11_BACKEND
+    /* The daemon is forked from here and would inherit our X connection,
+     * keeping a dead window on screen: close it first. */
+    x11_backend_shutdown();
+#endif
     session_detach(g_session_sock, g_wins, g_cur);
 }
 
@@ -928,8 +933,11 @@ int main(int argc, char *argv[])
             /* Role-reversal: old-live handed us its session socket. */
             g_session_sock = new_sess_fd;
         } else {
-            /* Daemon takeover: create a fresh listening socket. */
-            g_session_sock = session_listen();
+            /* Daemon takeover: the daemon exits as soon as it has our ACK,
+             * but may still be listening for an instant, so session_listen()'s
+             * liveness probe would sometimes find it and refuse.  Rebind
+             * unconditionally, as the observer promotion below does. */
+            g_session_sock = session_rebind();
             if (g_session_sock < 0) {
                 fputs("mux: failed to create session socket\n", stderr);
                 return 1;
@@ -1028,9 +1036,14 @@ int main(int argc, char *argv[])
         if (g_winch) { g_winch = 0; handle_resize(); }
 
 #ifdef X11_BACKEND
-        /* Window manager asked us to close (user clicked the close
-         * button, Alt-F4, etc) — treat it exactly like SIGTERM. */
-        if (x11_backend_close_requested()) g_quit = 1;
+        /* Our "terminal" went away: the window manager asked us to close
+         * (the close button, Alt-F4...) or the X connection was lost (the
+         * server exited, an `ssh -X` link dropped).  Same as the tty
+         * hanging up under the plain build: detach, so the session lives
+         * on -- handed to the other client if there is one, else as a
+         * daemon for a later `attach`.  (Quitting is Ctrl+B q.) */
+        if (x11_backend_close_requested() || x11_backend_lost())
+            auto_detach();   /* never returns */
 #endif
 
         /* Downgrade to observer after a takeover handshake */
@@ -1188,8 +1201,10 @@ int main(int argc, char *argv[])
          * wakes select() promptly instead of waiting for unrelated PTY
          * output, real-stdin input, or the (up to ~60s) clock timer. */
         int x11fd = x11_backend_fd();
-        FD_SET(x11fd, &rfds);
-        if (x11fd > maxfd) maxfd = x11fd;
+        if (x11fd >= 0) {
+            FD_SET(x11fd, &rfds);
+            if (x11fd > maxfd) maxfd = x11fd;
+        }
 #endif
 
         /*
@@ -1256,7 +1271,7 @@ int main(int argc, char *argv[])
          * discarded the window's contents while another window covered
          * it), a resize (new grid size: tell every window and pty) and/or KeyPress (queued as translated bytes by xterm_wait,
          * fed through the same FSM as real-stdin bytes below). */
-        if (FD_ISSET(x11fd, &rfds)) {
+        if (x11fd >= 0 && FD_ISSET(x11fd, &rfds)) {
             if (x11_backend_wait(0)) {
                 if (x11_backend_rows() != g_rows ||
                     x11_backend_columns() != g_cols)

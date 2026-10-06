@@ -34,6 +34,10 @@
 #include "window.h"
 #include "input.h"
 
+#ifdef X11_BACKEND
+#include "x11_backend.h"
+#endif
+
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -76,6 +80,22 @@ static int read_all(int fd, void *buf, size_t n)
         p += r; n -= (size_t)r;
     }
     return 0;
+}
+
+/* Size of whatever we display on: the terminal, or under X11_BACKEND our
+ * window's grid (a terminal that happened to launch us is irrelevant, and
+ * may be a different size or absent).  Rows include the status row. */
+static void obs_screen_size(int *rows, int *cols)
+{
+#ifdef X11_BACKEND
+    *rows = x11_backend_rows();
+    *cols = x11_backend_columns();
+#else
+    struct winsize ws = {0};
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+    *rows = ws.ws_row > 0 ? ws.ws_row : 24;
+    *cols = ws.ws_col > 0 ? ws.ws_col : 80;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -460,10 +480,9 @@ int session_attach(Window *wins[], int *cur_out,
         fcntl(new_session_sock, F_SETFD, FD_CLOEXEC);
 
         /* Send our terminal size so old-live can enter observe at right dims */
-        struct winsize ws = {0};
-        ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
-        int16_t my_rows = ws.ws_row > 0 ? ws.ws_row : 24;
-        int16_t my_cols = ws.ws_col > 0 ? ws.ws_col : 80;
+        int r, c;
+        obs_screen_size(&r, &c);
+        int16_t my_rows = (int16_t)r, my_cols = (int16_t)c;
         write_all(sock, &my_rows, 2);
         write_all(sock, &my_cols, 2);
 
@@ -567,33 +586,143 @@ int session_observer_init(int obs_fd, const Screen *s, int rows, int cols,
 /* ObsHeader.rows/cols are the SESSION dimensions; the observer clips   */
 /* or pads its own terminal to fit.  A zero-rows header signals EOF.   */
 
+/* The observer's front end.  The protocol loop below is the same for a
+ * terminal and for an X11 window; what differs is gathered in these
+ * helpers: setting up and leaving the display, where keys come from, and
+ * how a frame's status bar is shown. */
+
+#ifndef X11_BACKEND
 static volatile sig_atomic_t obs_winch_flag = 0;
 static void obs_on_winch(int sig) { (void)sig; obs_winch_flag = 1; }
+#endif
 
-/* Shared observe loop, entered after connection handshake and size receipt. */
+typedef struct {
+#ifndef X11_BACKEND
+    struct termios saved;
+    struct sigaction old_winch;
+#else
+    char unused;
+#endif
+} ObsTerm;
+
+static void obs_term_enter(ObsTerm *t)
+{
+#ifndef X11_BACKEND
+    (void)write(STDOUT_FILENO, "\033[?1049h", 8);
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &t->saved);
+    raw = t->saved;
+    cfmakeraw(&raw);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
+    obs_winch_flag = 0;
+    struct sigaction sa = {0};
+    sa.sa_handler = obs_on_winch;
+    sigaction(SIGWINCH, &sa, &t->old_winch);
+#else
+    (void)t;
+#endif
+}
+
+static void obs_term_leave(ObsTerm *t)
+{
+#ifndef X11_BACKEND
+    sigaction(SIGWINCH, &t->old_winch, NULL);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &t->saved);
+    (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
+#else
+    (void)t;
+#endif
+}
+
+/* fd to select() on for local input. */
+static int obs_input_fd(void)
+{
+#ifdef X11_BACKEND
+    return x11_backend_fd();
+#else
+    return STDIN_FILENO;
+#endif
+}
+
+/* Read local key bytes (called when obs_input_fd() is readable).
+ * Returns the count, or -1 if this client should disconnect: the
+ * terminal hung up, or the X window was closed or its connection lost.
+ * *relayout is set if the display itself changed (X11: exposed or
+ * resized; a terminal reports that through SIGWINCH instead). */
+static int obs_read_keys(uint8_t *buf, int cap, int *relayout)
+{
+#ifdef X11_BACKEND
+    if (x11_backend_wait(0)) *relayout = 1;
+    if (x11_backend_lost() || x11_backend_close_requested()) return -1;
+    return x11_backend_read_input(buf, cap);
+#else
+    (void)relayout;
+    ssize_t n = read(STDIN_FILENO, buf, (size_t)cap);
+    return n <= 0 ? -1 : (int)n;
+#endif
+}
+
+/* Show one frame: the cells (clipped to scr's view size), then the status
+ * bar.  On a terminal the frame carries the status bar already rendered
+ * as escape sequences; in a window it is drawn from the window table in
+ * the header. */
+static void obs_draw(RenderState *rs, Screen *scr, Cell **local,
+                     const ObsHeader *h, const char *status, int slen,
+                     int our_rows, int our_cols)
+{
+    scr->cells       = local;
+    scr->cur_row     = h->cur_row < scr->rows ? h->cur_row : scr->rows - 1;
+    scr->cur_col     = h->cur_col < scr->cols ? h->cur_col : scr->cols - 1;
+    scr->cur_visible = h->cur_visible;
+    render_screen(rs, scr);
+#ifdef X11_BACKEND
+    (void)status; (void)slen;
+    pid_t pids[MAX_WINDOWS] = {0};
+    bool  exists[MAX_WINDOWS] = {false}, alive[MAX_WINDOWS] = {false};
+    for (int i = 0; i < MAX_WINDOWS && i < 10; i++) {
+        exists[i] = (h->win_exists_mask >> i) & 1;
+        alive[i]  = (h->win_alive_mask  >> i) & 1;
+        pids[i]   = (pid_t)h->win_pids[i];
+    }
+    status_draw(our_rows, our_cols, h->cur_win, pids, exists, alive);
+#else
+    (void)our_rows; (void)our_cols;
+    if (slen > 0) {
+        (void)write(STDOUT_FILENO, status, (size_t)slen);
+        char mv[16];
+        int mvn = snprintf(mv, sizeof(mv), "\033[%d;%dH",
+                           scr->cur_row + 1, scr->cur_col + 1);
+        (void)write(STDOUT_FILENO, mv, (size_t)mvn);
+    }
+#endif
+}
+
+/* Shared observe loop, entered after connection handshake and size receipt.
+ * Returns 0 when we disconnect or the session ends, 1 if the main
+ * instance detached (takeover sentinel) and we should take over. */
 int session_observe_fd(int sock, int ses_rows, int ses_cols)
 {
-    struct winsize ws = {0};
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
-    int our_rows = ws.ws_row > 0 ? ws.ws_row : 24;
-    int our_cols = ws.ws_col > 0 ? ws.ws_col : 80;
+    int our_rows, our_cols;
+    obs_screen_size(&our_rows, &our_cols);
 
     int view_rows = (ses_rows < our_rows - 1 ? ses_rows : our_rows - 1);
     int view_cols = (ses_cols < our_cols      ? ses_cols : our_cols);
 
     RenderState rs;
     render_init(&rs, our_rows, our_cols);
-    (void)write(STDOUT_FILENO, "\033[?1049h", 8);
 
+    ObsTerm term;
     Cell **local = calloc((size_t)ses_rows, sizeof(Cell *));
     Cell  *data  = calloc((size_t)ses_rows * ses_cols, sizeof(Cell));
     if (!local || !data) {
         free(local); free(data);
-        (void)write(STDOUT_FILENO, "\033[?1049l", 8);
+        render_free(&rs);
         return -1;
     }
     for (int r = 0; r < ses_rows; r++)
         local[r] = data + r * ses_cols;
+    obs_term_enter(&term);
 
     Screen scr;
     memset(&scr, 0, sizeof(scr));
@@ -601,18 +730,8 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
     scr.cols        = view_cols;
     scr.cur_visible = 1;
 
-    struct termios raw, saved_termios;
-    tcgetattr(STDIN_FILENO, &saved_termios);
-    raw = saved_termios;
-    cfmakeraw(&raw);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-
-    obs_winch_flag = 0;
-    struct sigaction sa_winch = {0}, sa_old = {0};
-    sa_winch.sa_handler = obs_on_winch;
-    sigaction(SIGWINCH, &sa_winch, &sa_old);
-
     long esc_rem = -1;
+    int  relayout = 0, ret = 0;
 
     ObsHeader last_h;
     memset(&last_h, 0, sizeof(last_h));
@@ -620,42 +739,35 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
     int  last_status_len = 0;
 
     for (;;) {
-        /* Handle observer terminal resize */
-        if (obs_winch_flag) {
-            obs_winch_flag = 0;
-            struct winsize ws2 = {0};
-            ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws2);
-            our_rows  = ws2.ws_row > 0 ? ws2.ws_row : 24;
-            our_cols  = ws2.ws_col > 0 ? ws2.ws_col : 80;
+        /* The display changed size (or was exposed): lay the last frame
+         * out again. */
+#ifndef X11_BACKEND
+        if (obs_winch_flag) { obs_winch_flag = 0; relayout = 1; }
+#endif
+        if (relayout) {
+            relayout = 0;
+            obs_screen_size(&our_rows, &our_cols);
             view_rows = (ses_rows < our_rows - 1 ? ses_rows : our_rows - 1);
             view_cols = (ses_cols < our_cols      ? ses_cols : our_cols);
             scr.rows  = view_rows;
             scr.cols  = view_cols;
             render_free(&rs);
+#ifndef X11_BACKEND
             (void)write(STDOUT_FILENO, "\033[2J", 4);
+#endif
             render_init(&rs, our_rows, our_cols);
-            if (last_h.rows > 0) {
-                scr.cells       = local;
-                scr.cur_row     = last_h.cur_row < view_rows ? last_h.cur_row : view_rows - 1;
-                scr.cur_col     = last_h.cur_col < view_cols ? last_h.cur_col : view_cols - 1;
-                scr.cur_visible = last_h.cur_visible;
-                render_screen(&rs, &scr);
-                if (last_status_len > 0) {
-                    (void)write(STDOUT_FILENO, last_status_buf, (size_t)last_status_len);
-                    char mv[16];
-                    int mvn = snprintf(mv, sizeof(mv), "\033[%d;%dH",
-                                       scr.cur_row + 1, scr.cur_col + 1);
-                    (void)write(STDOUT_FILENO, mv, (size_t)mvn);
-                }
-            }
+            if (last_h.rows > 0)
+                obs_draw(&rs, &scr, local, &last_h, last_status_buf,
+                         last_status_len, our_rows, our_cols);
             continue;
         }
 
+        int infd = obs_input_fd();
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(sock,         &rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        int maxfd = sock > STDIN_FILENO ? sock : STDIN_FILENO;
+        FD_SET(sock, &rfds);
+        FD_SET(infd, &rfds);
+        int maxfd = sock > infd ? sock : infd;
 
         struct timeval tv, *tvp = NULL;
         if (esc_rem >= 0) {
@@ -669,7 +781,7 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
         }
 
         /* ESC timeout */
-        if (esc_rem >= 0 && !FD_ISSET(STDIN_FILENO, &rfds)) {
+        if (esc_rem >= 0 && !FD_ISSET(infd, &rfds)) {
             InputEvent ev = input_flush_esc();
             if (ev.cmd == CMD_PASS_BYTE) {
                 uint8_t pkt[3] = { 'K', 1, (uint8_t)ev.byte };
@@ -679,12 +791,12 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
         }
 
         /* Keyboard input: run through mux FSM, send typed packets upstream */
-        if (FD_ISSET(STDIN_FILENO, &rfds)) {
-            char keybuf[256];
-            ssize_t n = read(STDIN_FILENO, keybuf, sizeof(keybuf));
-            if (n <= 0) break;
-            for (ssize_t ki = 0; ki < n; ki++) {
-                InputEvent ev = input_feed((uint8_t)keybuf[ki]);
+        if (FD_ISSET(infd, &rfds)) {
+            uint8_t keybuf[256];
+            int n = obs_read_keys(keybuf, sizeof(keybuf), &relayout);
+            if (n < 0) break;
+            for (int ki = 0; ki < n; ki++) {
+                InputEvent ev = input_feed(keybuf[ki]);
                 if (!input_esc_pending()) esc_rem = -1;
                 else if (esc_rem < 0)     esc_rem = ESC_TIMEOUT_MS;
 
@@ -723,13 +835,9 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             if (read_all(sock, &last_h, sizeof(last_h)) < 0 || last_h.rows == 0) break;
             if (last_h.rows == -1) {
                 /* Takeover sentinel: main session is becoming a daemon.
-                 * Exit observe loop so caller can re-attach. */
-                sigaction(SIGWINCH, &sa_old, NULL);
-                tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
-                free(local); free(data);
-                render_free(&rs);
-                (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
-                return 1;
+                 * Leave the observe loop so the caller can re-attach. */
+                ret = 1;
+                goto done;
             }
             ObsHeader h = last_h;
 
@@ -742,7 +850,7 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
                 view_cols = (ses_cols < our_cols      ? ses_cols : our_cols);
                 local = calloc((size_t)ses_rows, sizeof(Cell *));
                 data  = calloc((size_t)ses_rows * ses_cols, sizeof(Cell));
-                if (!local || !data) goto done;
+                if (!local || !data) { free(local); free(data); local = NULL; data = NULL; goto done; }
                 for (int r = 0; r < ses_rows; r++)
                     local[r] = data + r * ses_cols;
                 scr.rows = view_rows;
@@ -764,30 +872,16 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             last_status_len = (int)slen;
             if (slen > 0) memcpy(last_status_buf, status_buf, slen);
 
-            scr.cells       = local;
-            scr.cur_row     = h.cur_row < view_rows ? h.cur_row : view_rows - 1;
-            scr.cur_col     = h.cur_col < view_cols ? h.cur_col : view_cols - 1;
-            scr.cur_visible = h.cur_visible;
-            render_screen(&rs, &scr);
-
-            if (slen > 0) {
-                (void)write(STDOUT_FILENO, status_buf, slen);
-                char mv[16];
-                int mvn = snprintf(mv, sizeof(mv), "\033[%d;%dH",
-                                   scr.cur_row + 1, scr.cur_col + 1);
-                (void)write(STDOUT_FILENO, mv, (size_t)mvn);
-            }
+            obs_draw(&rs, &scr, local, &h, status_buf, slen, our_rows, our_cols);
         }
     }
 
 done:
-    sigaction(SIGWINCH, &sa_old, NULL);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+    obs_term_leave(&term);
     free(local);
     free(data);
     render_free(&rs);
-    (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
-    return 0;
+    return ret;
 }
 
 
@@ -854,7 +948,9 @@ int session_do_takeover(int conn, int session_sock,
 
 int session_become_observer(int conn, int rows, int cols)
 {
+#ifndef X11_BACKEND
     (void)write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
+#endif
     int ret = session_observe_fd(conn, rows, cols);
     close(conn);
     return ret;   /* 1 = takeover sentinel received */

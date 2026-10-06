@@ -24,6 +24,8 @@ int x11_backend_wait(int timeout_ms) { return xterm_wait(timeout_ms); }
 int x11_backend_fd(void) { return xterm_fd(); }
 int x11_backend_read_input(uint8_t *buf, int cap) { return xterm_read_key(buf, cap); }
 int x11_backend_close_requested(void) { return xterm_close_requested(); }
+int x11_backend_lost(void) { return xterm_lost(); }
+void x11_backend_shutdown(void) { xterm_disconnect(); }
 
 /* Resolve a Cell's colour down to two xterm-256-palette index bytes,
  * plus a small structural-attr bitmask (drawn as extra pixels, not a
@@ -130,6 +132,16 @@ void x11_backend_render(const Screen *s)
             fb[i] = (uint8_t)glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
         }
     }
+    /* A frame shorter than the window (an observed session smaller than
+     * our window) must not leave older rows below it.  The last row is
+     * the status bar's, drawn separately and far less often, so it is
+     * left alone: for our own screens h is already rows - 1 and this
+     * loop does nothing. */
+    for (int r = h; r < rows - 1; r++)
+        for (int c = 0; c < cols; c++) {
+            int i = r * cols + c;
+            fb[i] = (uint8_t)glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+        }
     /* This is called on every content update (unlike the status bar,
      * which is deliberately redrawn far less often — see main.c), so
      * it's the right place to keep the cursor current: set it from the

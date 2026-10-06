@@ -7,6 +7,8 @@
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
 #define POLLIN      1
+#define POLLERR     8
+#define POLLHUP     16
 
 typedef uint32_t in_addr_t;
 typedef uint32_t socklen_t;

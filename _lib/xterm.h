@@ -49,6 +49,14 @@ int xterm_wait(int timeout_ms);
  * xterm_wait() on a fixed schedule). */
 int xterm_fd(void);
 
+/* Nonzero once the connection to the server has been lost (see xterm.c);
+ * the window is gone and every further call is a harmless no-op. */
+int xterm_lost(void);
+
+/* Close the connection (the server destroys the window).  Call before
+ * fork()ing a process that must not keep the window alive. */
+void xterm_disconnect(void);
+
 /* Drain up to `cap` bytes of keyboard input translated from KeyPress events
  * (plain ASCII for printable keys, Ctrl-letter control codes, and a handful
  * of ANSI escape sequences for arrows/backspace/etc) into `buf`. Events are
