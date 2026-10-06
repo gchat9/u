@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Usage: ./bench.py MODE [DEPTH] [BIN...]   (default BIN: ./xt_bench; N=runs via env, default 5)
+# Usage: ./bench.py MODE [DEPTH] [BIN...]   (default BIN: ./xt_bench; N=runs via env, default 9)
 # Prints the minimum CPU and wall time over N runs, under a private Xvfb.
 import os, subprocess, sys, time, resource
 mode = sys.argv[1]; depth = sys.argv[2] if len(sys.argv) > 2 else "24"
-bins = sys.argv[3:] or ["./xt_bench"]; n = int(os.environ.get("N", "5"))
+bins = sys.argv[3:] or ["./xt_bench"]; n = int(os.environ.get("N", "9"))
 xv = subprocess.Popen(["Xvfb", ":2", "-screen", "0", "800x600x" + depth, "-nolisten", "tcp"],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1); os.environ["DISPLAY"] = ":2"

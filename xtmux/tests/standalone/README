@@ -1,0 +1,9 @@
+Standalone checks for individual xtmux/tmux behaviours; each takes the binary to test as its first argument
+(scrollback-plain.py: the plain tmux).  They run against a private Xvfb, so need Xvfb and xdotool; see the
+header of each script for the rest.  They print what they observe; compare with the comment in the header.
+
+  resize.sh XTMUX        window resizes drive grid/VT/PTY sizes (also needs openbox, ImageMagick)
+  bold.sh XTMUX [DEPTH]  bold default-coloured text is #ffffff
+  scrollback.sh XTMUX    Ctrl+B PgUp viewer: enter, scroll, Esc restores the screen exactly
+  scrollback-plain.py TMUX   same for plain tmux, in a pty + terminal emulator (python3-pyte)
+  sigwinch.sh XTMUX      SIGWINCH while blocked writing to the X server must not kill it

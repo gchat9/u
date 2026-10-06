@@ -809,8 +809,8 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
                 case CMD_PASS_TWO:
                     pkt[0] = 'K'; pkt[1] = 2;
                     if (write_all(sock, pkt, 2) < 0) goto done;
-                    pkt[0] = (uint8_t)(ev.byte >> 8);
-                    pkt[1] = (uint8_t)ev.byte;
+                    pkt[0] = ev.byte;       /* ESC, ... */
+                    pkt[1] = ev.byte2;      /* ... and the byte after it */
                     if (write_all(sock, pkt, 2) < 0) goto done;
                     break;
                 case CMD_SELECT_WINDOW:

@@ -1,0 +1,21 @@
+Multi-client (shared session) tests for tmux / xtmux.  Needs: Xvfb, openbox, wmctrl, xdotool, xwd +
+ImageMagick (convert), python3 with pillow and pyte.  Run as root, or with a writable /run/utmux.
+Build tmux/ and xtmux/ first (defaults: tmux/tmux and xtmux/xtmux in the repo; or set TMUX_BIN, XTMUX_BIN).
+
+  python3 xtmux/tests/multiclient/mc_all.py [group ...]       (default: all groups)
+
+Groups:
+  keys             special keys (arrows...) typed in an observer arrive intact, xtmux and plain
+  shrink           attaching from a smaller screen keeps short output visible; full screens crop the top
+  pp               plain<->plain regression (attach takeover, mirroring, promotion, 3rd client)
+  px               plain main, xtmux attaches (and xtmux detaching)
+  xx               xtmux main, xtmux attaches: input and mirroring both ways
+  detach_pair      main xtmux detaches -> observer promoted
+  detach_lone      lone xtmux detaches -> daemon, window gone, re-attach works
+  close            window-manager close: lone, and with a plain observer
+  xloss            X server killed: lone, and with a plain observer
+  obs_close        closing the observer's window ends only that client
+  plainobs_detach  plain observer detaches; xtmux main unaffected
+  race             8x detach -> attach (the attach-to-daemon race)
+Each check prints PASS/FAIL; a summary follows.  mc_lib.py holds the helpers: plain tmux in a pty with a
+pyte terminal emulator, and xtmux launched with its stdio on a pty, like from a terminal.

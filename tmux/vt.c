@@ -1143,6 +1143,19 @@ static Cell **resize_grid(Cell **old_grid, int old_rows, int old_cols,
     return new_grid;
 }
 
+/* True if the row shows nothing: spaces (or NUL) on the default
+ * background, with no attribute that would draw on a blank (underline,
+ * strike, reverse video). */
+static bool row_is_blank(const Cell *row, int cols)
+{
+    for (int c = 0; c < cols; c++)
+        if ((row[c].ch != 0 && row[c].ch != ' ') ||
+            !(row[c].flags & CELL_BG_DFL) ||
+            (row[c].attrs & (ATTR_UNDERLINE | ATTR_STRIKE | ATTR_REVERSE)))
+            return false;
+    return true;
+}
+
 /*
  * Resize the Screen's cell grids and fix up all cursor/region state.
  * Called with the new terminal dimensions (not including the status row;
@@ -1268,17 +1281,28 @@ static void scr_resize(Screen *s, int new_rows, int new_cols)
 #if SCROLLBACK_ENABLED
     /*
      * When shrinking vertically on the primary screen with a full scroll
-     * region, push the top `reduce` rows into scrollback before discarding
-     * them.  This keeps the bottom of the screen visually anchored and
-     * mirrors what xterm/tmux do.
+     * region, rows have to go.  Empty ones below the cursor go first,
+     * from the bottom: a short session (a prompt and the output of a
+     * command or two) must not lose the top of its text just because the
+     * screen got a few rows shorter, as that looks like a fresh session.
+     * Only what is still left over -- the cursor would otherwise fall off
+     * the bottom -- is pushed off the top into scrollback.  The bottom of
+     * a full screen thus stays visually anchored, as in xterm/tmux.
      */
     int reduce = old_rows - new_rows;
     if (reduce > 0 && !s->in_alt_screen
             && s->scroll_top == 0 && s->scroll_bottom == old_rows - 1
             && s->scrollback) {
 
-        /* Capture rows 0..reduce-1 into scrollback (oldest first) */
-        for (int r = 0; r < reduce; r++)
+        int blank_below = 0;
+        for (int r = old_rows - 1; r > s->cur_row && blank_below < reduce; r--) {
+            if (!row_is_blank(s->cells[r], old_cols)) break;
+            blank_below++;
+        }
+        int top = reduce - blank_below;     /* rows to evict from the top */
+
+        /* Capture rows 0..top-1 into scrollback (oldest first) */
+        for (int r = 0; r < top; r++)
             scrollback_capture(s, &s->cells[r],
                                s->row_flags ? s->row_flags[r] : 0);
 
@@ -1286,12 +1310,12 @@ static void scr_resize(Screen *s, int new_rows, int new_cols)
         Cell **ng = alloc_cells(new_rows, new_cols);
         int copy_cols = old_cols < new_cols ? old_cols : new_cols;
         for (int r = 0; r < new_rows; r++)
-            memcpy(ng[r], s->cells[reduce + r],
+            memcpy(ng[r], s->cells[top + r],
                    (size_t)copy_cols * sizeof(Cell));
 
-        /* Adjust cursor upward by reduce rows */
-        s->cur_row  -= reduce;
-        s->saved_row -= reduce;
+        /* Adjust cursor upward by the rows evicted from the top */
+        s->cur_row  -= top;
+        s->saved_row -= top;
         if (s->cur_row  < 0) { s->cur_row  = 0; s->pending_wrap = false; }
         if (s->saved_row < 0)  s->saved_row  = 0;
 
@@ -1299,9 +1323,9 @@ static void scr_resize(Screen *s, int new_rows, int new_cols)
         free_cells(s->cells, old_rows);
         s->cells = ng;
 
-        /* row_flags: discard top `reduce` rows, realloc to new size */
+        /* row_flags: discard top `top` rows, realloc to new size */
         if (s->row_flags) {
-            memmove(s->row_flags, s->row_flags + reduce,
+            memmove(s->row_flags, s->row_flags + top,
                     (size_t)new_rows);
             s->row_flags = realloc(s->row_flags, (size_t)new_rows);
         }
