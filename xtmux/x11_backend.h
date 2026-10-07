@@ -37,3 +37,10 @@ void x11_backend_text_line(const char *utf8, int n, Style st);
 void x11_backend_text_fill(int row, Style st);
 void x11_backend_text_at(int row, int col, const char *utf8, int n, Style st);
 void x11_backend_text_end(void);
+
+/* Mouse.  _select says how much pointer traffic the displayed program wants
+ * (its Screen's mouse_mode: 0 none .. 3 all motion); _next returns the
+ * escape sequence for the next pointer event in the encoding it asked for
+ * (mouse_enc), see x11_backend.c.  -1: no more events. */
+void x11_backend_mouse_select(int level);
+int  x11_backend_mouse_next(int mode, int enc, int rows, int cols, uint8_t *out);

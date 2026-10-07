@@ -1,0 +1,18 @@
+Mouse reporting tests for xtmux.  Needs Xvfb, xdotool, xwd + ImageMagick, python3 with pillow and pyte; run as
+root (or with a writable /run/utmux).  Build tmux/ and xtmux/ first (or set TMUX_BIN / XTMUX_BIN).
+
+  python3 xtmux/tests/mouse/mouse_all.py [group ...]       (default: all groups)
+
+mouse_log.py runs inside the xtmux window: it enables the DEC private modes given on its command line, puts the
+tty in raw mode and appends every byte it receives to /tmp/mouse.log; the tests move/click the X pointer with
+xdotool and compare those bytes exactly.  Typing d / e into it switches the modes off / on again, q quits.
+
+Groups:  enc       the classic, ?1005 UTF-8, ?1006 SGR and ?1015 urxvt encodings; buttons, wheel
+         drag      ?1000 vs ?1002 vs ?1003: when motion is reported
+         mods      shift / alt / ctrl bits
+         toggle    ?1000l stops events, ?1000h resumes
+         edges     status row, clamping, classic range limit (needs a wide screen), scrollback viewer
+         windows   the mode is per window
+         handoff   a request survives detach + re-attach with a new xtmux
+         observer  an xtmux window that is only an observer forwards to the main
+Also runnable by hand: python3 /path/to/xterm-mouse-reporter.py inside xtmux.

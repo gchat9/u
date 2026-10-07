@@ -530,6 +530,7 @@ int session_observer_push(int obs_fd, const Screen *s,
     h.cur_col     = (int16_t)s->cur_col;
     h.cur_visible = s->cur_visible ? 1 : 0;
     h.cur_win     = (uint8_t)cur_win;
+    h.mouse       = (uint8_t)(s->mouse_mode | s->mouse_enc << 2);
     for (int i = 0; i < MAX_WINDOWS; i++) {
         exists[i] = wins[i] != NULL;
         alive[i]  = wins[i] && wins[i]->alive;
@@ -830,6 +831,22 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             }
         }
 
+#ifdef X11_BACKEND
+        /* Pointer events, as the report the main's displayed program asked
+         * for (the frame header says which); they go up like keys. */
+        {
+            uint8_t mb[40];
+            int mn;
+            while ((mn = x11_backend_mouse_next(last_h.mouse & 3, last_h.mouse >> 2,
+                                                view_rows, view_cols, mb)) >= 0)
+                if (mn > 0) {
+                    uint8_t hdr[2] = { 'K', (uint8_t)mn };
+                    if (write_all(sock, hdr, 2) < 0 || write_all(sock, mb, (size_t)mn) < 0)
+                        goto done;
+                }
+        }
+#endif
+
         /* Incoming frame */
         if (FD_ISSET(sock, &rfds)) {
             if (read_all(sock, &last_h, sizeof(last_h)) < 0 || last_h.rows == 0) break;
@@ -873,6 +890,9 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             if (slen > 0) memcpy(last_status_buf, status_buf, slen);
 
             obs_draw(&rs, &scr, local, &h, status_buf, slen, our_rows, our_cols);
+#ifdef X11_BACKEND
+            x11_backend_mouse_select(h.mouse & 3);
+#endif
         }
     }
 

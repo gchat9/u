@@ -11,13 +11,25 @@
 #include <stdint.h>  /* uint8_t, for Style below */
 
 /* ================================================================== */
+/* Mouse (xtmux)                                                        */
+/* ================================================================== */
+
+/* xtmux reports the mouse to programs that ask for it (?1000, ?1002,
+ * ?1003) using the classic xterm encoding or, if they ask for it
+ * (?1006), the SGR one.  Define this to also support the UTF-8 (?1005)
+ * and urxvt (?1015) encodings.  Few programs use them, and they cost
+ * code; without it a program asking for one of them simply keeps the
+ * encoding it had, as on any terminal that lacks it. */
+/* #define MOUSE_UTF8_URXVT_ENCODINGS */
+
+/* ================================================================== */
 /* Session                                                              */
 /* ================================================================== */
 
 /* Unix socket path for detach/attach.  A daemon listens here after
  * PREFIX+d; "mux attach" connects to it. */
 #ifndef MUX_SOCKET_PATH
-#define MUX_SOCKET_PATH "/run/utmux"
+#define MUX_SOCKET_PATH "/run/utmux-root"
 #endif
 
 /* ================================================================== */
@@ -159,7 +171,7 @@ typedef struct { uint8_t fg, bg; } Style;
  * a newline appended.  When the buffer is full the oldest line is dropped.
  */
 #ifndef SCROLLBACK_BYTES
-#define SCROLLBACK_BYTES    8192
+#define SCROLLBACK_BYTES    32768
 #endif
 
 /* ================================================================== */

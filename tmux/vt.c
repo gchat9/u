@@ -890,6 +890,16 @@ static void dispatch_csi(VTParser *p, char final)
                         s->scroll_top = 0; s->scroll_bottom = s->rows - 1;
                     }
                     break;
+                case 1000: s->mouse_mode = 1; break;
+                case 1002: s->mouse_mode = 2; break;
+                case 1003: s->mouse_mode = 3; break;
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+                case 1005: s->mouse_enc  = 1; break;
+#endif
+                case 1006: s->mouse_enc  = 2; break;
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+                case 1015: s->mouse_enc  = 3; break;
+#endif
                 case 2004: s->bracketed_paste = true; break;
                 default:   break;
                 }
@@ -937,6 +947,17 @@ static void dispatch_csi(VTParser *p, char final)
                         s->cur_attrs = s->alt_saved_attrs;
                     }
                     break;
+                /* As in xterm, resetting any tracking mode turns tracking
+                 * off; an encoding goes back to the default only if it is
+                 * the one in use. */
+                case 1000: case 1002: case 1003: s->mouse_mode = 0; break;
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+                case 1005: if (s->mouse_enc == 1) s->mouse_enc = 0; break;
+#endif
+                case 1006: if (s->mouse_enc == 2) s->mouse_enc = 0; break;
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+                case 1015: if (s->mouse_enc == 3) s->mouse_enc = 0; break;
+#endif
                 case 2004: s->bracketed_paste = false; break;
                 default:   break;
                 }
@@ -1450,6 +1471,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  cur_visible, pending_wrap;
     uint8_t  origin_mode, auto_wrap, app_cursor, bracketed_paste;
     uint8_t  insert_mode, in_alt_screen;
+    uint8_t  mouse_mode, mouse_enc;
     int32_t  scroll_top, scroll_bottom;
     uint16_t cur_fg, cur_bg;
     uint8_t  cur_attrs;
@@ -1498,6 +1520,8 @@ int vt_serialize(const VTParser *p, int fd)
     sw.auto_wrap      = s->auto_wrap      ? 1 : 0;
     sw.app_cursor     = s->app_cursor     ? 1 : 0;
     sw.bracketed_paste = s->bracketed_paste ? 1 : 0;
+    sw.mouse_mode     = s->mouse_mode;
+    sw.mouse_enc      = s->mouse_enc;
     sw.insert_mode    = s->insert_mode    ? 1 : 0;
     sw.in_alt_screen  = s->in_alt_screen  ? 1 : 0;
     sw.scroll_top     = (int32_t)s->scroll_top;
@@ -1580,6 +1604,8 @@ int vt_deserialize(VTParser *p, int fd)
     s->auto_wrap     = sw.auto_wrap;
     s->app_cursor    = sw.app_cursor;
     s->bracketed_paste = sw.bracketed_paste;
+    s->mouse_mode    = sw.mouse_mode;
+    s->mouse_enc     = sw.mouse_enc;
     s->insert_mode   = sw.insert_mode;
     s->in_alt_screen = sw.in_alt_screen;
     s->scroll_top    = (int)sw.scroll_top;

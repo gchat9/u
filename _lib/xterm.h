@@ -49,6 +49,23 @@ int xterm_wait(int timeout_ms);
  * xterm_wait() on a fixed schedule). */
 int xterm_fd(void);
 
+/* Pointer events.  xterm_mouse_select() says which the application wants
+ * (0 none, 1 buttons, 2 buttons and motion while one is held, 3 all
+ * motion); only those are requested from the server.  xterm_read_mouse()
+ * returns the queued events one at a time (nonzero if it filled *m).
+ * Positions are grid cells, clamped to the grid.  Motion is reported only
+ * when the pointer enters another cell. */
+typedef struct {
+    uint8_t  kind;     /* 0 press, 1 release, 2 motion                     */
+    uint8_t  button;   /* 1 left, 2 middle, 3 right, 4-7 wheel up/down/
+                          left/right; for motion, the button held (0 none) */
+    uint8_t  mods;     /* xterm's bits: 4 shift, 8 alt, 16 control         */
+    uint16_t col, row;
+} XtermMouse;
+
+void xterm_mouse_select(int level);
+int  xterm_read_mouse(XtermMouse *m);
+
 /* Nonzero once the connection to the server has been lost (see xterm.c);
  * the window is gone and every further call is a harmless no-op. */
 int xterm_lost(void);

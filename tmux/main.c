@@ -754,6 +754,21 @@ static void write_to_active(const uint8_t *buf, size_t n)
     }
 }
 
+#ifdef X11_BACKEND
+/* How much pointer traffic the displayed program wants: what it asked for
+ * with ?1000/?1002/?1003, but nothing while the scrollback viewer is up or
+ * the window's program has gone. */
+static int mouse_level_wanted(void)
+{
+    Window *w = g_wins[g_cur];
+    if (!w || !w->alive) return 0;
+#if SCROLLBACK_ENABLED
+    if (g_scrollback_mode) return 0;
+#endif
+    return w->vt.scr.mouse_mode;
+}
+#endif
+
 static void handle_event(InputEvent ev)
 {
     switch (ev.cmd) {
@@ -1044,6 +1059,11 @@ int main(int argc, char *argv[])
          * daemon for a later `attach`.  (Quitting is Ctrl+B q.) */
         if (x11_backend_close_requested() || x11_backend_lost())
             auto_detach();   /* never returns */
+
+        /* Pointer events are only requested from the X server while the
+         * displayed program wants them (it can change on any PTY output
+         * or window switch; the call is free when nothing changed). */
+        x11_backend_mouse_select(mouse_level_wanted());
 #endif
 
         /* Downgrade to observer after a takeover handshake */
@@ -1293,6 +1313,18 @@ int main(int argc, char *argv[])
                 InputEvent ev = input_feed(kbuf[i]);
                 if (!input_esc_pending()) esc_remaining_ms = -1;
                 handle_event(ev);
+            }
+
+            /* Pointer events go to the displayed program as the report
+             * it asked for (the status row is not its area). */
+            {
+                Window *mw = g_wins[g_cur];
+                int mmode = mouse_level_wanted();
+                uint8_t menc = mw ? mw->vt.scr.mouse_enc : 0, mb[40];
+                int mn;
+                while ((mn = x11_backend_mouse_next(mmode, menc, child_rows(),
+                                                    g_cols, mb)) >= 0)
+                    if (mn > 0) write_to_active(mb, (size_t)mn);
             }
         }
 #endif

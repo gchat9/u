@@ -38,6 +38,7 @@ typedef struct __attribute__((packed)) {
     int16_t  cur_row, cur_col;
     uint8_t  cur_visible;
     uint8_t  cur_win;
+    uint8_t  mouse;          /* mouse_mode | mouse_enc << 2 of the shown window */
     uint16_t win_exists_mask;
     uint16_t win_alive_mask;
     int32_t  win_pids[10];

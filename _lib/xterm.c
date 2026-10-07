@@ -28,6 +28,9 @@ extern char *getenv(const char *name);
 
 #define AF_UNIX 1
 
+/* Events always selected on our window (more are added for the pointer). */
+#define EMASK_BASE ((1u<<17)|(1u<<15)|(1u<<0)|(1u<<4)) /* StructureNotify|Exposure|KeyPress|EnterWindow */
+
 struct sockaddr_un {
     uint16_t sun_family;
     char sun_path[108];
@@ -55,8 +58,8 @@ static uint32_t palette[256];
 static void build_palette(void)
 {
     static const uint32_t base16[16] = {
-        0x000000,0x800000,0x008000,0x808000,0x000080,0x800080,0x008080,0xc0c0c0,
-        0x808080,0xff0000,0x00ff00,0xffff00,0x0000ff,0xff00ff,0x00ffff,0xffffff,
+        0x1a1a1a, 0xcd0000, 0x00cd00, 0xcdcd00, 0x3465a4, 0xcd00cd, 0x6fabad, 0xcccccc,
+        0x666666, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
     };
     for (int i = 0; i < 16; i++) palette[i] = base16[i];
     static const uint8_t lvl[6] = {0,95,135,175,215,255};
@@ -877,7 +880,7 @@ int xterm_init(void)
     uint16_t w=(uint16_t)WIN_W, h=(uint16_t)WIN_H, bw=0, cls=1;
     cfg_w = WIN_W; cfg_h = WIN_H;
     uint32_t vis=0, vmask=(1u<<1)|(1u<<11), bg=black_px;
-    uint32_t emask=(1u<<17)|(1u<<15)|(1u<<0)|(1u<<4); /* StructureNotify|Exposure|KeyPress|EnterWindow */
+    uint32_t emask=EMASK_BASE;
     r[0]=1;
     memcpy(r+2,&len,2); memcpy(r+4,&xterm_win,4); memcpy(r+8,&root_win,4);
     memcpy(r+12,&x,2); memcpy(r+14,&y,2); memcpy(r+16,&w,2); memcpy(r+18,&h,2);
@@ -951,6 +954,76 @@ void xterm_set_cursor(int row, int col)
 
 static uint8_t redraw_pending;
 
+/* ── Pointer ───────────────────────────────────────────────────────────
+ * Pointer events are only asked of the server while the application wants
+ * them (xterm_mouse_select), so a window that nobody is reporting the
+ * mouse for gets none.  They are turned into cell coordinates and queued
+ * for xterm_read_mouse, like keys. */
+#define MOUSE_QUEUE_CAP 32
+static XtermMouse mouse_queue[MOUSE_QUEUE_CAP];
+static uint8_t    mouse_head, mouse_tail, mouse_level;
+static int        mouse_last_col = -1, mouse_last_row = -1;
+
+void xterm_mouse_select(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    if (level == mouse_level) return;
+    mouse_level = (uint8_t)level;
+    /* ButtonPress|ButtonRelease; ButtonMotion (1<<13: motion while a
+     * button is held) or PointerMotion (1<<6: all motion). */
+    uint32_t em = EMASK_BASE;
+    if (level)      em |= (1u<<2) | (1u<<3);
+    if (level == 2) em |= 1u<<13;
+    if (level == 3) em |= 1u<<6;
+    /* ChangeWindowAttributes (opcode 2), value-mask CWEventMask. */
+    uint8_t r[16] = {0}; uint16_t len = 4; uint32_t vm = 0x800;
+    r[0] = 2;
+    memcpy(r+2, &len, 2); memcpy(r+4, &xterm_win, 4);
+    memcpy(r+8, &vm, 4);  memcpy(r+12, &em, 4);
+    xwrite(r, 16);
+    mouse_head = mouse_tail;          /* whatever was queued is stale now */
+    mouse_last_col = mouse_last_row = -1;
+}
+
+/* ButtonPress (4), ButtonRelease (5) or MotionNotify (6): event-x/y at
+ * offsets 24/26, modifier and button state at 28. */
+static void mouse_event(int etype, const uint8_t *ev)
+{
+    if (!mouse_level) return;           /* in flight when it was turned off */
+    int16_t x, y; uint16_t st;
+    memcpy(&x, ev + 24, 2); memcpy(&y, ev + 26, 2); memcpy(&st, ev + 28, 2);
+    /* While a button is held the pointer is grabbed, so it can be outside
+     * the window (or its partial last cell): clamp to the grid. */
+    int col = x < 0 ? 0 : x / cell_w, row = y < 0 ? 0 : y / cell_h;
+    if (col >= cols) col = cols - 1;
+    if (row >= rows) row = rows - 1;
+    XtermMouse m;
+    m.kind = (uint8_t)(etype - 4);
+    m.col  = (uint16_t)col; m.row = (uint16_t)row;
+    m.mods = (uint8_t)((st & 1 ? 4 : 0) | (st & 8 ? 8 : 0) | (st & 4 ? 16 : 0));
+    if (etype == 6) {
+        /* Report motion only when it enters another cell. */
+        if (col == mouse_last_col && row == mouse_last_row) return;
+        m.button = (uint8_t)((st & 0x100) ? 1 : (st & 0x200) ? 2 : (st & 0x400) ? 3 : 0);
+    } else {
+        m.button = ev[1];
+    }
+    mouse_last_col = col; mouse_last_row = row;
+    uint8_t next = (uint8_t)((mouse_tail + 1) % MOUSE_QUEUE_CAP);
+    if (next == mouse_head) return;     /* full: drop */
+    mouse_queue[mouse_tail] = m;
+    mouse_tail = next;
+}
+
+int xterm_read_mouse(XtermMouse *m)
+{
+    if (mouse_head == mouse_tail) return 0;
+    *m = mouse_queue[mouse_head];
+    mouse_head = (uint8_t)((mouse_head + 1) % MOUSE_QUEUE_CAP);
+    return 1;
+}
+
 /* One 32-byte server event.  Key presses are queued; everything else only
  * records state for xterm_wait() to act on. */
 static void handle_event(const uint8_t *ev)
@@ -968,6 +1041,8 @@ static void handle_event(const uint8_t *ev)
         uint16_t w, h;
         memcpy(&w, ev + 20, 2); memcpy(&h, ev + 22, 2);
         cfg_w = w; cfg_h = h;
+    } else if (etype >= 4 && etype <= 6) {
+        mouse_event(etype, ev);
     } else if (etype == 2) {
         handle_keypress(ev);
     } else if (etype == 7) {

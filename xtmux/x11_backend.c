@@ -312,3 +312,86 @@ void x11_backend_text_end(void)
     xterm_set_cursor(-1, -1);
     xterm_render();
 }
+
+/* ── Mouse reports ────────────────────────────────────────────────────── */
+
+void x11_backend_mouse_select(int level) { xterm_mouse_select(level); }
+
+static int put_dec(uint8_t *o, unsigned v)
+{
+    uint8_t t[5]; int n = 0, k = 0;
+    do { t[n++] = (uint8_t)('0' + v % 10); v /= 10; } while (v);
+    while (n) o[k++] = t[--n];
+    return k;
+}
+
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+static int put_utf8(uint8_t *o, unsigned v)     /* v < 0x800 */
+{
+    if (v < 0x80) { o[0] = (uint8_t)v; return 1; }
+    o[0] = (uint8_t)(0xC0 | v >> 6); o[1] = (uint8_t)(0x80 | (v & 0x3F));
+    return 2;
+}
+#endif
+
+/* Take the next pointer event and turn it into the bytes to send to the
+ * program, as it asked for with ?1000/?1002/?1003 (mode 1/2/3) and
+ * ?1006 (enc 2 SGR; 0 the classic form), and with
+ * MOUSE_UTF8_URXVT_ENCODINGS ?1005/?1015 (enc 1 UTF-8, 3 urxvt).
+ * Only events inside the rows x cols area the program sees count.
+ * Returns -1 when no event is left, else the number of bytes put in
+ * `out` (at least 40 of them): 0 for an event that is not reported --
+ * wrong mode, outside the area, or not representable (the classic form
+ * stops at column/row 223). */
+int x11_backend_mouse_next(int mode, int enc, int rows, int cols, uint8_t *out)
+{
+    XtermMouse m;
+    if (!xterm_read_mouse(&m)) return -1;
+    if (!mode || m.row >= rows || m.col >= cols) return 0;
+
+    int btn = m.button, cb, release = 0;
+    if (m.kind == 2) {                      /* motion */
+        if (mode < 2 || (mode == 2 && !btn)) return 0;
+        cb = 32 + (btn ? btn - 1 : 3);      /* 3: no button held */
+    } else if (btn >= 4 && btn <= 7) {      /* wheel: a press, never a release */
+        if (m.kind) return 0;
+        cb = 64 + btn - 4;
+    } else if (btn >= 1 && btn <= 3) {
+        cb = btn - 1; release = m.kind;
+    } else {
+        return 0;                           /* extra buttons: not reported */
+    }
+    cb |= m.mods;
+    unsigned x = m.col + 1u, y = m.row + 1u;
+
+    uint8_t *o = out;
+    *o++ = 033; *o++ = '[';
+    if (enc == 2) {                         /* SGR: the button survives release */
+        *o++ = '<'; o += put_dec(o, (unsigned)cb); *o++ = ';';
+        o += put_dec(o, x); *o++ = ';'; o += put_dec(o, y);
+        *o++ = release ? 'm' : 'M';
+        return (int)(o - out);
+    }
+    if (release) cb = 3 | m.mods;           /* the others: "a button went up" */
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+    if (enc == 3) {                         /* urxvt: decimal, button + 32 */
+        o += put_dec(o, (unsigned)cb + 32); *o++ = ';';
+        o += put_dec(o, x); *o++ = ';'; o += put_dec(o, y);
+        *o++ = 'M';
+        return (int)(o - out);
+    }
+#endif
+    *o++ = 'M';
+#ifdef MOUSE_UTF8_URXVT_ENCODINGS
+    if (enc == 1) {                         /* UTF-8 coordinates, up to 2015 */
+        if (x + 32 >= 0x800 || y + 32 >= 0x800) return 0;
+        o += put_utf8(o, (unsigned)cb + 32);
+        o += put_utf8(o, x + 32); o += put_utf8(o, y + 32);
+    } else
+#endif
+    {                                       /* classic: one byte each */
+        if (x > 223 || y > 223) return 0;
+        *o++ = (uint8_t)(cb + 32); *o++ = (uint8_t)(x + 32); *o++ = (uint8_t)(y + 32);
+    }
+    return (int)(o - out);
+}
