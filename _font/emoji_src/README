@@ -1,6 +1,8 @@
-Emoji artwork in this directory is from Twemoji (https://github.com/jdecked/twemoji,
-assets/72x72/<codepoint>.png), copyright Twitter, Inc and other contributors,
+Emoji artwork in this directory is from Twemoji
+copyright Twitter, Inc and other contributors,
 licensed under CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
+
+https://raw.githubusercontent.com/jdecked/twemoji/refs/heads/main/assets/72x72/<codepoint>.png
 
 These PNGs are build inputs only: mkemoji.c downsamples and palette-quantizes
 them into emoji.bfnt, which is a modified (derived) form of that artwork.

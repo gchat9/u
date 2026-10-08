@@ -66,6 +66,21 @@ typedef struct {
 void xterm_mouse_select(int level);
 int  xterm_read_mouse(XtermMouse *m);
 
+/* Clipboard.  xterm_selection_set() makes us the owner of PRIMARY and
+ * CLIPBOARD, serving this UTF-8 text to whoever asks; the text must stay
+ * valid until the next call (NULL gives the selections up).  The owner is
+ * the window, so the text is gone when the connection is.
+ * xterm_paste_request() asks the PRIMARY owner for its text: during a later
+ * xterm_wait(), cb(data, n, ctx) is called with it, piece by piece, and
+ * finally once with data == NULL (also when there is nothing to paste). */
+void xterm_selection_set(const char *text, size_t len);
+
+/* Nonzero (once) after a paste shortcut -- Shift+Insert or Ctrl+V -- was
+ * pressed.  The key is not delivered by xterm_read_key; the application
+ * should paste, with xterm_paste_request, as for any other paste gesture. */
+int xterm_paste_key(void);
+void xterm_paste_request(void (*cb)(const uint8_t *data, size_t n, void *ctx), void *ctx);
+
 /* Nonzero once the connection to the server has been lost (see xterm.c);
  * the window is gone and every further call is a harmless no-op. */
 int xterm_lost(void);

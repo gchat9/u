@@ -1,7 +1,7 @@
 import sys, os, time, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "multiclient"))   # mc_lib: PlainTmux, start_xvfb, start_xtmux, xdo, shot
-from mc_lib import *
+# mc_lib.py (alongside): PlainTmux, start_xvfb, start_xtmux, xdo, shot
+from mc_lib import *   # noqa: sibling module
 CW, CH, OX, OY = 13, 26, 3, 1      # cell size; window origin (no WM): window at +3,+1
 def cell_xy(c, r): return (OX + c*CW + CW//2, OY + r*CH + CH//2)
 def move(c, r): x, y = cell_xy(c, r); xdo("mousemove", str(x), str(y)); time.sleep(0.08)
@@ -19,7 +19,7 @@ def start_logger(xt_modes, modes):
         if os.path.exists("/tmp/mouse.ready"): break
         time.sleep(0.1)
     time.sleep(0.5); clear()
-def stop_logger(): xdo("type", "q"); time.sleep(0.4)
+def stop_logger(): xdo("key", "ctrl+q"); time.sleep(0.4)
 
 # ---- check()/reset() shared by the tests
 

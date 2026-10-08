@@ -1,18 +1,34 @@
-Mouse reporting tests for xtmux.  Needs Xvfb, xdotool, xwd + ImageMagick, python3 with pillow and pyte; run as
-root (or with a writable /run/utmux).  Build tmux/ and xtmux/ first (or set TMUX_BIN / XTMUX_BIN).
+Mouse tests for xtmux: reporting the mouse to programs (mouse_all.py) and copy/paste with it (clip_all.py).
+Both need Xvfb, xdotool, xwd + ImageMagick (convert), xclip, python3 with pillow and pyte; run as root (or with a
+writable /run/utmux).  This directory is self-contained (mc_lib.py holds the shared helpers).  Build tmux/ and xtmux/ first (or set TMUX_BIN / XTMUX_BIN).  Each suite takes group names;
+with none it runs them all (several minutes -- run groups separately if your environment limits command time).
 
-  python3 xtmux/tests/mouse/mouse_all.py [group ...]       (default: all groups)
+  python3 xtmux/tests/mouse/mouse_all.py [group ...]
+  python3 xtmux/tests/mouse/clip_all.py  [group ...]
 
-mouse_log.py runs inside the xtmux window: it enables the DEC private modes given on its command line, puts the
-tty in raw mode and appends every byte it receives to /tmp/mouse.log; the tests move/click the X pointer with
-xdotool and compare those bytes exactly.  Typing d / e into it switches the modes off / on again, q quits.
+mouse_log.py runs inside the xtmux window: it enables the DEC private modes given on its command line, puts the tty
+in raw mode and appends every byte it receives to /tmp/mouse.log; the tests move/click the X pointer with xdotool
+and compare those bytes exactly.  ^D / ^E switch the modes off / on again, ^Q quits.  MOUSE_LOG_SLOW=0.03 makes it
+a slow reader (256 bytes per 30 ms).
 
-Groups:  enc       the classic, ?1005 UTF-8, ?1006 SGR and ?1015 urxvt encodings; buttons, wheel
-         drag      ?1000 vs ?1002 vs ?1003: when motion is reported
-         mods      shift / alt / ctrl bits
-         toggle    ?1000l stops events, ?1000h resumes
-         edges     status row, clamping, classic range limit (needs a wide screen), scrollback viewer
-         windows   the mode is per window
-         handoff   a request survives detach + re-attach with a new xtmux
-         observer  an xtmux window that is only an observer forwards to the main
+mouse_all.py groups
+  enc       classic and ?1006 SGR encodings (?1005/?1015 when xtmux is built with MOUSE_UTF8_URXVT_ENCODINGS:
+            set MOUSE_EXTRA=1 for that build); buttons, wheel
+  drag      ?1000 vs ?1002 vs ?1003: when motion is reported
+  mods      ctrl / alt bits; Shift (MOUSE_SELECT_MOD) is the copy/paste override and is not passed on
+  toggle    ?1000l stops events, ?1000h resumes
+  edges     status row, clamping, classic range limit (needs a wide screen), scrollback viewer
+  windows   the mode is per window
+  handoff   a request survives detach + re-attach with a new xtmux
+  observer  an xtmux window that is only an observer forwards to the main
+
+clip_all.py groups
+  copy      drag copies to PRIMARY+CLIPBOARD; wrapped lines, trimming, Unicode; highlight lifecycle
+  policy    who gets the mouse: the program, or copy/paste (Shift override)
+  paste     right click pastes: newline conversion, sanitising, bracketed paste, large pastes
+  serve     TARGETS / UTF8_STRING to other clients; losing ownership
+  observer  copy and paste in an observer window (K packets)
+  slow      pastes into a slow reader: xtmux main, an observer window, and plain tmux
+  keys      paste shortcuts: Shift+Insert, Ctrl+V (and that the plain keys still reach the program)
+  interop   xsel / xclip both ways, TARGETS, WM_PROTOCOLS (needs xsel too)
 Also runnable by hand: python3 /path/to/xterm-mouse-reporter.py inside xtmux.

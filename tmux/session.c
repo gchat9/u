@@ -530,7 +530,7 @@ int session_observer_push(int obs_fd, const Screen *s,
     h.cur_col     = (int16_t)s->cur_col;
     h.cur_visible = s->cur_visible ? 1 : 0;
     h.cur_win     = (uint8_t)cur_win;
-    h.mouse       = (uint8_t)(s->mouse_mode | s->mouse_enc << 2);
+    h.mouse       = (uint8_t)(s->mouse_mode | s->mouse_enc << 2 | (s->bracketed_paste ? 16 : 0));
     for (int i = 0; i < MAX_WINDOWS; i++) {
         exists[i] = wins[i] != NULL;
         alive[i]  = wins[i] && wins[i]->alive;
@@ -663,6 +663,21 @@ static int obs_read_keys(uint8_t *buf, int cap, int *relayout)
     return n <= 0 ? -1 : (int)n;
 #endif
 }
+
+#ifdef X11_BACKEND
+/* What the pointer produces for the program (mouse reports, pasted text)
+ * goes up to the main like typed keys: K packets of at most 255 bytes. */
+static void obs_pointer_sink(const uint8_t *b, size_t n, void *ctx)
+{
+    int sock = *(int *)ctx;
+    while (n) {
+        size_t k = n > 255 ? 255 : n;
+        uint8_t hdr[2] = { 'K', (uint8_t)k };
+        if (write_all(sock, hdr, 2) < 0 || write_all(sock, b, k) < 0) return;
+        b += k; n -= k;
+    }
+}
+#endif
 
 /* Show one frame: the cells (clipped to scr's view size), then the status
  * bar.  On a terminal the frame carries the status bar already rendered
@@ -832,19 +847,15 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
         }
 
 #ifdef X11_BACKEND
-        /* Pointer events, as the report the main's displayed program asked
-         * for (the frame header says which); they go up like keys. */
-        {
-            uint8_t mb[40];
-            int mn;
-            while ((mn = x11_backend_mouse_next(last_h.mouse & 3, last_h.mouse >> 2,
-                                                view_rows, view_cols, mb)) >= 0)
-                if (mn > 0) {
-                    uint8_t hdr[2] = { 'K', (uint8_t)mn };
-                    if (write_all(sock, hdr, 2) < 0 || write_all(sock, mb, (size_t)mn) < 0)
-                        goto done;
-                }
-        }
+        /* Pointer events: for the program, as the report the main's
+         * displayed program asked for (the frame header says which), or
+         * else text selection, copy and paste (see x11_backend.c). */
+        if (x11_backend_paste_key() && last_h.rows > 0)       /* Shift+Insert, Ctrl+V */
+            x11_backend_paste((last_h.mouse >> 4) & 1, obs_pointer_sink, &sock);
+        if (last_h.rows > 0)            /* (there is nothing on screen before the first frame) */
+            x11_backend_pointer(&scr, last_h.mouse & 3, (last_h.mouse >> 2) & 3,
+                                (last_h.mouse >> 4) & 1, view_rows, view_cols,
+                                obs_pointer_sink, &sock);
 #endif
 
         /* Incoming frame */
@@ -889,14 +900,20 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             last_status_len = (int)slen;
             if (slen > 0) memcpy(last_status_buf, status_buf, slen);
 
+#ifdef X11_BACKEND
+            (void)x11_backend_selection_drop();   /* (the frame is drawn next) */
+#endif
             obs_draw(&rs, &scr, local, &h, status_buf, slen, our_rows, our_cols);
 #ifdef X11_BACKEND
-            x11_backend_mouse_select(h.mouse & 3);
+            x11_backend_mouse_select((h.mouse & 3) < 2 ? 2 : (h.mouse & 3));
 #endif
         }
     }
 
 done:
+#ifdef X11_BACKEND
+    x11_backend_pointer_release();      /* `sock` is about to go out of scope */
+#endif
     obs_term_leave(&term);
     free(local);
     free(data);

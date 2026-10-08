@@ -36,14 +36,19 @@ if "enc" in tests:
     clear(); click(140,30)
     check("1006 SGR: large coordinates", log() == sgr(0,140,30) + sgr(0,140,30,"m"), log())
     stop_logger()
+    extra = os.environ.get("MOUSE_EXTRA") == "1"   # build has MOUSE_UTF8_URXVT_ENCODINGS
     start_logger(None, ["1000", "1015"]);    click(5,3)
-    check("1015 urxvt: decimal, button+32", log() == ESC + b"[32;6;4M" + ESC + b"[35;6;4M", log())
+    if extra: check("1015 urxvt: decimal, button+32", log() == ESC + b"[32;6;4M" + ESC + b"[35;6;4M", log())
+    else:     check("1015 not compiled in: the request is ignored, classic encoding stays", log() == classic(0,5,3) + classic(3,5,3), log().hex(" "))
     stop_logger()
     start_logger(None, ["1000", "1005"]);    click(100,3)
-    check("1005 UTF-8: column 100 takes two bytes", log() == ESC + b"[M" + b"\x20" + "\u0085".encode() + b"\x24" + ESC + b"[M" + b"\x23" + "\u0085".encode() + b"\x24", log().hex(" "))
+    u = ESC + b"[M" + b"\x20" + "\u0085".encode() + b"\x24" + ESC + b"[M" + b"\x23" + "\u0085".encode() + b"\x24"
+    if extra: check("1005 UTF-8: column 100 takes two bytes", log() == u, log().hex(" "))
+    else:     check("1005 not compiled in: classic encoding stays (col 100 -> one byte)", log() == classic(0,100,3) + classic(3,100,3), log().hex(" "))
     stop_logger()
-    start_logger(None, ["1000", "1006", "1005"]); click(5,3)   # last set wins
-    check("two encodings requested: the later (?1005 after ?1006) is used", log().startswith(ESC + b"[M"), log().hex(" "))
+    start_logger(None, ["1000", "1006", "1005"]); click(5,3)
+    if extra: check("two encodings requested: the later (?1005 after ?1006) is used", log().startswith(ESC + b"[M"), log().hex(" "))
+    else:     check("?1006 then unsupported ?1005: SGR stays in effect", log() == sgr(0,5,3) + sgr(0,5,3,"m"), log())
     stop_logger(); done(xv, xt)
 
 if "drag" in tests:
@@ -70,11 +75,16 @@ if "mods" in tests:
     print("## modifiers")
     xv, xt = boot()
     start_logger(None, ["1000", "1006"])
-    for key, bit in (("ctrl", 16), ("shift", 4), ("alt", 8)):
+    for key, bit in (("ctrl", 16), ("alt", 8)):
         clear(); xdo("keydown", key); time.sleep(.1); click(5,3); xdo("keyup", key); time.sleep(.15)
         check("%s+click sets modifier bit %d (and nothing else leaks)" % (key, bit), log() == sgr(bit,5,3) + sgr(bit,5,3,"m"), log())
+    clear(); xdo("keydown","ctrl"); xdo("keydown","alt"); time.sleep(.1); click(5,3); xdo("keyup","alt"); xdo("keyup","ctrl"); time.sleep(.15)
+    check("ctrl+alt+click combines bits", log() == sgr(24,5,3) + sgr(24,5,3,"m"), log())
+    # MOUSE_SELECT_MOD (default 4 = Shift) keeps the mouse for copy and paste: those events are not the program's
+    clear(); xdo("keydown", "shift"); time.sleep(.1); click(5,3); xdo("keyup", "shift"); time.sleep(.15)
+    check("shift+click is the copy/paste override: not passed to the program", log() == b"", log())
     clear(); xdo("keydown","ctrl"); xdo("keydown","shift"); time.sleep(.1); click(5,3); xdo("keyup","shift"); xdo("keyup","ctrl"); time.sleep(.15)
-    check("ctrl+shift+click combines bits", log() == sgr(20,5,3) + sgr(20,5,3,"m"), log())
+    check("...whatever else is held with it", log() == b"", log())
     stop_logger(); done(xv, xt)
 
 if "toggle" in tests:
@@ -82,9 +92,9 @@ if "toggle" in tests:
     xv, xt = boot()
     start_logger(None, ["1000", "1006"])
     click(5,3); check("enabled: delivered", log() != b"")
-    xdo("type", "d"); time.sleep(.5); clear(); click(5,3)
+    xdo("key", "ctrl+d"); time.sleep(.5); clear(); click(5,3)
     check("?1000l: pointer events stop", log() == b"", log())
-    xdo("type", "e"); time.sleep(.5); clear(); click(5,3)
+    xdo("key", "ctrl+e"); time.sleep(.5); clear(); click(5,3)
     check("?1000h again: they resume", log() == sgr(0,5,3) + sgr(0,5,3,"m"), log())
     stop_logger(); done(xv, xt)
 
@@ -140,9 +150,9 @@ if "observer" in tests:
     check("click in the observer window reaches the program", log() == sgr(0,5,3) + sgr(0,5,3,"m"), log())
     clear(); click(7,10,4)
     check("wheel too", log() == sgr(64,7,10), log())
-    p.send(b"d"); p.pump(0.8); time.sleep(.5); clear(); click(5,3)
+    p.send(b"\x04"); p.pump(0.8); time.sleep(.5); clear(); click(5,3)
     check("program turns the mode off -> observer stops forwarding", log() == b"", log())
-    p.send(b"e"); p.pump(0.8); time.sleep(.5); clear(); click(5,3)
+    p.send(b"\x05"); p.pump(0.8); time.sleep(.5); clear(); click(5,3)
     check("...and on again", log() == sgr(0,5,3) + sgr(0,5,3,"m"), log())
     p.kill(); done(xv, xt)
 

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "x11_backend.h"
 #include "../tmux/status.h"
 
@@ -90,6 +91,21 @@ static int wide_glyph(uint32_t wch, int right, uint8_t *attr)
     return g;
 }
 
+/* The text selection, if any: its two ends (row << 16 | col, in either
+ * order) as set by the mouse, see "Selection and clipboard" below.
+ * sel_on: it is drawn (in reverse video); sel_drag: the drag that is
+ * making it is still going. */
+static uint8_t  sel_on, sel_drag;
+static unsigned sel_a, sel_b;
+#define SEL_KEY(r, c) ((unsigned)(r) << 16 | (unsigned)(c))
+
+static int sel_hit(int r, int c)
+{
+    unsigned k = SEL_KEY(r, c);
+    unsigned lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
+    return k >= lo && k <= hi;
+}
+
 void x11_backend_render(const Screen *s)
 {
     uint8_t *fb  = xterm_framebuffer();
@@ -124,6 +140,9 @@ void x11_backend_render(const Screen *s)
             int g = wch ? wide_glyph(wch, right, &wattr) : glyph_slot(ch);
             fb[i] = g < 0 ? 0 : (uint8_t)g;
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
+            if (sel_on && sel_hit(r, c)) {     /* selected: reverse video */
+                uint8_t t = fgb[i]; fgb[i] = bgb[i]; bgb[i] = t;
+            }
             if (wattr)      atb[i] |= wattr;   /* OR: keeps underline/strike */
             else if (g < 0) atb[i] |= XTERM_ATTR_MISSING;  /* after resolve_colors, which sets atb */
         }
@@ -334,19 +353,17 @@ static int put_utf8(uint8_t *o, unsigned v)     /* v < 0x800 */
 }
 #endif
 
-/* Take the next pointer event and turn it into the bytes to send to the
- * program, as it asked for with ?1000/?1002/?1003 (mode 1/2/3) and
- * ?1006 (enc 2 SGR; 0 the classic form), and with
- * MOUSE_UTF8_URXVT_ENCODINGS ?1005/?1015 (enc 1 UTF-8, 3 urxvt).
- * Only events inside the rows x cols area the program sees count.
- * Returns -1 when no event is left, else the number of bytes put in
- * `out` (at least 40 of them): 0 for an event that is not reported --
- * wrong mode, outside the area, or not representable (the classic form
- * stops at column/row 223). */
-int x11_backend_mouse_next(int mode, int enc, int rows, int cols, uint8_t *out)
+/* The escape sequence for pointer event *mp, as a program that asked for
+ * the mouse with ?1000/?1002/?1003 (mode 1/2/3) wants it: ?1006 (enc 2
+ * SGR; 0 the classic form), and with MOUSE_UTF8_URXVT_ENCODINGS
+ * ?1005/?1015 (enc 1 UTF-8, 3 urxvt).  Only events inside the rows x cols
+ * area the program sees count.  Puts at most 40 bytes in `out` and
+ * returns their number: 0 for an event that is not reported -- wrong mode,
+ * outside the area, or not representable (the classic form stops at
+ * column/row 223). */
+static int mouse_encode(const XtermMouse *mp, int mode, int enc, int rows, int cols, uint8_t *out)
 {
-    XtermMouse m;
-    if (!xterm_read_mouse(&m)) return -1;
+    XtermMouse m = *mp;
     if (!mode || m.row >= rows || m.col >= cols) return 0;
 
     int btn = m.button, cb, release = 0;
@@ -394,4 +411,169 @@ int x11_backend_mouse_next(int mode, int enc, int rows, int cols, uint8_t *out)
         *o++ = (uint8_t)(cb + 32); *o++ = (uint8_t)(x + 32); *o++ = (uint8_t)(y + 32);
     }
     return (int)(o - out);
+}
+
+/* ── Selection and clipboard ───────────────────────────────────────────
+ * Mouse policy: while the displayed program has not asked for the mouse
+ * (mode 0), or MOUSE_SELECT_MOD (config.h) is held when a button goes
+ * down, the mouse belongs to us -- left drag selects text and copies it to
+ * PRIMARY and CLIPBOARD, a right click pastes PRIMARY.  Otherwise the
+ * events are passed to the program.  Which of the two it is is decided
+ * when a button goes down and holds until it comes up again. */
+
+typedef void (*SendFn)(const uint8_t *, size_t, void *);
+
+static uint8_t grab, grab_btn;      /* a button is held: 1 the program's, 2 ours */
+static char   *sel_buf;             /* the copied text (xterm_selection_set serves it) */
+
+/* Where pasted text goes, as last registered by the code that handles the
+ * pointer (see x11_backend_pointer): paste text arrives some time after
+ * it was asked for. */
+static struct { SendFn send; void *ctx; uint8_t bracketed, started, after_cr; } paste;
+
+static int utf8_encode(uint8_t *o, uint32_t cp)
+{
+    if (cp < 0x80)    { o[0] = (uint8_t)cp; return 1; }
+    if (cp < 0x800)   { o[0] = (uint8_t)(0xC0 | cp >> 6);
+                        o[1] = (uint8_t)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { o[0] = (uint8_t)(0xE0 | cp >> 12);
+                        o[1] = (uint8_t)(0x80 | (cp >> 6 & 0x3F));
+                        o[2] = (uint8_t)(0x80 | (cp & 0x3F)); return 3; }
+    o[0] = (uint8_t)(0xF0 | cp >> 18); o[1] = (uint8_t)(0x80 | (cp >> 12 & 0x3F));
+    o[2] = (uint8_t)(0x80 | (cp >> 6 & 0x3F)); o[3] = (uint8_t)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* The selected text, in reading order, from s: trailing blanks of each
+ * line dropped, a newline between lines unless the line wrapped.  malloc'd,
+ * *len bytes (not terminated); NULL if there is nothing. */
+static char *sel_extract(const Screen *s, size_t *len)
+{
+    unsigned lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
+    int r0 = (int)(lo >> 16), c0 = (int)(lo & 0xFFFF);
+    int r1 = (int)(hi >> 16), c1 = (int)(hi & 0xFFFF);
+    if (r1 >= s->rows) { r1 = s->rows - 1; c1 = s->cols - 1; }
+    if (r0 > r1) return NULL;
+    char *buf = malloc((size_t)(r1 - r0 + 1) * ((size_t)s->cols * 4 + 1) + 1);
+    if (!buf) return NULL;
+    size_t n = 0;
+    for (int r = r0; r <= r1; r++) {
+        int a = r == r0 ? c0 : 0, b = r == r1 ? c1 : s->cols - 1;
+        if (b >= s->cols) b = s->cols - 1;
+        int wrapped = r < r1 && s->row_flags && (s->row_flags[r] & ROW_WRAPPED);
+        if (!wrapped)
+            while (b >= a && (s->cells[r][b].ch == 0 || s->cells[r][b].ch == ' ')) b--;
+        for (int c = a; c <= b; c++) {
+            const Cell *cell = &s->cells[r][c];
+            if (cell->flags & CELL_WIDE_CONT) continue;
+            n += (size_t)utf8_encode((uint8_t *)buf + n, cell->ch ? cell->ch : ' ');
+        }
+        if (r < r1 && !wrapped) buf[n++] = '\n';
+    }
+    *len = n;
+    return buf;
+}
+
+/* The text we asked to paste, in pieces (see xterm_paste_request).  What
+ * is typed to a program must not carry control characters that could
+ * act as commands -- an ESC would end a bracketed paste early -- so only
+ * tab and newline survive, and newlines go as the CR that Enter sends. */
+static void paste_chunk(const uint8_t *d, size_t n, void *unused)
+{
+    (void)unused;
+    if (!paste.send) return;
+    if (!d) {                                   /* the end */
+        if (paste.started && paste.bracketed) paste.send((const uint8_t *)"\033[201~", 6, paste.ctx);
+        paste.started = paste.after_cr = 0;
+        return;
+    }
+    if (!paste.started) {
+        paste.started = 1;
+        if (paste.bracketed) paste.send((const uint8_t *)"\033[200~", 6, paste.ctx);
+    }
+    uint8_t out[128]; size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = d[i];
+        int skip = b == '\n' && paste.after_cr;      /* the LF of a CR LF */
+        paste.after_cr = b == '\r';
+        if (b == '\n') b = '\r';
+        if (skip || (b < 0x20 && b != '\t' && b != '\r') || b == 0x7f) continue;
+        out[k++] = b;
+        if (k == sizeof out) { paste.send(out, k, paste.ctx); k = 0; }
+    }
+    if (k) paste.send(out, k, paste.ctx);
+}
+
+/* Ask for the PRIMARY text and send it to the program as it arrives
+ * (wrapped as a bracketed paste if it asked for that).  What a right click
+ * does, and the paste shortcuts. */
+void x11_backend_paste(int bracketed, SendFn send, void *ctx)
+{
+    paste.send = send; paste.ctx = ctx; paste.bracketed = (uint8_t)bracketed;
+    xterm_paste_request(paste_chunk, NULL);
+}
+
+/* Nonzero (once) after a paste shortcut was pressed. */
+int x11_backend_paste_key(void) { return xterm_paste_key(); }
+
+/* Drop the highlighted selection (not while its drag is going, and the
+ * copied text stays on the clipboard); returns nonzero if one was shown,
+ * so the caller knows to repaint. */
+int x11_backend_selection_drop(void)
+{
+    if (sel_drag || !sel_on) return 0;
+    sel_on = 0;
+    return 1;
+}
+
+/* The code that consumes pointer events is going away (an observer
+ * leaving): pasted text must not be sent to it any more. */
+void x11_backend_pointer_release(void) { paste.send = NULL; }
+
+/* Handle the queued pointer events for the program shown in `s`, which asked
+ * for the mouse as mode/enc (see mouse_encode) and for bracketed paste or
+ * not, and sees rows x cols cells.  What is for the program is passed to
+ * `send(bytes, n, ctx)`, as is pasted text. */
+void x11_backend_pointer(const Screen *s, int mode, int enc, int bracketed,
+                         int rows, int cols, SendFn send, void *ctx)
+{
+    paste.send = send; paste.ctx = ctx; paste.bracketed = (uint8_t)bracketed;
+    XtermMouse m;
+    uint8_t out[40];
+    int redraw = 0, n;
+    while (xterm_read_mouse(&m)) {
+        int forced = MOUSE_SELECT_MOD && (m.mods & MOUSE_SELECT_MOD) == MOUSE_SELECT_MOD;
+        int pass = 0;
+
+        if (m.button >= 4) {                    /* wheel */
+            pass = mode && !forced && grab != 2;
+        } else if (m.kind == 0 && !grab) {      /* a button goes down */
+            if (m.row >= rows || m.col >= cols) continue;   /* not the program's area */
+            if (sel_on) { sel_on = 0; redraw = 1; }
+            grab = (mode && !forced) ? 1 : 2; grab_btn = m.button;
+            if (grab == 2) {
+                if (m.button == 1) { sel_a = sel_b = SEL_KEY(m.row, m.col); sel_drag = 1; }
+                else if (m.button == 3) x11_backend_paste(bracketed, send, ctx);
+            }
+            pass = grab == 1;
+        } else if (grab == 2) {                 /* our gesture: motion and the release */
+            if (sel_drag && m.kind != 0) {
+                int r = m.row < rows ? m.row : rows - 1, c = m.col < cols ? m.col : cols - 1;
+                if (SEL_KEY(r, c) != sel_b) { sel_b = SEL_KEY(r, c); sel_on = sel_a != sel_b; redraw = 1; }
+                if (m.kind == 1 && m.button == 1) {
+                    sel_drag = 0;
+                    size_t len;
+                    char *t = sel_on ? sel_extract(s, &len) : NULL;
+                    if (t && len) { xterm_selection_set(t, len); free(sel_buf); sel_buf = t; }
+                    else free(t);
+                }
+            }
+        } else {                                /* the program's gesture, or motion with no button */
+            pass = grab ? 1 : (m.kind == 2 && mode == 3 && !forced);
+        }
+        if (m.kind == 1 && grab && m.button == grab_btn) grab = 0;
+        if (pass && (n = mouse_encode(&m, mode, enc, rows, cols, out)) > 0)
+            send(out, (size_t)n, ctx);
+    }
+    if (redraw) x11_backend_render(s);
 }

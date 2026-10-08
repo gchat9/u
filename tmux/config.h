@@ -22,6 +22,16 @@
  * encoding it had, as on any terminal that lacks it. */
 /* #define MOUSE_UTF8_URXVT_ENCODINGS */
 
+/* Copy and paste with the mouse (xtmux): drag with the left button to
+ * select text and copy it to PRIMARY and CLIPBOARD, click the right button
+ * to paste PRIMARY.  When a program has asked for the mouse these go to it
+ * instead -- unless this modifier is held, which keeps the mouse for
+ * copy and paste: 4 Shift, 8 Alt, 16 Control (add them to need several);
+ * 0 leaves the mouse to the program for good. */
+#ifndef MOUSE_SELECT_MOD
+#define MOUSE_SELECT_MOD 4
+#endif
+
 /* ================================================================== */
 /* Session                                                              */
 /* ================================================================== */

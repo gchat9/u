@@ -134,6 +134,15 @@ static void xwrite(const void *buf, size_t n)
     }
 }
 
+/* Every request we send gets the next sequence number (the server counts
+ * them from 1 after the connection setup, which is not a request); the
+ * replies and errors it sends carry that number.  That is how a reply is
+ * told from an error that belongs to some earlier request -- see
+ * await_reply. */
+static uint16_t xseq;
+static void xreq(const void *buf, size_t n) { xseq++; xwrite(buf, n); }
+static int  await_reply(uint8_t r[32]);
+
 static void xdrain(size_t n)
 {
     uint8_t tmp[256];
@@ -178,7 +187,7 @@ static void put_image(uint32_t draw, uint32_t gc,
         memcpy(hdr+ 8, &gc,   4); memcpy(hdr+12, &uw,   2);
         memcpy(hdr+14, &ur,   2); memcpy(hdr+16, &sx,   2);
         memcpy(hdr+18, &sy,   2); hdr[21] = depth;
-        xwrite(hdr, PUT_HDR + dsz);
+        xreq(hdr, PUT_HDR + dsz);
         memcpy(hdr, save, PUT_HDR);
     }
 }
@@ -218,11 +227,10 @@ static void load_keyboard_mapping(void)
     memcpy(req+2, &len, 2);
     req[4] = min_keycode;
     req[5] = (uint8_t)count;
-    xwrite(req, 8);
+    xreq(req, 8);
 
     uint8_t hdr[32];
-    xread(hdr, 32);
-    if (hdr[0] != 1) return;   /* error reply: leave keysyms_per_kc == 0 */
+    if (!await_reply(hdr)) return;   /* it failed: leave keysyms_per_kc == 0 */
     uint8_t kspc = hdr[1];
     if (!kspc) return;
 
@@ -285,6 +293,22 @@ static void push_str(const char *s) { while (*s) key_push((uint8_t)*s++); }
  * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to
  * their Unicode code points, so ks doubles as the code point here with
  * no translation table needed. */
+/* Paste shortcuts: Shift+Insert, and Ctrl+V (also with Shift).  They are
+ * not typed to the program; the application is told (xterm_paste_key) and
+ * pastes as it does for the mouse.  Compile with -DXTERM_PASTE_CTRL_V=0 to
+ * leave Ctrl+V to the program (vim's literal-next, for one). */
+#ifndef XTERM_PASTE_CTRL_V
+#define XTERM_PASTE_CTRL_V 1
+#endif
+static uint8_t paste_key;
+
+int xterm_paste_key(void)
+{
+    int k = paste_key;
+    paste_key = 0;
+    return k;
+}
+
 static void handle_keypress(const uint8_t *ev)
 {
     uint8_t keycode = ev[1];
@@ -298,6 +322,16 @@ static void handle_keypress(const uint8_t *ev)
                                           * "lv3:ralt_switch" */
 
     uint32_t ks = keysym_for(keycode, (altgr ? 2 : 0) + (shift ? 1 : 0));
+    /* Insert usually has nothing in its shifted column, so Shift+Insert has
+     * to be recognized by the unshifted one. */
+    int insert = ks == 0xFF63 ||
+                 (shift && keysym_for(keycode, altgr ? 2 : 0) == 0xFF63);
+    if ((shift && !ctrl && !alt && insert) ||                              /* Shift+Insert */
+        (XTERM_PASTE_CTRL_V && ctrl && !alt && (ks == 'v' || ks == 'V'))) { /* Ctrl+V */
+        paste_key = 1;
+        return;
+    }
+
     if (!ks) return;
 
     /* Meta-prefix: makes Alt+key reach the multiplexer's own shortcuts
@@ -735,6 +769,28 @@ static int regrid(int w, int h)
  * after mapping it can have its ConfigureNotify arrive here, and
  * handle_event() records it for xterm_init to apply. */
 static void handle_event(const uint8_t *ev);
+/* The reply to the request just sent.  What else arrives first is dealt
+ * with: events are handled, and an error for an *earlier* request (one of
+ * the many we fire off without waiting, such as SetInputFocus on a window
+ * the window manager has not mapped yet) is dropped -- it must not be
+ * taken for the answer.  Returns 0 if the awaited request itself failed,
+ * or the connection is gone. */
+static int await_reply(uint8_t r[32])
+{
+    for (;;) {
+        xread(r, 32);
+        if (xlost) return 0;
+        if (r[0] == 1) return 1;
+        if (r[0] == 0) {
+            uint16_t seq;
+            memcpy(&seq, r + 2, 2);
+            if (seq == xseq) return 0;
+            continue;
+        }
+        handle_event(r);
+    }
+}
+
 static uint32_t intern_atom(const char *name, int len)
 {
     uint8_t req[24] = {0};
@@ -744,16 +800,16 @@ static uint32_t intern_atom(const char *name, int len)
     memcpy(req+2, &reqlen, 2);
     memcpy(req+4, &nlen, 2);
     memcpy(req+8, name, (size_t)len);
-    xwrite(req, (size_t)reqlen * 4);
-    for (;;) {
-        uint8_t rep[32]; xread(rep, 32);
-        if (rep[0] == 1) { uint32_t atom; memcpy(&atom, rep+8, 4); return atom; }
-        if (rep[0] == 0) return 0; /* error: give up gracefully */
-        handle_event(rep);         /* else an event that beat the reply */
-    }
+    xreq(req, (size_t)reqlen * 4);
+    uint8_t rep[32];
+    if (!await_reply(rep)) return 0;
+    uint32_t atom;
+    memcpy(&atom, rep+8, 4);
+    return atom;
 }
 
 static uint32_t wm_protocols_atom, wm_delete_window_atom;
+static uint32_t a_clipboard, a_utf8, a_targets, a_prop;   /* see "Selections" */
 static int close_requested;
 
 /* WM_NAME (STRING, format 8) — bare-minimum window title. */
@@ -774,7 +830,7 @@ void xterm_set_title(const char *name, int len)
     memcpy(req+20, &nlen, 4);
     memcpy(buf, req, 24);
     memcpy(buf + 24, name, (size_t)len);
-    xwrite(buf, (size_t)reqlen * 4);
+    xreq(buf, (size_t)reqlen * 4);
 }
 
 int xterm_close_requested(void) { return close_requested; }
@@ -802,7 +858,7 @@ static void grab_focus(void)
     uint8_t foc[12] = {0}; uint16_t foc_len=3; uint32_t time0=0;
     foc[0]=42; foc[1]=1; /* revert-to = PointerRoot */
     memcpy(foc+2,&foc_len,2); memcpy(foc+4,&xterm_win,4); memcpy(foc+8,&time0,4);
-    xwrite(foc,12);
+    xreq(foc,12);
 }
 
 int xterm_init(void)
@@ -886,13 +942,20 @@ int xterm_init(void)
     memcpy(r+12,&x,2); memcpy(r+14,&y,2); memcpy(r+16,&w,2); memcpy(r+18,&h,2);
     memcpy(r+20,&bw,2); memcpy(r+22,&cls,2); memcpy(r+24,&vis,4);
     memcpy(r+28,&vmask,4); memcpy(r+32,&bg,4); memcpy(r+36,&emask,4);
-    xwrite(r, 40);
+    xreq(r, 40);
     uint8_t map[8] = {0}; uint16_t map_len=2; map[0]=8;
-    memcpy(map+2,&map_len,2); memcpy(map+4,&xterm_win,4); xwrite(map,8);
+    memcpy(map+2,&map_len,2); memcpy(map+4,&xterm_win,4); xreq(map,8);
     uint8_t gc[16] = {0}; uint16_t gc_len=4; uint32_t mask=0; gc[0]=55;
     memcpy(gc+2,&gc_len,2); memcpy(gc+4,&xterm_gc,4); memcpy(gc+8,&xterm_win,4);
-    memcpy(gc+12,&mask,4); xwrite(gc,16);
+    memcpy(gc+12,&mask,4); xreq(gc,16);
 
+#ifdef XTERM_TEST_ERROR_BEFORE_ATOMS
+    /* Test hook: an unrelated request that fails, as the SetInputFocus below
+     * does on a window manager that has not mapped the window yet.  The
+     * atoms interned after it must still come out right (see await_reply). */
+    { uint8_t g[8] = {0}; uint16_t gl = 2; uint32_t bad = 0x7ffffff0;
+      g[0] = 14; memcpy(g+2, &gl, 2); memcpy(g+4, &bad, 4); xreq(g, 8); }
+#endif
     grab_focus();
 
     /* Opt into the WM_DELETE_WINDOW handshake so a window-manager-driven
@@ -901,6 +964,10 @@ int xterm_init(void)
      * dying under us. */
     wm_protocols_atom     = intern_atom("WM_PROTOCOLS", 12);
     wm_delete_window_atom = intern_atom("WM_DELETE_WINDOW", 16);
+    a_clipboard = intern_atom("CLIPBOARD", 9);
+    a_utf8      = intern_atom("UTF8_STRING", 11);
+    a_targets   = intern_atom("TARGETS", 7);
+    a_prop      = intern_atom("XTERM_PASTE", 11);
     uint8_t wp[28] = {0}; uint16_t wp_len=7; uint32_t wp_n=1;
     wp[0]=18; /* ChangeProperty, mode=Replace */
     memcpy(wp+2,&wp_len,2); memcpy(wp+4,&xterm_win,4);
@@ -909,7 +976,7 @@ int xterm_init(void)
     wp[16]=32; /* format */
     memcpy(wp+20,&wp_n,4);
     memcpy(wp+24,&wm_delete_window_atom,4);
-    xwrite(wp,28);
+    xreq(wp,28);
 
     regrid(cfg_w, cfg_h);   /* a ConfigureNotify may have beaten the atom replies */
     xup = 1;
@@ -981,7 +1048,7 @@ void xterm_mouse_select(int level)
     r[0] = 2;
     memcpy(r+2, &len, 2); memcpy(r+4, &xterm_win, 4);
     memcpy(r+8, &vm, 4);  memcpy(r+12, &em, 4);
-    xwrite(r, 16);
+    xreq(r, 16);
     mouse_head = mouse_tail;          /* whatever was queued is stale now */
     mouse_last_col = mouse_last_row = -1;
 }
@@ -1024,6 +1091,131 @@ int xterm_read_mouse(XtermMouse *m)
     return 1;
 }
 
+/* ── Selections (the clipboard) ────────────────────────────────────────
+ * We can own PRIMARY and CLIPBOARD, serving a UTF-8 text the application
+ * keeps for us (xterm_selection_set), and ask the PRIMARY owner for its
+ * text (xterm_paste_request).  Neither needs any buffer here: owned text
+ * is the application's, and pasted text is handed over in small pieces as
+ * it is read from the server.  Not supported: INCR transfers (very large
+ * pastes from some clients) and any text format but UTF8_STRING. */
+static const char *sel_text;
+static size_t      sel_len;
+static uint8_t     sel_owned;            /* bit 0: PRIMARY, bit 1: CLIPBOARD */
+static void      (*paste_cb)(const uint8_t *, size_t, void *);
+static void       *paste_ctx;
+
+/* SetSelectionOwner (opcode 22), at the current time. */
+static void set_owner(uint32_t sel, uint32_t owner)
+{
+    uint8_t r[16] = {0}; uint16_t len = 4;
+    r[0] = 22; memcpy(r+2, &len, 2);
+    memcpy(r+4, &owner, 4); memcpy(r+8, &sel, 4);
+    xreq(r, 16);
+}
+
+void xterm_selection_set(const char *text, size_t len)
+{
+    sel_text = text; sel_len = len;
+    sel_owned = text && a_clipboard ? 3 : 0;
+    uint32_t owner = sel_owned ? xterm_win : 0;
+    set_owner(1, owner);                 /* 1 is XA_PRIMARY */
+    if (a_clipboard) set_owner(a_clipboard, owner);
+}
+
+/* ChangeProperty (opcode 18, mode Replace) of `units` items of `format`
+ * bits on someone's window. */
+static void change_property(uint32_t win, uint32_t prop, uint32_t type,
+                            int format, const void *data, size_t units)
+{
+    size_t nbytes = units * (size_t)(format / 8), pad = -nbytes & 3;
+    uint8_t r[24] = {0}; uint16_t len = (uint16_t)(6 + (nbytes + pad) / 4);
+    uint32_t n = (uint32_t)units;
+    static const uint8_t zeros[3];
+    r[0] = 18; memcpy(r+2, &len, 2);
+    memcpy(r+4, &win, 4); memcpy(r+8, &prop, 4); memcpy(r+12, &type, 4);
+    r[16] = (uint8_t)format; memcpy(r+20, &n, 4);
+    xreq(r, 24); xwrite(data, nbytes); xwrite(zeros, pad);
+}
+
+/* Another client wants our selection (event 30: time 4, owner 8,
+ * requestor 12, selection 16, target 20, property 24).  Answer with a
+ * property on its window and a SelectionNotify (via SendEvent, opcode 25);
+ * property None in the notify means "can't". */
+static void selection_request(const uint8_t *ev)
+{
+    uint32_t time, req, sel, target, prop;
+    memcpy(&time, ev+4, 4);   memcpy(&req, ev+12, 4); memcpy(&sel, ev+16, 4);
+    memcpy(&target, ev+20, 4); memcpy(&prop, ev+24, 4);
+    if (!prop) prop = target;            /* old clients: property unset */
+    uint8_t bit = sel == 1 ? 1 : (sel == a_clipboard ? 2 : 0);
+    int ok = 0;
+    if (bit & sel_owned) {
+        if (target == a_targets) {
+            uint32_t t[2] = { a_targets, a_utf8 };
+            change_property(req, prop, 4 /* ATOM */, 32, t, 2); ok = 1;
+        } else if (target == a_utf8) {
+            size_t max = ((size_t)x_max_request_words - 6) * 4;
+            change_property(req, prop, a_utf8, 8, sel_text, sel_len < max ? sel_len : max);
+            ok = 1;
+        }
+    }
+    uint8_t r[44] = {0}; uint16_t len = 11; uint32_t none = 0;
+    r[0] = 25; memcpy(r+2, &len, 2); memcpy(r+4, &req, 4);
+    uint8_t *e = r + 12;                 /* the SelectionNotify event */
+    e[0] = 31; memcpy(e+4, &time, 4); memcpy(e+8, &req, 4);
+    memcpy(e+12, &sel, 4); memcpy(e+16, &target, 4);
+    memcpy(e+20, ok ? &prop : &none, 4);
+    xreq(r, 44);
+}
+
+void xterm_paste_request(void (*cb)(const uint8_t *, size_t, void *), void *ctx)
+{
+    if (!a_utf8) { cb(NULL, 0, ctx); return; }
+    paste_cb = cb; paste_ctx = ctx;
+    /* ConvertSelection (opcode 24): PRIMARY as UTF8_STRING into our
+     * window's private property; the answer is a SelectionNotify. */
+    uint8_t r[24] = {0}; uint16_t len = 6; uint32_t prim = 1, none = 0;
+    r[0] = 24; memcpy(r+2, &len, 2);
+    memcpy(r+4, &xterm_win, 4); memcpy(r+8, &prim, 4);
+    memcpy(r+12, &a_utf8, 4);   memcpy(r+16, &a_prop, 4);
+    memcpy(r+20, &none, 4);
+    xreq(r, 24);
+}
+
+/* The text has arrived in our property: pass it to cb, 4 KB of the
+ * property per GetProperty (opcode 20), then delete it (opcode 19). */
+static void fetch_paste(void (*cb)(const uint8_t *, size_t, void *), void *ctx)
+{
+    for (uint32_t off = 0; ; off += 1024) {
+        uint8_t q[24] = {0}, r[32]; uint16_t len = 6;
+        uint32_t lo = off, longs = 1024;
+        q[0] = 20; memcpy(q+2, &len, 2);
+        memcpy(q+4, &xterm_win, 4); memcpy(q+8, &a_prop, 4);   /* type: any */
+        memcpy(q+16, &lo, 4); memcpy(q+20, &longs, 4);
+        xreq(q, 24);
+        if (!await_reply(r)) return;
+        uint32_t extra, type, after, vlen;
+        memcpy(&extra, r+4, 4); memcpy(&type, r+8, 4);
+        memcpy(&after, r+12, 4); memcpy(&vlen, r+16, 4);
+        /* Only plain 8-bit UTF8_STRING data (not, say, an INCR header). */
+        size_t valid = (r[1] == 8 && type == a_utf8) ? vlen : 0, left = (size_t)extra * 4;
+        uint8_t buf[512];
+        while (left) {
+            size_t n = left < sizeof buf ? left : sizeof buf;
+            xread(buf, n);
+            if (xlost) return;
+            size_t give = valid < n ? valid : n;
+            if (give) cb(buf, give, ctx);
+            valid -= give; left -= n;
+        }
+        if (!after || type != a_utf8) break;
+    }
+    uint8_t d[12] = {0}; uint16_t dl = 3;
+    d[0] = 19; memcpy(d+2, &dl, 2);
+    memcpy(d+4, &xterm_win, 4); memcpy(d+8, &a_prop, 4);
+    xreq(d, 12);
+}
+
 /* One 32-byte server event.  Key presses are queued; everything else only
  * records state for xterm_wait() to act on. */
 static void handle_event(const uint8_t *ev)
@@ -1043,6 +1235,20 @@ static void handle_event(const uint8_t *ev)
         cfg_w = w; cfg_h = h;
     } else if (etype >= 4 && etype <= 6) {
         mouse_event(etype, ev);
+    } else if (etype == 30) {
+        selection_request(ev);
+    } else if (etype == 29) {
+        /* SelectionClear: someone else took the selection (selection
+         * atom at 12). */
+        uint32_t sel; memcpy(&sel, ev+12, 4);
+        sel_owned &= (uint8_t)~(sel == 1 ? 1 : (sel == a_clipboard ? 2 : 0));
+    } else if (etype == 31) {
+        /* SelectionNotify, the answer to xterm_paste_request (property
+         * at 20, None if the owner could not give us the text). */
+        uint32_t prop; memcpy(&prop, ev+20, 4);
+        void (*cb)(const uint8_t *, size_t, void *) = paste_cb;
+        paste_cb = NULL;
+        if (cb) { if (prop) fetch_paste(cb, paste_ctx); cb(NULL, 0, paste_ctx); }
     } else if (etype == 2) {
         handle_keypress(ev);
     } else if (etype == 7) {

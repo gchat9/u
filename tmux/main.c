@@ -590,6 +590,9 @@ static bool scrollback_feed(uint8_t b, bool last)
 
 static void full_redraw(void)
 {
+#ifdef X11_BACKEND
+    (void)x11_backend_selection_drop();
+#endif
 #if SCROLLBACK_ENABLED
     if (g_scrollback_mode) { render_scrollback_view(); return; }
 #endif
@@ -705,6 +708,36 @@ static void handle_resize(void)
 /* Input dispatch                                                       */
 /* ================================================================== */
 
+/* Set when pty_write_all read the window's output to get on: the screen
+ * is behind and the main loop must repaint (and answer what it asked). */
+static bool g_pty_drained;
+
+/* Write all of buf to the window's terminal.  The master is non-blocking
+ * and the tty's input queue small (about 4 KB), so a long text -- a paste --
+ * does not go in one write: the program has to read some first.  While
+ * waiting for it, its output is read, since it may be blocked writing that
+ * to us.  If nothing moves for a second the program is not reading at all
+ * and the rest is dropped. */
+static void pty_write_all(Window *w, const uint8_t *b, size_t n)
+{
+    int stalled = 0;
+    while (n) {
+        ssize_t r = write(w->pty.master, b, n);
+        if (r > 0) { b += r; n -= (size_t)r; stalled = 0; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno != EAGAIN) return;           /* the program is gone */
+        fd_set rf, wf;
+        FD_ZERO(&rf); FD_ZERO(&wf);
+        FD_SET(w->pty.master, &rf); FD_SET(w->pty.master, &wf);
+        struct timeval tv = { 0, 100000 };
+        int ready = select(w->pty.master + 1, &rf, &wf, NULL, &tv);
+        if (ready > 0 && FD_ISSET(w->pty.master, &rf) && drain_pty(w))
+            g_pty_drained = true;
+        if (ready <= 0 && ++stalled >= 10) return;
+        if (ready > 0) stalled = 0;
+    }
+}
+
 static void write_to_active(const uint8_t *buf, size_t n)
 {
     Window *w = g_wins[g_cur];
@@ -727,27 +760,33 @@ static void write_to_active(const uint8_t *buf, size_t n)
     static uint8_t seq[3];
     static int     seq_len;
 
+    /* Nothing to translate: all at once (a paste can be long). */
+    if (!w->vt.scr.app_cursor && seq_len == 0) {
+        pty_write_all(w, buf, n);
+        return;
+    }
+
     for (size_t i = 0; i < n; i++) {
         uint8_t b = buf[i];
         if (!w->vt.scr.app_cursor) {
-            (void)write(w->pty.master, &b, 1);
+            pty_write_all(w, &b, 1);
             seq_len = 0;
             continue;
         }
         seq[seq_len++] = b;
         if (seq_len == 1 && seq[0] != 0x1B) {
-            (void)write(w->pty.master, seq, 1); seq_len = 0;
+            pty_write_all(w, seq, 1); seq_len = 0;
         } else if (seq_len == 2) {
             if (seq[1] != '[' && seq[1] != 'O') {
-                (void)write(w->pty.master, seq, 2); seq_len = 0;
+                pty_write_all(w, seq, 2); seq_len = 0;
             }
         } else if (seq_len == 3) {
             if (seq[1]=='[' && (seq[2]=='A'||seq[2]=='B'||
                                  seq[2]=='C'||seq[2]=='D')) {
                 uint8_t out[3] = { 0x1B, 'O', seq[2] };
-                (void)write(w->pty.master, out, 3);
+                pty_write_all(w, out, 3);
             } else {
-                (void)write(w->pty.master, seq, 3);
+                pty_write_all(w, seq, 3);
             }
             seq_len = 0;
         }
@@ -755,17 +794,35 @@ static void write_to_active(const uint8_t *buf, size_t n)
 }
 
 #ifdef X11_BACKEND
-/* How much pointer traffic the displayed program wants: what it asked for
- * with ?1000/?1002/?1003, but nothing while the scrollback viewer is up or
- * the window's program has gone. */
-static int mouse_level_wanted(void)
+/* What the displayed program asked for with ?1000/?1002/?1003 (0 when it
+ * has gone). */
+static int shown_mouse_mode(void)
 {
     Window *w = g_wins[g_cur];
-    if (!w || !w->alive) return 0;
+    return w && w->alive ? w->vt.scr.mouse_mode : 0;
+}
+
+/* How much pointer traffic to ask the X server for: what that program
+ * wants, but at least buttons and drags, since the mouse is also ours for
+ * copy and paste (see x11_backend.c) -- except while the scrollback
+ * viewer is up, which has nothing to select. */
+static int mouse_level_wanted(void)
+{
+    if (!g_wins[g_cur]) return 0;
 #if SCROLLBACK_ENABLED
     if (g_scrollback_mode) return 0;
 #endif
-    return w->vt.scr.mouse_mode;
+    int m = shown_mouse_mode();
+    return m < 2 ? 2 : m;
+}
+
+/* Where what the pointer produces for the program (reports, pasted text)
+ * goes: its terminal, if it is still there. */
+static void pointer_sink(const uint8_t *b, size_t n, void *ctx)
+{
+    (void)ctx;
+    Window *w = g_wins[g_cur];
+    if (w && w->alive) { w->pristine = false; pty_write_all(w, b, n); }
 }
 #endif
 
@@ -1304,6 +1361,10 @@ int main(int argc, char *argv[])
             }
             uint8_t kbuf[64];
             int kn = x11_backend_read_input(kbuf, sizeof kbuf);
+            /* Typing ends a text selection's highlight. */
+            if (kn > 0 && g_wins[g_cur] && !g_scrollback_mode &&
+                x11_backend_selection_drop())
+                render_screen(&g_rs, &g_wins[g_cur]->vt.scr);
             for (int i = 0; i < kn; i++) {
 #if SCROLLBACK_ENABLED
                 /* a full buffer might end mid-sequence: not a lone ESC */
@@ -1315,16 +1376,18 @@ int main(int argc, char *argv[])
                 handle_event(ev);
             }
 
-            /* Pointer events go to the displayed program as the report
-             * it asked for (the status row is not its area). */
+            /* Pointer events: for the displayed program, as the report it
+             * asked for, or else text selection, copy and paste. */
             {
                 Window *mw = g_wins[g_cur];
-                int mmode = mouse_level_wanted();
-                uint8_t menc = mw ? mw->vt.scr.mouse_enc : 0, mb[40];
-                int mn;
-                while ((mn = x11_backend_mouse_next(mmode, menc, child_rows(),
-                                                    g_cols, mb)) >= 0)
-                    if (mn > 0) write_to_active(mb, (size_t)mn);
+                if (x11_backend_paste_key() && mw && !g_scrollback_mode)   /* Shift+Insert, Ctrl+V */
+                    x11_backend_paste(mw->vt.scr.bracketed_paste, pointer_sink, NULL);
+                if (mw && !g_scrollback_mode) {
+                    Screen *ms = &mw->vt.scr;
+                    x11_backend_pointer(ms, shown_mouse_mode(), ms->mouse_enc,
+                                        ms->bracketed_paste, child_rows(), g_cols,
+                                        pointer_sink, NULL);
+                }
             }
         }
 #endif
@@ -1345,10 +1408,18 @@ int main(int argc, char *argv[])
                 uint8_t klen;
                 if (read(g_observer_fd, &klen, 1) == 1 && klen > 0) {
                     char kbuf[256];
-                    ssize_t got = read(g_observer_fd, kbuf, klen);
+                    /* A stream socket may hand over less than asked for
+                     * (a pasted text makes long packets): take all of it,
+                     * or the rest would be read as the next packet. */
+                    ssize_t got = 0;
+                    while (got < klen) {
+                        ssize_t r = read(g_observer_fd, kbuf + got, (size_t)(klen - got));
+                        if (r <= 0) break;
+                        got += r;
+                    }
                     if (got > 0 && g_wins[g_cur] && g_wins[g_cur]->alive) {
                         g_wins[g_cur]->pristine = false;
-                        (void)write(g_wins[g_cur]->pty.master, kbuf, (size_t)got);
+                        pty_write_all(g_wins[g_cur], (const uint8_t *)kbuf, (size_t)got);
                     }
                 }
             } else if (type == 'W') {
@@ -1373,6 +1444,24 @@ int main(int argc, char *argv[])
             clock_remaining_ms = ms_to_next_minute();
         }
 
+        /* Output that was read to make room for a long write (a paste)
+         * has not been shown yet. */
+        if (g_pty_drained) {
+            g_pty_drained = false;
+            Window *w = g_wins[g_cur];
+            if (w && w->alive && w->vt.cpr_requested) {
+                w->vt.cpr_requested = false;
+                char reply[32];
+                int rlen = snprintf(reply, sizeof(reply), "\033[%d;%dR",
+                                    w->vt.scr.cur_row + 1, w->vt.scr.cur_col + 1);
+                (void)write(w->pty.master, reply, (size_t)rlen);
+            }
+            if (w && !g_scrollback_mode) {
+                render_screen(&g_rs, &w->vt.scr);
+                observer_push();
+            }
+        }
+
         /* PTY masters */
         for (int i = 0; i < MAX_WINDOWS; i++) {
             Window *w = g_wins[i];
@@ -1387,6 +1476,9 @@ int main(int argc, char *argv[])
                     (void)write(w->pty.master, reply, (size_t)rlen);
                 }
                 if (!g_scrollback_mode) {
+#ifdef X11_BACKEND
+                    (void)x11_backend_selection_drop();   /* (the render below repaints) */
+#endif
                     render_screen(&g_rs, &w->vt.scr);
                     observer_push();
                 }

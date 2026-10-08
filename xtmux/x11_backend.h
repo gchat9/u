@@ -38,9 +38,23 @@ void x11_backend_text_fill(int row, Style st);
 void x11_backend_text_at(int row, int col, const char *utf8, int n, Style st);
 void x11_backend_text_end(void);
 
-/* Mouse.  _select says how much pointer traffic the displayed program wants
- * (its Screen's mouse_mode: 0 none .. 3 all motion); _next returns the
- * escape sequence for the next pointer event in the encoding it asked for
- * (mouse_enc), see x11_backend.c.  -1: no more events. */
+/* Mouse and clipboard.  _select says how much pointer traffic is wanted
+ * (the displayed program's mouse_mode, 0 none .. 3 all motion; always at
+ * least 2 while the mouse is also ours for copy and paste).
+ *
+ * _pointer handles the queued pointer events for the program shown in s
+ * (which asked for the mouse as mode/enc, and bracketed paste or not, and
+ * sees rows x cols cells): events for the program, and text pasted, are
+ * passed to send(bytes, n, ctx); the rest is text selection and copy, see
+ * x11_backend.c.  _paste pastes PRIMARY (what a right click does) and
+ * _paste_key says, once, that Shift+Insert or Ctrl+V asked for that.
+ * _selection_drop removes the highlight (nonzero if there
+ * was one to repaint); _pointer_release says that send/ctx is going away. */
 void x11_backend_mouse_select(int level);
-int  x11_backend_mouse_next(int mode, int enc, int rows, int cols, uint8_t *out);
+void x11_backend_pointer(const Screen *s, int mode, int enc, int bracketed,
+                         int rows, int cols,
+                         void (*send)(const uint8_t *, size_t, void *), void *ctx);
+void x11_backend_paste(int bracketed, void (*send)(const uint8_t *, size_t, void *), void *ctx);
+int  x11_backend_paste_key(void);
+int  x11_backend_selection_drop(void);
+void x11_backend_pointer_release(void);

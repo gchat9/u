@@ -40,11 +40,12 @@ static const uint32_t emoji_charset[] = {
     0x1f525, /* 🔥 fire                         */
     0x1f389, /* 🎉 party popper                 */
     0x1f480, /* 💀 skull                        */
-    0x2705,  /* ✅ check mark button             */
-    0x274c,  /* ❌ cross mark                    */
-    0x2b50,  /* ⭐ star                          */
-    0x1f4af, /* 💯 hundred points                */
-    0x1f680, /* 🚀 rocket                        */
+    0x26a1,  /* ⚡ HIGH VOLTAGE SIGN            */
+    0x2705,  /* ✅ check mark button            */
+    0x274c,  /* ❌ cross mark                   */
+    0x2b50,  /* ⭐ star                         */
+    0x1f4af, /* 💯 hundred points               */
+    0x1f680, /* 🚀 rocket                       */
 };
 #define EMOJI_COUNT ((int)(sizeof(emoji_charset) / sizeof(emoji_charset[0])))
 
