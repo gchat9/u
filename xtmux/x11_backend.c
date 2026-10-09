@@ -97,19 +97,25 @@ static int wide_glyph(uint32_t wch, int right, uint8_t *attr)
     return g;
 }
 
-/* The text selection, if any: its two ends (row << 16 | col, in either
- * order) as set by the mouse, see "Selection and clipboard" below.
- * sel_on: it is drawn (in reverse video); sel_drag: the drag that is
- * making it is still going. */
-static uint8_t  sel_on, sel_drag;
-static unsigned sel_a, sel_b;
+/* The text selection, if any: where the mouse went down (sel_a) and where
+ * it is now (sel_b), as row << 16 | col, see "Selection and clipboard"
+ * below.  sel_mode says what they select (SM_*); sel_lo..sel_hi is the
+ * cells that makes, worked out by sel_calc when either end moves: in
+ * reading order, or for SM_RECT the corners of a rectangle.  sel_on: it is
+ * drawn (in reverse video); sel_drag: the drag that is making it is still
+ * going. */
+enum { SM_CHAR, SM_RECT, SM_WORD, SM_LINE };
+static uint8_t  sel_on, sel_drag, sel_mode;
+static unsigned sel_a, sel_b, sel_lo, sel_hi;
 #define SEL_KEY(r, c) ((unsigned)(r) << 16 | (unsigned)(c))
 
 static int sel_hit(int r, int c)
 {
     unsigned k = SEL_KEY(r, c);
-    unsigned lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
-    return k >= lo && k <= hi;
+    if (sel_mode == SM_RECT)
+        return (unsigned)r >= sel_lo >> 16 && (unsigned)r <= sel_hi >> 16 &&
+               (unsigned)c >= (sel_lo & 0xFFFF) && (unsigned)c <= (sel_hi & 0xFFFF);
+    return k >= sel_lo && k <= sel_hi;
 }
 
 void x11_backend_render(const Screen *s)
@@ -424,7 +430,9 @@ static int mouse_encode(const XtermMouse *mp, int mode, int enc, int rows, int c
  * Mouse policy: while the displayed program has not asked for the mouse
  * (mode 0), or MOUSE_SELECT_MOD (config.h) is held when a button goes
  * down, the mouse belongs to us -- left drag selects text and copies it to
- * PRIMARY and CLIPBOARD, a right click pastes PRIMARY.  Otherwise the
+ * PRIMARY and CLIPBOARD (double click: a word, triple click: a line, and
+ * dragging after either extends it by words or lines; Alt held: the
+ * rectangle between the two ends), a right click pastes PRIMARY.  Otherwise the
  * events are passed to the program.  Which of the two it is is decided
  * when a button goes down and holds until it comes up again. */
 
@@ -451,23 +459,60 @@ static int utf8_encode(uint8_t *o, uint32_t cp)
     return 4;
 }
 
-/* The selected text, in reading order, from s: trailing blanks of each
- * line dropped, a newline between lines unless the line wrapped.  malloc'd,
- * *len bytes (not terminated); NULL if there is nothing. */
-static char *sel_extract(const Screen *s, size_t *len)
+/* Is the cell at (r, c) of s blank (a space or empty), as opposed to part
+ * of a word?  The second half of a wide character is not blank. */
+static int blank(const Screen *s, int r, int c)
+{
+    const Cell *x = &s->cells[r][c];
+    return (!x->ch || x->ch == ' ') && !(x->flags & CELL_WIDE_CONT);
+}
+
+/* The end of the word at key k, d = -1 for its start, 1 for its end: a word
+ * is a run of cells that are all blank or all not, within the row. */
+static unsigned word_edge(const Screen *s, unsigned k, int d)
+{
+    int r = (int)(k >> 16), c = (int)(k & 0xFFFF);
+    if (r >= s->rows || c >= s->cols) return k;
+    int t = blank(s, r, c);
+    while (c + d >= 0 && c + d < s->cols && blank(s, r, c + d) == t) c += d;
+    return SEL_KEY(r, c);
+}
+
+/* Set sel_lo/sel_hi from sel_a, sel_b and sel_mode. */
+static void sel_calc(const Screen *s)
 {
     unsigned lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
-    int r0 = (int)(lo >> 16), c0 = (int)(lo & 0xFFFF);
-    int r1 = (int)(hi >> 16), c1 = (int)(hi & 0xFFFF);
+    if (sel_mode == SM_RECT) {
+        unsigned ra = sel_a >> 16, rb = sel_b >> 16, ca = sel_a & 0xFFFF, cb = sel_b & 0xFFFF;
+        lo = SEL_KEY(ra < rb ? ra : rb, ca < cb ? ca : cb);
+        hi = SEL_KEY(ra < rb ? rb : ra, ca < cb ? cb : ca);
+    } else if (sel_mode == SM_WORD) {
+        lo = word_edge(s, lo, -1); hi = word_edge(s, hi, 1);
+    } else if (sel_mode == SM_LINE) {
+        lo &= ~0xFFFFu; hi |= 0xFFFF;               /* (clamped to the width below) */
+    }
+    sel_lo = lo; sel_hi = hi;
+    sel_on = sel_mode >= SM_WORD || sel_a != sel_b;
+}
+
+/* The selected text (sel_lo..sel_hi) from s: in reading order, or by rows
+ * of the rectangle; trailing blanks of each line dropped, a newline between
+ * lines unless the line wrapped.  malloc'd, *len bytes (not terminated);
+ * NULL if there is nothing. */
+static char *sel_extract(const Screen *s, size_t *len)
+{
+    int rect = sel_mode == SM_RECT;
+    int r0 = (int)(sel_lo >> 16), c0 = (int)(sel_lo & 0xFFFF);
+    int r1 = (int)(sel_hi >> 16), c1 = (int)(sel_hi & 0xFFFF);
     if (r1 >= s->rows) { r1 = s->rows - 1; c1 = s->cols - 1; }
     if (r0 > r1) return NULL;
     char *buf = malloc((size_t)(r1 - r0 + 1) * ((size_t)s->cols * 4 + 1) + 1);
     if (!buf) return NULL;
     size_t n = 0;
     for (int r = r0; r <= r1; r++) {
-        int a = r == r0 ? c0 : 0, b = r == r1 ? c1 : s->cols - 1;
+        int a = rect || r == r0 ? c0 : 0, b = rect || r == r1 ? c1 : s->cols - 1;
         if (b >= s->cols) b = s->cols - 1;
-        int wrapped = r < r1 && s->row_flags && (s->row_flags[r] & ROW_WRAPPED);
+        int wrapped = !rect && r < r1 && s->row_flags && (s->row_flags[r] & ROW_WRAPPED);
         if (!wrapped)
             while (b >= a && (s->cells[r][b].ch == 0 || s->cells[r][b].ch == ' ')) b--;
         for (int c = a; c <= b; c++) {
@@ -559,14 +604,20 @@ void x11_backend_pointer(const Screen *s, int mode, int enc, int bracketed,
             if (sel_on) { sel_on = 0; redraw = 1; }
             grab = (mode && !forced) ? 1 : 2; grab_btn = m.button;
             if (grab == 2) {
-                if (m.button == 1) { sel_a = sel_b = SEL_KEY(m.row, m.col); sel_drag = 1; }
+                if (m.button == 1) {
+                    sel_a = sel_b = SEL_KEY(m.row, m.col); sel_drag = 1;
+                    sel_mode = (m.mods & 8) && !(MOUSE_SELECT_MOD & 8) ? SM_RECT :
+                               m.clicks == 2 ? SM_WORD : m.clicks == 3 ? SM_LINE : SM_CHAR;
+                    sel_calc(s);                    /* a double or triple click selects now */
+                    redraw |= sel_on;
+                }
                 else if (m.button == 3) x11_backend_paste(bracketed, send, ctx);
             }
             pass = grab == 1;
         } else if (grab == 2) {                 /* our gesture: motion and the release */
             if (sel_drag && m.kind != 0) {
                 int r = m.row < rows ? m.row : rows - 1, c = m.col < cols ? m.col : cols - 1;
-                if (SEL_KEY(r, c) != sel_b) { sel_b = SEL_KEY(r, c); sel_on = sel_a != sel_b; redraw = 1; }
+                if (SEL_KEY(r, c) != sel_b) { sel_b = SEL_KEY(r, c); sel_calc(s); redraw = 1; }
                 if (m.kind == 1 && m.button == 1) {
                     sel_drag = 0;
                     size_t len;

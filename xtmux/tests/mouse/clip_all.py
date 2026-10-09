@@ -36,7 +36,7 @@ def logger(modes, first="ZZ-marker", env=""):
         time.sleep(.1)
     time.sleep(.5); clear()
 def sgr(cb, c, r, f="M"): return ESC + b"[<%d;%d;%d%s" % (cb, c + 1, r + 1, f.encode())
-tests = sys.argv[1:] or ["copy","policy","paste","serve","observer"]
+tests = sys.argv[1:] or ["copy","select","policy","paste","serve","observer"]
 
 if "copy" in tests:
     print("## copying")
@@ -187,12 +187,14 @@ if "keys" in tests:
     xv, xt = boot()
     logger([])
     own("primary", b"via shortcut")
-    for combo in ("shift+Insert", "ctrl+v", "ctrl+shift+v"):
+    for combo in ("shift+Insert", "ctrl+v"):
         clear(); xdo("key", combo); time.sleep(.6)
         check("%s pastes PRIMARY, and sends nothing else" % combo, log() == b"via shortcut", log())
     clear(); xdo("key", "Insert"); time.sleep(.4)
     check("a plain Insert is still the program's key (ESC [ 2 ~)", log() == ESC + b"[2~", log())
-    clear(); xdo("key", "ctrl+b"); xdo("key", "ctrl+v") if False else None
+    for combo, want in (("ctrl+shift+v", b"\x16"), ("super+ctrl+v", b"\x16"), ("ctrl+alt+v", ESC + b"\x16")):
+        clear(); xdo("key", combo); time.sleep(.5)
+        check("%s is not a paste: the program gets %r" % (combo, want), log() == want, log())
     clear(); xdo("key", "alt+v"); time.sleep(.4)
     check("alt+v is not a paste (ESC v reaches the multiplexer/program as before)", log() != b"via shortcut", log())
     xdo("key", "ctrl+q"); time.sleep(.5)
@@ -214,5 +216,62 @@ if "keys" in tests:
     clear(); own("primary", b"obs shortcut"); xdo("key", "ctrl+v"); time.sleep(.8)
     check("in an observer window too", log() == ESC + b"[200~obs shortcut" + ESC + b"[201~", log())
     p.kill(); done(xv, xt)
+
+def mclick(c, r, n, to=None, mods=()):
+    """n quick presses of button 1 at (c, r); the last is held and, if `to` is given, dragged there first."""
+    for m in mods: xdo("keydown", m)
+    move(c, r)
+    for _ in range(n - 1): xdo("click", "1"); time.sleep(.05)
+    xdo("mousedown", "1")
+    if to: time.sleep(.1); move(*to); time.sleep(.1)
+    xdo("mouseup", "1"); time.sleep(.3)
+    for m in mods: xdo("keyup", m)
+    time.sleep(.1)
+
+if "select" in tests:
+    print("## double / triple click, rectangle")
+    xv, xt = boot()
+    xdo("type", "clear; printf 'foo bar-baz  qux\\nsecond line here\\nthird\\n'"); xdo("key","Return"); time.sleep(.8)
+    own("primary", b"sentinel"); mclick(6, 0, 2)
+    check("double click selects a word (non-blanks)", xc("primary") == b"bar-baz", xc("primary"))
+    check("...and copies it to CLIPBOARD too", xc("clipboard") == b"bar-baz", xc("clipboard"))
+    mclick(0, 0, 2);  check("word at the left edge", xc("primary") == b"foo", xc("primary"))
+    mclick(14, 0, 2); check("word before trailing blanks", xc("primary") == b"qux", xc("primary"))
+    mclick(14, 1, 2); check("last word of a line", xc("primary") == b"here", xc("primary"))
+    mclick(1, 0, 2, to=(2, 1))
+    check("double click + drag: both ends snap to words", xc("primary") == b"foo bar-baz  qux\nsecond", xc("primary"))
+    mclick(8, 1, 2, to=(5, 0))
+    check("...dragging backwards", xc("primary") == b"bar-baz  qux\nsecond line", xc("primary"))
+    mclick(3, 1, 3)
+    check("triple click selects the whole line", xc("primary") == b"second line here", xc("primary"))
+    mclick(3, 1, 3, to=(1, 2))
+    check("triple click + drag: whole lines", xc("primary") == b"second line here\nthird", xc("primary"))
+    mclick(3, 1, 3, to=(1, 0))
+    check("...upwards", xc("primary") == b"foo bar-baz  qux\nsecond line here", xc("primary"))
+    own("primary", b"sentinel-P"); click(0, 0); time.sleep(.6); click(0, 0)
+    check("two slow clicks are not a double click", xc("primary") == b"sentinel-P", xc("primary"))
+    time.sleep(.6); click(0, 0); click(8, 0)
+    check("clicks in different cells are not a double click", xc("primary") == b"sentinel-P", xc("primary"))
+    xdo("type", "clear; printf 'abcdefgh\\nijklmnop\\nqrstuvwx\\n'"); xdo("key","Return"); time.sleep(.8)
+    drag(2,0, 4,2, mod="alt")
+    check("alt+drag selects a rectangle", xc("primary") == b"cde\nklm\nstu", xc("primary"))
+    drag(4,2, 2,0, mod="alt")
+    check("...from the other corner", xc("primary") == b"cde\nklm\nstu", xc("primary"))
+    drag(4,0, 2,2, mod="alt")
+    check("...and the other diagonal", xc("primary") == b"cde\nklm\nstu", xc("primary"))
+    drag(2,0, 4,2)
+    check("without alt it flows with the text", xc("primary") == b"cdefgh\nijklmnop\nqrstu", xc("primary"))
+    done(xv, xt)
+    xv, xt = boot()
+    logger(["1000", "1006"])
+    own("primary", b"sentinel-P")
+    drag(2,1, 6,1, mod="alt"); time.sleep(.3)
+    check("alt+drag in a program that wants the mouse goes to the program", xc("primary") == b"sentinel-P" and log() != b"", log())
+    xdo("key", "ctrl+q"); time.sleep(.5)
+    xdo("type", "clear; printf 'abcdefgh\\nijklmnop\\nqrstuvwx\\n'"); xdo("key","Return"); time.sleep(.8)
+    logger(["1000", "1006"], first="abcdefgh\\nijklmnop\\nqrstuvwx")
+    xdo("keydown", "shift"); drag(2,0, 4,2, mod="alt"); xdo("keyup", "shift"); time.sleep(.3)
+    check("shift+alt+drag (Shift forces copy/paste) selects a rectangle there too", xc("primary") == b"cde\nklm\nstu", xc("primary"))
+    done(xv, xt)
 
 print("\nSUMMARY: %d/%d passed" % (sum(results), len(results)))

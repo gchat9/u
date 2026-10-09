@@ -24,11 +24,13 @@ mouse_all.py groups
 
 clip_all.py groups
   copy      drag copies to PRIMARY+CLIPBOARD; wrapped lines, trimming, Unicode; highlight lifecycle
+  select    double click (word), triple click (line), dragging after either, alt+drag (rectangle); what is not a
+            multi-click (slow, other cell)
   policy    who gets the mouse: the program, or copy/paste (Shift override)
   paste     right click pastes: newline conversion, sanitising, bracketed paste, large pastes
   serve     TARGETS / UTF8_STRING to other clients; losing ownership
   observer  copy and paste in an observer window (K packets)
   slow      pastes into a slow reader: xtmux main, an observer window, and plain tmux
-  keys      paste shortcuts: Shift+Insert, Ctrl+V (and that the plain keys still reach the program)
+  keys      paste shortcuts: Shift+Insert, Ctrl+V on its own (with Shift/Alt/Super the key goes to the program)
   interop   xsel / xclip both ways, TARGETS, WM_PROTOCOLS (needs xsel too)
 Also runnable by hand: python3 /path/to/xterm-mouse-reporter.py inside xtmux.

@@ -293,10 +293,12 @@ static void push_str(const char *s) { while (*s) key_push((uint8_t)*s++); }
  * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to
  * their Unicode code points, so ks doubles as the code point here with
  * no translation table needed. */
-/* Paste shortcuts: Shift+Insert, and Ctrl+V (also with Shift).  They are
- * not typed to the program; the application is told (xterm_paste_key) and
- * pastes as it does for the mouse.  Compile with -DXTERM_PASTE_CTRL_V=0 to
- * leave Ctrl+V to the program (vim's literal-next, for one). */
+/* Paste shortcuts: Shift+Insert, and Ctrl+V with no other modifier (not
+ * Shift, Alt, Super...: those reach the program, as plain Ctrl+V if
+ * nothing else is bound to them).  They are not typed to the program; the
+ * application is told (xterm_paste_key) and pastes as it does for the
+ * mouse.  Compile with -DXTERM_PASTE_CTRL_V=0 to leave Ctrl+V to the
+ * program (vim's literal-next, for one). */
 #ifndef XTERM_PASTE_CTRL_V
 #define XTERM_PASTE_CTRL_V 1
 #endif
@@ -327,7 +329,8 @@ static void handle_keypress(const uint8_t *ev)
     int insert = ks == 0xFF63 ||
                  (shift && keysym_for(keycode, altgr ? 2 : 0) == 0xFF63);
     if ((shift && !ctrl && !alt && insert) ||                              /* Shift+Insert */
-        (XTERM_PASTE_CTRL_V && ctrl && !alt && (ks == 'v' || ks == 'V'))) { /* Ctrl+V */
+        (XTERM_PASTE_CTRL_V && ctrl && !(state & 0xE9) &&   /* Ctrl+V, and of the other modifier bits */
+         (ks == 'v' || ks == 'V'))) {                       /* only CapsLock/NumLock (0x02, 0x10) */
         paste_key = 1;
         return;
     }
@@ -1043,6 +1046,15 @@ static XtermMouse mouse_queue[MOUSE_QUEUE_CAP];
 static uint8_t    mouse_head, mouse_tail, mouse_level;
 static int        mouse_last_col = -1, mouse_last_row = -1;
 
+/* Multi-click detection: a press of the same button in the same cell as
+ * the last one, within this many ms (X server time), counts on: 1, 2, 3,
+ * then 1 again. */
+#ifndef XTERM_MULTICLICK_MS
+#define XTERM_MULTICLICK_MS 400
+#endif
+static uint32_t   click_t, click_cell;
+static uint8_t    click_n, click_btn;
+
 void xterm_mouse_select(int level)
 {
     if (level < 0) level = 0;
@@ -1081,6 +1093,15 @@ static void mouse_event(int etype, const uint8_t *ev)
     m.kind = (uint8_t)(etype - 4);
     m.col  = (uint16_t)col; m.row = (uint16_t)row;
     m.mods = (uint8_t)((st & 1 ? 4 : 0) | (st & 8 ? 8 : 0) | (st & 4 ? 16 : 0));
+    m.clicks = 0;
+    if (etype == 4 && ev[1] < 4) {
+        uint32_t t, cell = (uint32_t)row << 16 | (uint32_t)col;
+        memcpy(&t, ev + 4, 4);
+        click_n = click_n && click_btn == ev[1] && cell == click_cell &&
+                  t - click_t < XTERM_MULTICLICK_MS ? click_n % 3 + 1 : 1;
+        click_t = t; click_cell = cell; click_btn = ev[1];
+        m.clicks = click_n;
+    }
     if (etype == 6) {
         /* Report motion only when it enters another cell. */
         if (col == mouse_last_col && row == mouse_last_row) return;

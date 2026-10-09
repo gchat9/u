@@ -66,6 +66,9 @@ typedef struct {
                           left/right; for motion, the button held (0 none) */
     uint8_t  mods;     /* xterm's bits: 4 shift, 8 alt, 16 control         */
     uint16_t col, row;
+    uint8_t  clicks;   /* for a press of buttons 1-3: 1, 2 or 3 for a single,
+                          double or triple click (same button and cell,
+                          in quick succession); else 0                      */
 } XtermMouse;
 
 void xterm_mouse_select(int level);

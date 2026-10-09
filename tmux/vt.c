@@ -687,15 +687,22 @@ static void dispatch_csi(VTParser *p, char final)
                 clear_row_range(s, s->cells[start_row], start_col, s->cols - 1);
                 for (int r = start_row + 1; r < s->rows; r++)
                     clear_row_range(s, s->cells[r], 0, s->cols - 1);
+                /* Rows erased whole are no longer wrapped lines (as for EL). */
+                if (s->row_flags) {
+                    int f = start_row + (start_col > 0);
+                    memset(s->row_flags + f, 0, (size_t)(s->rows - f));
+                }
             } else if (m == 1) {
                 /* erase from top to cursor */
                 for (int r = 0; r < s->cur_row; r++)
                     clear_row_range(s, s->cells[r], 0, s->cols - 1);
                 clear_row_range(s, s->cells[s->cur_row], 0, s->cur_col);
+                if (s->row_flags) memset(s->row_flags, 0, (size_t)s->cur_row);
             } else if (m == 3) {
                 /* erase scrollback – same as 2 for our purposes */
                 for (int r = 0; r < s->rows; r++)
                     clear_row_range(s, s->cells[r], 0, s->cols - 1);
+                if (s->row_flags) memset(s->row_flags, 0, (size_t)s->rows);
             }
             break;
         }

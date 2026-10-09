@@ -24,7 +24,10 @@
 
 /* Copy and paste with the mouse (xtmux): drag with the left button to
  * select text and copy it to PRIMARY and CLIPBOARD, click the right button
- * to paste PRIMARY.  When a program has asked for the mouse these go to it
+ * to paste PRIMARY.  Double-click selects a word, triple-click a line, and
+ * dragging after either extends the selection by words or lines; Alt+drag
+ * selects a rectangle (with Alt as MOUSE_SELECT_MOD below, that is not
+ * available).  When a program has asked for the mouse these go to it
  * instead -- unless this modifier is held, which keeps the mouse for
  * copy and paste: 4 Shift, 8 Alt, 16 Control (add them to need several);
  * 0 leaves the mouse to the program for good. */
