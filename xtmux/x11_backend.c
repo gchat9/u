@@ -76,11 +76,17 @@ static inline int glyph_slot(uint32_t ch)
 }
 
 /* Glyph slot and attribute for one half of a double-width character:
- * a fullwidth form draws its narrow twin's glyph spread over two cells,
- * anything else is an emoji (index 255, a placeholder box, if we have
+ * one with a bitmap of its own in the font's wide glyphs (ツ), a
+ * fullwidth form drawing its narrow twin's glyph spread over two cells,
+ * or anything else is an emoji (index 255, a placeholder box, if we have
  * no bitmap for it).  `right` selects the right-hand cell. */
 static int wide_glyph(uint32_t wch, int right, uint8_t *attr)
 {
+    int ws = charset_wide_slot(wch);
+    if (ws >= 0) {
+        *attr = (right ? XTERM_ATTR_FW_R : XTERM_ATTR_FW_L) | XTERM_ATTR_WIDE;
+        return ws;
+    }
     uint32_t twin = charset_fullwidth_alias(wch);
     if (twin) {
         *attr = right ? XTERM_ATTR_FW_R : XTERM_ATTR_FW_L;
@@ -123,8 +129,9 @@ void x11_backend_render(const Screen *s)
             int i = r * cols + c;
             /* A wide cell is a CELL_WIDE cell plus a CELL_WIDE_CONT cell
              * (see vt.c put_char), drawn as two halves of one thing: an
-             * emoji, or a fullwidth punctuation mark standing in for its
-             * ASCII twin's glyph. Both halves store the same glyph byte
+             * emoji, a glyph with a two-cell bitmap of its own, or a
+             * fullwidth punctuation mark standing in for its ASCII
+             * twin's glyph. Both halves store the same glyph byte
              * and flag which half they are. A wide character with
              * neither a bitmap nor an ASCII twin gets emoji index 255,
              * which xterm draws as a two-cell placeholder box. A
@@ -263,7 +270,7 @@ static uint32_t next_char(const char **p, const char *end, int *width)
     if (len > end - *p) len = 1, cp = u[0];
     for (int k = 1; k < len; k++) cp = cp << 6 | (u[k] & 0x3F);
     *p += len;
-    *width = (cp >= 0x231A && (emoji_wide(cp) || charset_fullwidth(cp))) ? 2 : 1;
+    *width = (cp >= 0x1100 && (emoji_wide(cp) || charset_wide(cp))) ? 2 : 1;
     if (cp == 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F) ||
         (cp >= 0x200B && cp <= 0x200F)) return 0;
     return cp;

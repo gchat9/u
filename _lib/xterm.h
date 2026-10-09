@@ -29,6 +29,11 @@ uint8_t *xterm_bg_buffer(void);
  * the two cells (fullwidth punctuation, see charset.h). */
 #define XTERM_ATTR_FW_L      0x20
 #define XTERM_ATTR_FW_R      0x40
+/* Modifier on FW_L/FW_R: the glyph byte is not a narrow glyph slot but
+ * an index into the font's wide glyphs (charset.h's wide slots), and the
+ * cell draws the left or right half of that two-cell-wide bitmap rather
+ * than a centred narrow glyph. */
+#define XTERM_ATTR_WIDE      0x80
 uint8_t *xterm_attr_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);

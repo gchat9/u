@@ -404,14 +404,15 @@ static void handle_keypress(const uint8_t *ev)
  * BFNT font
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define FONT_MAX       (128 * 1024)
+#define FONT_MAX       (256 * 1024)   /* keep equal to _font/mkfont.c's */
 #define GRID_MAX_CELLS (32 * 1024)
 #define SETUP_MAX      (8 * 1024)
 
 static uint8_t  *mmap_base;
 static size_t    mmap_size;
-static uint16_t  cell_w, cell_h, baseline, first_cp, num_glyphs;
+static uint16_t  cell_w, cell_h, baseline, first_cp, num_glyphs, num_wide;
 static uint8_t  *glyph_data;
+static uint8_t  *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
 static int       WIN_W, WIN_H, cols, rows;
 static int       cfg_w, cfg_h;    /* window size as last reported by the server */
 
@@ -432,9 +433,11 @@ static void font_load(const char *path)
     memcpy(&baseline,   mmap_base+ 8, 2);
     memcpy(&first_cp,   mmap_base+10, 2);
     memcpy(&num_glyphs, mmap_base+12, 2);
-    size_t glyph_bytes = (size_t)cell_w * cell_h * num_glyphs;
+    memcpy(&num_wide,   mmap_base+14, 2);     /* 0 in a file without wide glyphs */
+    size_t glyph_bytes = (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
     if (glyph_bytes > FONT_MAX - 16) die("font is too large\n");
     glyph_data = mmap_base + 16;
+    wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
 }
 
 /* emoji.bfnt (see _font/mkemoji.c): optional -- if it's missing or doesn't
@@ -568,6 +571,8 @@ static void fill_row(int r, uint32_t color, uint8_t depth)
 
 /* Paint the whole cell from a glyph's coverage bitmap through lut[].
  * Cell column x shows glyph column x - sh (blank outside the glyph).
+ * `stride` is the bitmap's row length: cell_w for a narrow glyph, or
+ * 2*cell_w for a wide one (g then points at the column the cell shows).
  * Written out per pixel size (GLYPH_ROW) so the depth test is per row,
  * not per pixel. */
 #define GLYPH_ROW(T)                                                   \
@@ -579,9 +584,9 @@ static void fill_row(int r, uint32_t color, uint8_t depth)
         ((T *)line)[x] = (T)p;                                         \
     }
 __attribute__((optimize("O2"))) /* the hot loop: -Os costs ~30% here */
-static void draw_glyph(const uint8_t *g, int sh, uint8_t depth)
+static void draw_glyph(const uint8_t *g, int stride, int sh, uint8_t depth)
 {
-    for (int y = 0; y < cell_h; y++, g += cell_w) {
+    for (int y = 0; y < cell_h; y++, g += stride) {
         uint8_t *line = cell_buf + (size_t)y * cell_stride;
         if (depth == 16) { GLYPH_ROW(uint16_t) }
         else             { GLYPH_ROW(uint32_t) }
@@ -656,8 +661,15 @@ static void render_cell(int row, int col, uint8_t depth)
      * drawn over a plain background, which is what glyph slot 0 gives:
      * it is the space, see charset.h, so its coverage is all zero. */
     const uint8_t *g = glyph_data;
-    int sh = 0;
-    if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) &&
+    int sh = 0, stride = cell_w;
+    if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) && (rattrs & XTERM_ATTR_WIDE)) {
+        /* A wide glyph: this cell's half of a two-cell bitmap. An index
+         * past the font's wide glyphs leaves g on slot 0, a blank. */
+        if (cp < num_wide) {
+            g = wide_data + (size_t)cp * 2 * cell_w * cell_h + (size_t)half * cell_w;
+            stride = 2 * cell_w;
+        }
+    } else if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) &&
         cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
         g += (size_t)(cp-first_cp)*cell_w*cell_h;
         /* A fullwidth character reuses its narrow twin's glyph, centred
@@ -666,7 +678,7 @@ static void render_cell(int row, int col, uint8_t depth)
          * remainder). Ordinary cells: sh = 0, every column in range. */
         if (is_fw) sh = cell_w / 2 - half * cell_w;
     }
-    draw_glyph(g, sh, depth);
+    draw_glyph(g, stride, sh, depth);
     if (is_emoji)
         draw_emoji(cp, half, fg, depth);
     else if (rattrs & XTERM_ATTR_MISSING)

@@ -441,17 +441,17 @@ static void put_char(VTParser *p, uint32_t ch)
      * whenever no UTF-8 locale is configured -- confirmed to misbehave
      * that way in practice, and not a safe assumption for a minimal
      * target system. The emoji blocks (see emoji_charset.h) and the
-     * fullwidth forms (see charset.h) are double-width whether or not
-     * we can draw that particular one; everything else is 1. (Other wide scripts, e.g. CJK, would
-     * extend this same lookup.) Whether a codepoint can actually be
-     * drawn is decided separately, at render time. The >= 0x231A guard
-     * keeps the table scan off the hot path for all ordinary text. */
+     * fullwidth forms and CJK (see charset.h) are double-width whether or
+     * not we can draw that particular one; everything else is 1. Whether
+     * a codepoint can actually be drawn is decided separately, at render
+     * time. The >= 0x1100 guard keeps the table scans off the hot path
+     * for all ordinary text. */
     if (ch == 0x200D || (ch >= 0xFE00 && ch <= 0xFE0F) ||
         (ch >= 0x200B && ch <= 0x200F))
         return;  /* zero-width (ZWJ, variation selectors, ...): wcwidth() says 0, and
                   * readline believes it, so taking a cell for one would put the
                   * screen out of step with the line being edited */
-    int width = (ch >= 0x231A && (emoji_wide(ch) || charset_fullwidth(ch))) ? 2 : 1;
+    int width = (ch >= 0x1100 && (emoji_wide(ch) || charset_wide(ch))) ? 2 : 1;
 
     /* Handle pending wrap: wrap to next line before placing char */
     if (s->pending_wrap) {

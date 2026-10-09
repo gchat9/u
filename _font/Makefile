@@ -14,14 +14,17 @@
 #   make distclean   clean, plus the downloaded stb_*.h and generated *.bfnt
 #
 # Inputs from outside the repo: a monospace TTF (TTF=..., default DejaVu
-# Sans Mono; Debian/Ubuntu: fonts-dejavu-core) and, on first use, network
-# access for stb_*.h. The stb headers are pinned to one commit and then
+# Sans Mono; Debian/Ubuntu: fonts-dejavu-core), a TTF/TTC for the
+# double-width glyphs (WTTF=..., default Noto Sans CJK; Debian/Ubuntu:
+# fonts-noto-cjk) and, on first use, network access for stb_*.h. The stb
+# headers are pinned to one commit and then
 # simply kept: make treats the local file as up to date, so nothing is
 # re-downloaded until `make distclean`.
 
 HOSTCC  ?= cc
 CFLAGS  ?= -O2
 TTF     ?= /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+WTTF    ?= /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 FONTDIR ?= /etc
 
 STB_REF ?= 2c980bb59875b0d32144a71867fbdebb2f77cd20
@@ -32,8 +35,8 @@ all: font.bfnt emoji.bfnt
 
 # mkfont/mkemoji write font.bfnt/emoji.bfnt into the current directory;
 # mkemoji also reads font.bfnt (for the cell size), hence that dependency.
-font.bfnt: mkfont $(TTF)
-	./mkfont $(TTF)
+font.bfnt: mkfont $(TTF) $(WTTF)
+	./mkfont $(TTF) $(WTTF)
 
 emoji.bfnt: mkemoji font.bfnt $(wildcard emoji_src/*.png)
 	./mkemoji
@@ -49,6 +52,9 @@ $(STB):
 
 $(TTF):
 	@echo "$@: not found. Install a monospace TTF (e.g. fonts-dejavu-core) or pass TTF=/path/to/font.ttf" >&2; false
+
+$(WTTF):
+	@echo "$@: not found. Install a font with the wide glyphs (e.g. fonts-noto-cjk) or pass WTTF=/path/to/font.ttc" >&2; false
 
 install: all
 	install -d $(DESTDIR)$(FONTDIR)
