@@ -1365,7 +1365,14 @@ static void scr_resize(Screen *s, int new_rows, int new_cols)
         s->rows = new_rows;
         s->cols = new_cols;
         s->scroll_bottom = new_rows - 1;
+        /* This branch returns, so it must clamp everything that the default
+         * path below clamps.  The saved row is the one that was missing: the
+         * eviction only subtracts from it, so it can still lie below the new
+         * bottom.  A later ESC 8 (restore cursor) then used it as a row index
+         * into a grid with fewer rows: a heap read out of bounds in put_char(). */
+        if (s->cur_row       >= new_rows) { s->cur_row = new_rows - 1; s->pending_wrap = false; }
         if (s->cur_col       >= new_cols) { s->cur_col = new_cols - 1; s->pending_wrap = false; }
+        if (s->saved_row     >= new_rows)   s->saved_row     = new_rows - 1;
         if (s->saved_col     >= new_cols)   s->saved_col     = new_cols - 1;
         if (s->alt_saved_row >= new_rows)   s->alt_saved_row = new_rows - 1;
         if (s->alt_saved_col >= new_cols)   s->alt_saved_col = new_cols - 1;

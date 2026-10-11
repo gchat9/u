@@ -20,6 +20,7 @@
 #endif
 
 #include "xterm.h"
+#include "xterm_conf.h"
 
 /* Ugly workaround for xtmux that uses both dietlibc and _sys/ buildsystem */
 #ifdef X11_BACKEND
@@ -419,15 +420,37 @@ static uint8_t  *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after t
 static int       WIN_W, WIN_H, cols, rows;
 static int       cfg_w, cfg_h;    /* window size as last reported by the server */
 
+/* The length of the file, read through (the syscall layer has no fstat or
+ * lseek on every architecture).  At most `limit`: longer is the same to us,
+ * as nothing past the mapping is read.  The mapping itself is taken from
+ * offset 0, so the descriptor's position does not matter afterwards. */
+static size_t file_length(int fd, size_t limit)
+{
+    uint8_t tmp[1024];
+    size_t total = 0;
+    for (;;) {
+        long r = read(fd, tmp, sizeof tmp);
+        if (r == -EINTR) continue;
+        if (r <= 0) return total;               /* end of file, or an error: short, and refused below */
+        total += (size_t)r;
+        if (total >= limit) return limit;
+    }
+}
+
 static void font_load(const char *path)
 {
     int fd = (int)open(path, O_RDONLY, 0);
     if (fd < 0) die("could not open font\n");
+    /* The mapping is FONT_MAX bytes whatever the file holds, and a read past
+     * the file's end is SIGBUS: so what the header claims is checked against
+     * the file's real size before any of it is read. */
+    size_t fsize = file_length(fd, FONT_MAX);
+    if (fsize < 16) { close(fd); die("invalid BFNT font: the file is too short\n"); }
     mmap_base = mmap(0, FONT_MAX, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mmap_base == MAP_FAILED) die("could not map font\n");
     mmap_size = FONT_MAX;
-    if (mmap_size < 16 || mmap_base[0] != 'B' || mmap_base[1] != 'F' ||
+    if (mmap_base[0] != 'B' || mmap_base[1] != 'F' ||
         mmap_base[2] != 'N' || mmap_base[3] != 'T') {
         die("invalid BFNT font\n");
     }
@@ -437,8 +460,11 @@ static void font_load(const char *path)
     memcpy(&first_cp,   mmap_base+10, 2);
     memcpy(&num_glyphs, mmap_base+12, 2);
     memcpy(&num_wide,   mmap_base+14, 2);     /* 0 in a file without wide glyphs */
+    if (cell_w == 0 || cell_h == 0) die("invalid BFNT font: empty cell\n");
     size_t glyph_bytes = (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
     if (glyph_bytes > FONT_MAX - 16) die("font is too large\n");
+    if (16 + glyph_bytes > fsize)
+        die("invalid BFNT font: the file is shorter than its header says\n");
     glyph_data = mmap_base + 16;
     wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
 }
@@ -455,6 +481,8 @@ static void emoji_load(const char *path)
 {
     int fd = (int)open(path, O_RDONLY, 0);
     if (fd < 0) return;
+    size_t fsize = file_length(fd, EMOJI_MAX);   /* as font_load: nothing is read past the end */
+    if (fsize < 12) { close(fd); return; }
     uint8_t *m = mmap(0, EMOJI_MAX, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return;
@@ -462,7 +490,8 @@ static void emoji_load(const char *path)
     memcpy(&w, m + 4, 2); memcpy(&h, m + 6, 2); memcpy(&n, m + 8, 2);
     size_t rec = 45 + ((size_t)w * 2 * h + 1) / 2;
     if (m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != 'J' ||
-        w != cell_w || h != cell_h || 12 + (size_t)n * rec > EMOJI_MAX)
+        w != cell_w || h != cell_h || 12 + (size_t)n * rec > EMOJI_MAX ||
+        12 + (size_t)n * rec > fsize)
         return;
     emoji_data = m; emoji_count = n; emoji_rec = rec;
 }
@@ -830,7 +859,7 @@ static int close_requested;
 /* WM_NAME (STRING, format 8) — bare-minimum window title. */
 void xterm_set_title(const char *name, int len)
 {
-    uint8_t buf[24 + 256];
+    uint8_t buf[24 + 256] = {0};     /* the padding after the name goes to the server: no stale bytes */
     if ((size_t)len > sizeof buf - 24) len = sizeof buf - 24; /* generous cap */
     uint16_t reqlen = (uint16_t)(6 + ((len + 3) / 4));
     uint32_t nlen = (uint32_t)len;
@@ -924,12 +953,17 @@ int xterm_init(void)
     size_t setup_size = (size_t)alen * 4;
     if (setup_size > sizeof setup_storage) die("X11 setup reply is too large\n");
     uint8_t *d = setup_storage; xread(d, setup_size);
+    if (setup_size < 32) die("X11 setup reply is malformed\n");
     memcpy(&xid_base, d+4, 4); memcpy(&xid_mask, d+8, 4);
     uint16_t vlen; memcpy(&vlen, d+16, 2);
     uint16_t max_request_words; memcpy(&max_request_words, d+18, 2);
     if (max_request_words > 6) x_max_request_words = max_request_words;
     uint8_t nfmt = d[21];
     size_t soff = 32 + ((vlen+3u)&~3u) + (size_t)nfmt*8;
+    /* The first screen's fields (up to the root depth at +38) must lie inside
+     * the reply: a vendor string or format list longer than the reply says is
+     * refused, not read past. */
+    if (soff + 40 > setup_size) die("X11 setup reply is malformed\n");
     uint32_t root_win; memcpy(&root_win, d+soff, 4);
     uint32_t black_px; memcpy(&black_px, d+soff+12, 4);
     uint16_t screen_w; memcpy(&screen_w, d+soff+20, 2);
@@ -1254,6 +1288,16 @@ static void fetch_paste(void (*cb)(const uint8_t *, size_t, void *), void *ctx)
 static void handle_event(const uint8_t *ev)
 {
     uint8_t etype = ev[0] & 0x7f;
+    /* Bit 7 marks an event that another client sent with XSendEvent.  The
+     * server delivers those to us like any other, so a program on the
+     * display could type into the session, or press buttons in it, with no
+     * input from the user.  Keys and buttons from such events are dropped,
+     * as xterm does by default (allowSendEvents).  What a client sends by
+     * protocol and the program depends on is still handled: a
+     * SelectionNotify answering our request, a WM_DELETE_WINDOW from the
+     * window manager, ConfigureNotify. */
+    if ((ev[0] & 0x80) && (etype == 2 || etype == 4 || etype == 5 || etype == 6))
+        return;     /* KeyPress, ButtonPress/Release, MotionNotify */
     if (etype == 12) {
         uint16_t count;
         memcpy(&count, ev + 16, 2);

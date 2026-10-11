@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +45,7 @@
 # endif
 #endif
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -92,6 +94,52 @@
 #define CHAN_MAX_PKT 32768u      /* largest CHANNEL_DATA we ask for: a packet carrying that much
                                   * (plus ~9 bytes of header, padding, ...) stays under MAX_PKT */
 #define WINDOW_SIZE (1u << 20)   /* 1 MiB advertised receive window */
+#define MAX_PRE_BANNER_LINES 1024       /* text lines a server may send before its SSH-2.0 line */
+#define MAX_PRE_BANNER_BYTES 65536
+
+/* The handshake time limit (-o ConnectTimeout=N): from the start of the
+ * connection until the session begins.  A server that stalls at any point
+ * before that -- connect, version, key exchange, authentication -- gets this
+ * long before we give up.  The session itself, once running, is not timed.
+ * The time the user spends on the host key question does not count. */
+#define DEFAULT_CONNECT_TIMEOUT 60              /* seconds; 0: no limit */
+static int       g_connect_timeout = DEFAULT_CONNECT_TIMEOUT;
+static int       g_hs_active;                   /* the handshake is being timed */
+static long long g_hs_deadline_ms;
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static void hs_arm(void) {
+    if (g_connect_timeout <= 0) return;
+    g_hs_active = 1;
+    g_hs_deadline_ms = now_ms() + (long long)g_connect_timeout * 1000;
+}
+static void hs_pause(void)  { g_hs_active = 0; }   /* the user is being asked a question */
+static void hs_resume(void) { hs_arm(); }
+static void hs_done(int fd) {                      /* the session begins: no limit any more */
+    g_hs_active = 0;
+    struct timeval none = { 0, 0 };                /* and no send limit either (see tcp_connect) */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &none, sizeof none);
+}
+
+/* Waits until fd is readable, or the handshake limit is reached (then dies).
+ * Called before every read of the connection; a no-op outside the handshake. */
+static void wait_readable(int fd) {
+    if (!g_hs_active) return;
+    for (;;) {
+        long long left = g_hs_deadline_ms - now_ms();
+        if (left <= 0)
+            die("timed out: the server did not finish the handshake within %d seconds"
+                " (ConnectTimeout)", g_connect_timeout);
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int r = poll(&p, 1, (int)left);
+        if (r > 0) return;
+        if (r < 0 && errno != EINTR) die("poll: %s", strerror(errno));
+    }
+}
 
 /* ═══════════════════════════ Fatal error helper ══════════════════════════ */
 
@@ -284,6 +332,11 @@ static void load_ed25519_key(const char *path,
 {
     FILE *f = fopen(path, "r");
     if (!f) die("%s: %s", path, strerror(errno));
+    /* As OpenSSH: a key anyone else can read is no longer a secret. */
+    struct stat kst;
+    if (fstat(fileno(f), &kst) == 0 && (kst.st_mode & 077))
+        die("%s: unprotected private key file (mode %03o): remove group and other access (chmod 600)",
+            path, (unsigned)(kst.st_mode & 0777));
 
     /* Every copy of the key we make is wiped below; that includes stdio's
      * buffer, which would otherwise be freed by fclose() with the key in it. */
@@ -353,15 +406,20 @@ static int tcp_connect(const char *host, const char *port) {
     hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(host, port, &hints, &res);
     if (rc) die("getaddrinfo: %s", gai_strerror(rc));
-    int fd = -1;
+    int fd = -1, why = 0;
     for (r = res; r; r = r->ai_next) {
         fd = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
         if (fd < 0) continue;
+        if (g_connect_timeout > 0) {          /* a blocking connect() honours SO_SNDTIMEO on Linux */
+            struct timeval tv = { g_connect_timeout, 0 };
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        }
         if (connect(fd, r->ai_addr, r->ai_addrlen) == 0) break;
+        why = errno;
         close(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) die("connect to %s:%s failed", host, port);
+    if (fd < 0) die("connect to %s:%s failed: %s", host, port, strerror(why));
     int one = 1;                                   /* keystrokes must not wait for an ACK */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
@@ -378,7 +436,7 @@ static int valid_host(const char *h) {
     size_t n = strlen(h);
     if (n == 0 || n > 255 || h[0] == '-') return 0;
     for (size_t i = 0; i < n; i++)
-        if (!isalnum((unsigned char)h[i]) && !strchr("-._:[]", h[i])) return 0;
+        if (!isalnum((unsigned char)h[i]) && !strchr("-._:", h[i])) return 0;
     return 1;
 }
 static int valid_port(const char *p) {
@@ -453,6 +511,7 @@ static int proxy_connect(const char *cmd, const char *host, const char *port) {
 static void xread(int fd, void *buf, size_t n) {
     uint8_t *p = buf;
     while (n > 0) {
+        wait_readable(fd);
         ssize_t r = read(fd, p, n);
         if (r < 0) die("read: %s", strerror(errno));
         if (r == 0) die("connection closed by remote");
@@ -546,6 +605,10 @@ static uint8_t *pkt_recv_plain(SSH *ssh, size_t *plen) {
 }
 
 static void pkt_send_enc(SSH *ssh, const uint8_t *pay, size_t plen) {
+    /* The ChaCha20 nonce is the 32-bit sequence number: once it wraps, the
+     * keystream and the Poly1305 key of an earlier packet are reused.  Refuse
+     * instead; a rekey (or a new connection) is needed long before this. */
+    if (ssh->send_seq == UINT32_MAX) die("send sequence number exhausted: reconnect");
     uint8_t pad = (uint8_t)(8 - ((1 + plen) % 8));
     if (pad < 4) pad += 8;
     uint32_t pl = (uint32_t)(1 + plen + pad);
@@ -776,11 +839,32 @@ static char *known_hosts_path(void) {
     return p;
 }
 
+/* Reads one SSH string at *pos of a blob; 0 if it does not fit (a malformed
+ * entry is skipped, not fatal).  *p is set to the bytes if p is not NULL. */
+static int wire_str(const uint8_t *b, size_t blen, size_t *pos, size_t *n, const uint8_t **p) {
+    if (blen - *pos < 4) return 0;
+    uint32_t l = ((uint32_t)b[*pos] << 24) | ((uint32_t)b[*pos + 1] << 16)
+               | ((uint32_t)b[*pos + 2] << 8) | (uint32_t)b[*pos + 3];
+    *pos += 4;
+    if (l > blen - *pos) return 0;
+    if (p) *p = b + *pos;
+    *n = l; *pos += l;
+    return 1;
+}
+
 /* Returns 1 if found and matches, 0 if not found, -1 if found but mismatch */
 static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
     char *path = known_hosts_path();
-    FILE *f = fopen(path, "r"); free(path);
-    if (!f) return 0;  /* missing file == not found */
+    FILE *f = fopen(path, "r");
+    /* Only a file that does not exist means that no key is known.  Any other
+     * failure (permissions, a directory, an I/O error) must not be taken for
+     * "unknown host": that would ask the user about a host whose key is in the
+     * file, and accept the answer. */
+    if (!f) {
+        if (errno == ENOENT) { free(path); return 0; }
+        die("%s: cannot open: %s", path, strerror(errno));
+    }
+    free(path);
 
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
@@ -801,14 +885,15 @@ static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
         uint8_t blob[256]; ssize_t blen = b64dec(b64, strlen(b64), blob, sizeof blob);
         if (blen < 0) continue;
         /* blob is the SSH wire format: string("ssh-ed25519") || string(32-byte key) */
-        Buf b2 = { blob, (size_t)blen, (size_t)blen, 0 };
-        size_t tl; rdstr(&b2, &tl);        /* skip type string */
-        size_t kl; const uint8_t *k = rdstr(&b2, &kl);
+        size_t pos = 0, tl, kl; const uint8_t *k;
+        if (!wire_str(blob, (size_t)blen, &pos, &tl, NULL)) continue;  /* type */
+        if (!wire_str(blob, (size_t)blen, &pos, &kl, &k)) continue;    /* key */
         if (kl != 32) continue;
 
         fclose(f);
         return (sodium_memcmp(k, pubkey, 32) == 0) ? 1 : -1;
     }
+    if (ferror(f)) die("known_hosts: cannot read: %s", strerror(errno));
     fclose(f); return 0;
 }
 
@@ -917,6 +1002,9 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
         sk_own = pkt_recv(ssh, &sk_len); sk_pkt = sk_own;
         if (sk_pkt[0] != SSH_MSG_KEXINIT) die("expected KEXINIT, got %d", sk_pkt[0]);
     }
+    /* The strict-KEX scan below reads the name-lists after the type byte and
+     * the 16-byte cookie.  A shorter payload would be read past its end. */
+    if (sk_len < 17) die("server KEXINIT too short (%zu bytes)", sk_len);
     free(ssh->server_kexinit);
     ssh->server_kexinit = malloc(sk_len);
     if (!ssh->server_kexinit) die("malloc");
@@ -1016,9 +1104,12 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
      * sig_blob wire format: string("ssh-ed25519") || string(64-byte_sig)
      */
     Buf sb = { (uint8_t *)sig_blob, sig_len, sig_len, 0 };
-    size_t st_len; rdstr(&sb, &st_len);           /* skip "ssh-ed25519" tag */
+    size_t st_len; const uint8_t *st = rdstr(&sb, &st_len);
+    if (st_len != 11 || memcmp(st, "ssh-ed25519", 11) != 0)
+        die("server signature is not ssh-ed25519");   /* the key is ed25519, its signature too */
     size_t raw_sig_len; const uint8_t *raw_sig = rdstr(&sb, &raw_sig_len);
     if (raw_sig_len != 64) die("bad ed25519 signature length");
+    if (sb.pos != sig_len) die("trailing data after the server's signature");
     if (crypto_sign_verify_detached(raw_sig, H, 32, srv_pk) != 0)
         die("server host key signature FAILED — aborting");
 
@@ -1036,6 +1127,7 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
                 "If you changed the server, edit ~/.ssh/known_hosts.", host);
         }
         if (kh == 0) {
+            hs_pause();                        /* waiting for the user does not count */
             /* First time: show fingerprint, ask user */
             uint8_t blob[ED25519_BLOB_LEN], fp[32];
             ed25519_blob(srv_pk, blob);
@@ -1050,13 +1142,16 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
             err("\nAre you sure you want to continue connecting (yes/no)? ");
             char ans[8];
             ssize_t an = tty_ask(ans, sizeof(ans) - 1);
-            if (an <= 0) tty_exit(1);
             while (an > 0 && (ans[an-1] == '\n' || ans[an-1] == '\r')) an--;
-            if (an != 3 || memcmp(ans, "yes", 3) != 0) tty_exit(1);   /* exactly "yes" */
+            if (an != 3 || memcmp(ans, "yes", 3) != 0) {      /* exactly "yes" */
+                err("Host key verification failed.\n");
+                tty_exit(1);
+            }
             kh_add(host, srv_pk);
             err("Warning: Permanently added '");
             err(host);
             err("\' to known hosts.\n");
+            hs_resume();
         }
         memcpy(ssh->host_pk, srv_pk, 32);
     }
@@ -1611,6 +1706,11 @@ int main(int argc, char **argv) {
                     g_known_hosts_file = val;
                 } else if (strcasecmp(key, "ProxyCommand") == 0) {
                     g_proxy_command = val;
+                } else if (strcasecmp(key, "ConnectTimeout") == 0) {
+                    char *end; long v = strtol(val, &end, 10);
+                    if (*val == '\0' || *end != '\0' || v < 0 || v > 3600)
+                        die("mssh: bad ConnectTimeout (0-3600 seconds): %s", val);
+                    g_connect_timeout = (int)v;
                 } else {
                     die("mssh: unsupported option: %s", key);
                 }
@@ -1622,7 +1722,8 @@ int main(int argc, char **argv) {
                     "\n"
                     "Supported -o options:\n"
                     "  UserKnownHostsFile=<path>\n"
-                    "  ProxyCommand=<cmd>  (%h/%p expanded to host/port)\n");
+                    "  ProxyCommand=<cmd>  (%h/%p expanded to host/port)\n"
+                    "  ConnectTimeout=<s>  (handshake time limit, default 60; 0: none)\n");
                 return 1;
         }
     }
@@ -1680,6 +1781,7 @@ int main(int argc, char **argv) {
     load_ed25519_key(identity, sk, pk);
 
     /* ── Connect (direct TCP or ProxyCommand) ── */
+    hs_arm();
     int fd = g_proxy_command ? proxy_connect(g_proxy_command, host, port)
                              : tcp_connect(host, port);
 
@@ -1712,11 +1814,16 @@ int main(int argc, char **argv) {
     }
 
     /* Read lines until we see one starting with "SSH-2.0" */
+    /* The server may send text before its version line (RFC 4253 4.2), but a
+     * server that never sends one must not keep us reading forever. */
     char sv[256]; size_t svlen = 0;
+    size_t pre_bytes = 0, pre_lines = 0;
     for (;;) {
         char c;
         xread(fd, &c, 1);
+        if (++pre_bytes > MAX_PRE_BANNER_BYTES) die("too much text before the server's SSH version line");
         if (c == '\n') {
+            if (++pre_lines > MAX_PRE_BANNER_LINES) die("too many lines before the server's SSH version line");
             if (svlen > 0 && sv[svlen-1] == '\r') sv[--svlen] = '\0';
             else sv[svlen] = '\0';
             if (strncmp(sv, "SSH-2.0", 7) == 0) break;
@@ -1756,6 +1863,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── I/O loop (the terminal's) ── */
+    hs_done(fd);
     int status = tty_run(&ssh, got_pty, !have_command);
 
     /* Clean up */

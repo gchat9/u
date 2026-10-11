@@ -7,6 +7,7 @@
 #define _DEFAULT_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -53,7 +54,17 @@ void tty_msg(const char *s) {
     }
 }
 
-ssize_t tty_ask(char *buf, size_t n) { return read(STDIN_FILENO, buf, n); }
+/* The answer to the host key question comes from the terminal, never from
+ * stdin: stdin may be a pipe carrying data for the remote command, or the
+ * output of "echo yes", and then nobody answered.  As OpenSSH does, the
+ * controlling terminal is asked; with none, there is no answer (-1).  */
+ssize_t tty_ask(char *buf, size_t n) {
+    int fd = open("/dev/tty", O_RDONLY | O_NOCTTY);
+    if (fd < 0) return -1;
+    ssize_t r = read(fd, buf, n);
+    close(fd);
+    return r;
+}
 
 void tty_exit(int code) { exit(code); }
 
