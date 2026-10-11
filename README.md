@@ -21,10 +21,10 @@ Example: user runs "sleep" tool with some exceptionally long and/or corrupted ar
 
 - `_arch/`   per-architecture bits (syscall macros, numbers, `_start`). C + assembly;
 - `_sys/`    entry-point glue and shared type/constant definitions, common to all architectures. C;
-- `_lib/`    small freestanding libc-ish helpers (mem, str, net), plus `xterm`, an X11 terminal surface (opt-in: not pulled in by `_sys/_.h`, built by the tools that use it), `vt`, the VT parser it can display, `xterm_screen`, which shows a parsed screen in the window and handles the mouse, selection and clipboard for it, `xtty`, all of that behind a write/poll interface for a program that wants to be an X11 terminal app (see `xtty_demo/`), and `xterm_conf.h`, their compile-time options;
+- `_lib/`    small freestanding libc-ish helpers (mem, str, net), plus `xterm`, an X11 terminal surface (opt-in: not pulled in by `_sys/_.h`, built by the tools that use it), `vt`, the VT parser it can display, `xterm_screen`, which shows a parsed screen in the window and handles the mouse, selection and clipboard for it, `xtty`, all of that behind a write/poll interface for a program that wants to be an X11 terminal app (see `xtty_demo/`), `xterm_conf.h`, their compile-time options, and `sodium_lite/`, a small portable subset of libsodium (SHA-256, ChaCha20, Poly1305, X25519, Ed25519) tested against the real one;
 - `_mk/`     shared Makefile logic, included from each tool's own Makefile;
 - `_font/`   generator for the font files `xterm` loads at runtime: `mkfont`/`mkemoji`, their inputs (`emoji_src/`), and `charset.h`/`emoji_charset.h`, which define what each glyph is. Host tools, not a tool itself;
-- `[a-z].*/` individual tools. C only.
+- `[a-z].*/` individual tools. C only. `mssh/` is a minimal SSH-2 client and `xmssh/` the same client in a window of its own, with a built-in xterm emulator (`_lib/xtty`) instead of the user's terminal (it loads `font.bfnt` at run time: `make fonts`, then install). They share `mssh/mssh.c`, the protocol; only `tty.c`, the terminal front-end, differs (see `mssh/mssh.h`). Their cryptography is `_lib/sodium_lite`, the few libsodium functions they use (`make SODIUM=system` links the real libsodium instead, to compare). Like `tmux/` and `xtmux/`, dietlibc programs, not freestanding.
 
 ## Building
 
