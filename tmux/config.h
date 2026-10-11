@@ -11,29 +11,12 @@
 #include <stdint.h>  /* uint8_t, for Style below */
 
 /* ================================================================== */
-/* Mouse (xtmux)                                                        */
+/* Mouse and scrollback                                                 */
 /* ================================================================== */
 
-/* xtmux reports the mouse to programs that ask for it (?1000, ?1002,
- * ?1003) using the classic xterm encoding or, if they ask for it
- * (?1006), the SGR one.  Define this to also support the UTF-8 (?1005)
- * and urxvt (?1015) encodings.  Few programs use them, and they cost
- * code; without it a program asking for one of them simply keeps the
- * encoding it had, as on any terminal that lacks it. */
-/* #define MOUSE_UTF8_URXVT_ENCODINGS */
-
-/* Copy and paste with the mouse (xtmux): drag with the left button to
- * select text and copy it to PRIMARY and CLIPBOARD, click the right button
- * to paste PRIMARY.  Double-click selects a word, triple-click a line, and
- * dragging after either extends the selection by words or lines; Alt+drag
- * selects a rectangle (with Alt as MOUSE_SELECT_MOD below, that is not
- * available).  When a program has asked for the mouse these go to it
- * instead -- unless this modifier is held, which keeps the mouse for
- * copy and paste: 4 Shift, 8 Alt, 16 Control (add them to need several);
- * 0 leaves the mouse to the program for good. */
-#ifndef MOUSE_SELECT_MOD
-#define MOUSE_SELECT_MOD 4
-#endif
+/* The mouse (copy and paste, MOUSE_SELECT_MOD, the reported encodings)
+ * and scrollback options are not tmux's alone: they are in
+ * ../_lib/xterm_conf.h, shared by everything built on the xterm layer. */
 
 /* ================================================================== */
 /* Session                                                              */
@@ -164,28 +147,6 @@ typedef struct { uint8_t fg, bg; } Style;
     _FG(WINDOW_STATUS_ACTIVITY_FG) _BG(WINDOW_STATUS_ACTIVITY_BG)
 #define WINDOW_STATUS_ACTIVITY_COLOR \
     ((Style){ WINDOW_STATUS_ACTIVITY_FG, WINDOW_STATUS_ACTIVITY_BG })
-
-/* ================================================================== */
-/* Scrollback                                                           */
-/* ================================================================== */
-
-/*
- * Capture lines that scroll off the top into a per-window buffer and
- * inject them into the parent terminal's own scrollback on window switch.
- * Set to 0 to disable entirely (saves SCROLLBACK_BYTES per window).
- */
-#ifndef SCROLLBACK_ENABLED
-#define SCROLLBACK_ENABLED  1
-#endif
-
-/*
- * Size of the per-window scrollback buffer in bytes.
- * Lines are stored as plain UTF-8 with trailing whitespace stripped and
- * a newline appended.  When the buffer is full the oldest line is dropped.
- */
-#ifndef SCROLLBACK_BYTES
-#define SCROLLBACK_BYTES    32768
-#endif
 
 /* ================================================================== */
 /* Window lifecycle                                                     */

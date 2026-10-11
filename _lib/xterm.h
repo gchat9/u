@@ -10,7 +10,7 @@ uint8_t *xterm_bg_buffer(void);
 
 /* Parallel per-cell structural-attribute bitmask (only attrs that need
  * extra pixels drawn, not just a colour swap, live here). Independent
- * of tmux/vt.h's ATTR_* bit values by design — callers translate. */
+ * of vt.h's ATTR_* bit values by design — callers translate. */
 #define XTERM_ATTR_UNDERLINE 0x01
 #define XTERM_ATTR_STRIKE    0x02
 /* Emoji occupy two adjacent cells (see emoji.bfnt / emoji_charset.h).

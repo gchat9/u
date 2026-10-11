@@ -2,7 +2,7 @@
 
 #include <stdbool.h>
 #include "pty.h"
-#include "vt.h"
+#include "../_lib/vt.h"
 
 typedef struct {
     Pty       pty;

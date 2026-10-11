@@ -27,7 +27,7 @@
  */
 
 #include "session.h"
-#include "vt.h"
+#include "../_lib/vt.h"
 #include "pty.h"
 #include "render.h"
 #include "status.h"
@@ -851,9 +851,9 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
          * displayed program asked for (the frame header says which), or
          * else text selection, copy and paste (see x11_backend.c). */
         if (x11_backend_paste_key() && last_h.rows > 0)       /* Shift+Insert, Ctrl+V */
-            x11_backend_paste((last_h.mouse >> 4) & 1, obs_pointer_sink, &sock);
+            xscr_paste((last_h.mouse >> 4) & 1, obs_pointer_sink, &sock);
         if (last_h.rows > 0)            /* (there is nothing on screen before the first frame) */
-            x11_backend_pointer(&scr, last_h.mouse & 3, (last_h.mouse >> 2) & 3,
+            xscr_pointer(&scr, last_h.mouse & 3, (last_h.mouse >> 2) & 3,
                                 (last_h.mouse >> 4) & 1, view_rows, view_cols,
                                 obs_pointer_sink, &sock);
 #endif
@@ -901,7 +901,7 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             if (slen > 0) memcpy(last_status_buf, status_buf, slen);
 
 #ifdef X11_BACKEND
-            (void)x11_backend_selection_drop();   /* (the frame is drawn next) */
+            (void)xscr_selection_drop();   /* (the frame is drawn next) */
 #endif
             obs_draw(&rs, &scr, local, &h, status_buf, slen, our_rows, our_cols);
 #ifdef X11_BACKEND
@@ -912,7 +912,7 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
 
 done:
 #ifdef X11_BACKEND
-    x11_backend_pointer_release();      /* `sock` is about to go out of scope */
+    xscr_pointer_release();      /* `sock` is about to go out of scope */
 #endif
     obs_term_leave(&term);
     free(local);

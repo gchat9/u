@@ -14,7 +14,7 @@
 #include <termios.h>
 
 #include "pty.h"
-#include "vt.h"
+#include "../_lib/vt.h"
 #include "render.h"
 #include "input.h"
 #include "status.h"
@@ -138,7 +138,7 @@ static void redraw_status(void)
         alive[i]  = (w != NULL && w->alive);
         pids[i]   = (w && w->alive) ? w->pty.child : 0;
     }
-    /* Under X11_BACKEND the cursor is kept current by x11_backend_render()
+    /* Under X11_BACKEND the cursor is kept current by xscr_render()
      * itself (see render.c / x11_backend.c) — it fires on every content
      * update, whereas this status-bar redraw deliberately doesn't (see
      * the "NOT redrawn on every PTY update" comment further down), so
@@ -591,7 +591,7 @@ static bool scrollback_feed(uint8_t b, bool last)
 static void full_redraw(void)
 {
 #ifdef X11_BACKEND
-    (void)x11_backend_selection_drop();
+    (void)xscr_selection_drop();
 #endif
 #if SCROLLBACK_ENABLED
     if (g_scrollback_mode) { render_scrollback_view(); return; }
@@ -1363,7 +1363,7 @@ int main(int argc, char *argv[])
             int kn = x11_backend_read_input(kbuf, sizeof kbuf);
             /* Typing ends a text selection's highlight. */
             if (kn > 0 && g_wins[g_cur] && !g_scrollback_mode &&
-                x11_backend_selection_drop())
+                xscr_selection_drop())
                 render_screen(&g_rs, &g_wins[g_cur]->vt.scr);
             for (int i = 0; i < kn; i++) {
 #if SCROLLBACK_ENABLED
@@ -1381,10 +1381,10 @@ int main(int argc, char *argv[])
             {
                 Window *mw = g_wins[g_cur];
                 if (x11_backend_paste_key() && mw && !g_scrollback_mode)   /* Shift+Insert, Ctrl+V */
-                    x11_backend_paste(mw->vt.scr.bracketed_paste, pointer_sink, NULL);
+                    xscr_paste(mw->vt.scr.bracketed_paste, pointer_sink, NULL);
                 if (mw && !g_scrollback_mode) {
                     Screen *ms = &mw->vt.scr;
-                    x11_backend_pointer(ms, shown_mouse_mode(), ms->mouse_enc,
+                    xscr_pointer(ms, shown_mouse_mode(), ms->mouse_enc,
                                         ms->bracketed_paste, child_rows(), g_cols,
                                         pointer_sink, NULL);
                 }
@@ -1477,7 +1477,7 @@ int main(int argc, char *argv[])
                 }
                 if (!g_scrollback_mode) {
 #ifdef X11_BACKEND
-                    (void)x11_backend_selection_drop();   /* (the render below repaints) */
+                    (void)xscr_selection_drop();   /* (the render below repaints) */
 #endif
                     render_screen(&g_rs, &w->vt.scr);
                     observer_push();

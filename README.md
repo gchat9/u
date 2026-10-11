@@ -21,7 +21,7 @@ Example: user runs "sleep" tool with some exceptionally long and/or corrupted ar
 
 - `_arch/`   per-architecture bits (syscall macros, numbers, `_start`). C + assembly;
 - `_sys/`    entry-point glue and shared type/constant definitions, common to all architectures. C;
-- `_lib/`    small freestanding libc-ish helpers (mem, str, net), plus `xterm`, a render-only X11 terminal surface (opt-in: not pulled in by `_sys/_.h`, built by the tools that use it);
+- `_lib/`    small freestanding libc-ish helpers (mem, str, net), plus `xterm`, an X11 terminal surface (opt-in: not pulled in by `_sys/_.h`, built by the tools that use it), `vt`, the VT parser it can display, `xterm_screen`, which shows a parsed screen in the window and handles the mouse, selection and clipboard for it, `xtty`, all of that behind a write/poll interface for a program that wants to be an X11 terminal app (see `xtty_demo/`), and `xterm_conf.h`, their compile-time options;
 - `_mk/`     shared Makefile logic, included from each tool's own Makefile;
 - `_font/`   generator for the font files `xterm` loads at runtime: `mkfont`/`mkemoji`, their inputs (`emoji_src/`), and `charset.h`/`emoji_charset.h`, which define what each glyph is. Host tools, not a tool itself;
 - `[a-z].*/` individual tools. C only.

@@ -43,7 +43,7 @@ struct sockaddr_un {
 
 /* Standard xterm 256-colour palette (see e.g.
  * https://www.ditig.com/256-colors-cheat-sheet), matching the encoding
- * documented in tmux/vt.h for Cell.fg/bg: 0-7 ANSI, 8-15 bright ANSI,
+ * documented in vt.h for Cell.fg/bg: 0-7 ANSI, 8-15 bright ANSI,
  * 16-231 the 6x6x6 colour cube, 232-255 the greyscale ramp.
  *
  * Slots 0 and 15 (ANSI black / bright white) are overwritten with this

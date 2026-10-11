@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vt.h"
+#include "../_lib/vt.h"
 
 /*
  * RenderState tracks what we believe is currently displayed on the real

@@ -1,8 +1,9 @@
 # xtmux: build of ../tmux with X11_BACKEND defined
-# Only x11_backend.* and ../_lib/xterm.c are xtmux-specific
+# Only x11_backend.* is xtmux-specific; ../_lib/xterm.c (the window) and
+# ../_lib/xterm_screen.c (a Screen shown in it) are shared
 
 TARGET     := xtmux
-EXTRA_OBJS := x11_backend.o xterm.o
+EXTRA_OBJS := x11_backend.o xterm_screen.o xterm.o
 include ../_mk/tmux.mk
 
 # vpath for .c files only, deliberately not VPATH: that would also search

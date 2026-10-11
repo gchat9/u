@@ -199,7 +199,7 @@ void render_screen(RenderState *rs, const Screen *s)
 {
 #ifdef X11_BACKEND
     (void)rs;
-    x11_backend_render(s);
+    xscr_render(s);
     return;
 #endif
     int rows = s->rows < rs->rows ? s->rows : rs->rows;
@@ -350,7 +350,7 @@ void render_full_redraw(RenderState *rs, const Screen *s)
 {
 #ifdef X11_BACKEND
     (void)rs;
-    x11_backend_render(s);
+    xscr_render(s);
     return;
 #endif
     /* Blank the physical screen in one shot, then let the diff loop

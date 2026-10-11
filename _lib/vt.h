@@ -1,5 +1,5 @@
 #pragma once
-#include "config.h"
+#include "xterm_conf.h"
 
 #define ROW_WRAPPED  0x01u  /* line reached right margin via autowrap */
 
@@ -73,7 +73,7 @@ typedef struct {
      * mouse_mode: 0 off; 1 press/release (?1000); 2 + motion while a button
      * is held (?1002); 3 + all motion (?1003).  mouse_enc: how a report is
      * encoded: 0 classic ESC [ M bytes, 2 SGR (?1006); with
-     * MOUSE_UTF8_URXVT_ENCODINGS (config.h) also 1 UTF-8 (?1005) and
+     * MOUSE_UTF8_URXVT_ENCODINGS (xterm_conf.h) also 1 UTF-8 (?1005) and
      * 3 urxvt (?1015).  Only a display that has a pointer acts on these. */
     uint8_t  mouse_mode, mouse_enc;
     bool     insert_mode;   /* IRM                                       */

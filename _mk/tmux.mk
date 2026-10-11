@@ -12,7 +12,10 @@ CC      := diet gcc
 CFLAGS  = -Wall -Wextra -Wno-unused-result -g -O2 -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
 LDFLAGS = -lutil -static
 
-SRCS = main.c pty.c vt.c render.c input.c status.c session.c
+SRCS ?= main.c pty.c vt.c render.c input.c status.c session.c
+
+# vt.c is the shared VT parser, in _lib. (.c files only, as in xtmux/Makefile.)
+vpath %.c ../_lib
 OBJS = $(SRCS:.c=.o) $(EXTRA_OBJS)
 DEPS = $(OBJS:.o=.d)
 
