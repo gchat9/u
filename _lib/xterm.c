@@ -346,6 +346,9 @@ static void handle_keypress(const uint8_t *ev)
         uint32_t up = ks;
         if (up >= 'a' && up <= 'z') up -= 'a' - 'A';
         if (up >= '@' && up <= '_') { key_push((uint8_t)(up & 0x1f)); return; }
+        /* Ctrl+Space is NUL, as in xterm.  (Ctrl+@ is the same byte and is
+         * caught above; space is outside that range, so it needs its own.) */
+        if (up == ' ') { key_push(0); return; }
     }
 
     if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) {

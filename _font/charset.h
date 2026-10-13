@@ -20,13 +20,15 @@
  * ASCII. The table holds, in order:
  *
  *   - a small set of accented Latin letters (Western European, minus
- *     the ones left out on purpose; no other Latin-1 symbols or
- *     letters), plus the sharp s and the Æ/Œ ligatures. Œ/œ are not
- *     Latin-1 (U+0152/0153), so there is no Latin-1 range here at all;
+ *     the ones left out on purpose; no other Latin-1 letters), plus the
+ *     sharp s and the Æ/Œ ligatures. Œ/œ are not Latin-1 (U+0152/0153),
+ *     so there is no Latin-1 range here at all;
  *   - light and double box-drawing (what dialog/whiptail/ncurses TUIs
  *     actually draw), square corners only;
  *   - a few block/shade glyphs, four arrows, and three punctuation/
- *     dingbat marks (check marks, em dash).
+ *     dingbat marks (check marks, em dash), the degree sign, the French
+ *     guillemets, and the horizontal ellipsis.  The big solidus U+29F8
+ *     has no glyph of its own: see charset_slot().
  *
  * Double-width glyphs are a second, separate array of the same kind: a
  * "wide slot" indexes charset_wide_extra[] and a wide bitmap in
@@ -71,6 +73,9 @@ static const uint16_t charset_extra[] = {
     0x2580, 0x2584, 0x2588, 0x2591, 0x2592, 0x2593,    /* block / shade */
     0x25B2, 0x25BA, 0x25BC, 0x25C4,                    /* arrows: up right down left */
     0x2714, 0x2713, 0x2014,                            /* ✔ ✓ — */
+    0x00B0,                                            /* ° */
+    0x00AB, 0x00BB,                                    /* « » */
+    0x2026,                                            /* … */
 };
 #define CHARSET_EXTRA_COUNT ((int)(sizeof(charset_extra) / sizeof(charset_extra[0])))
 
@@ -103,8 +108,10 @@ static inline int charset_slot(uint32_t cp)
 {
     /* Hyphen (U+2010) and non-breaking hyphen (U+2011) are drawn with the
      * ASCII hyphen-minus glyph: no slot of their own (man(1) breaks words
-     * with U+2010). Copy and paste still see the original character. */
+     * with U+2010). Copy and paste still see the original character.
+     * The big solidus (U+29F8) is likewise drawn with the ASCII slash. */
     if (cp == 0x2010 || cp == 0x2011) cp = '-';
+    if (cp == 0x29F8) cp = '/';
     if (cp >= CHARSET_ASCII_LO && cp <= CHARSET_ASCII_HI)
         return CHARSET_ASCII_BASE + (int)(cp - CHARSET_ASCII_LO);
     for (int i = 0; i < CHARSET_EXTRA_COUNT; i++)
