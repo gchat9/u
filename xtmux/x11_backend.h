@@ -27,13 +27,16 @@ void x11_backend_status(int row, int cols, int active,
  * window like output to a terminal.  _begin blanks the screen and homes
  * the text cursor; _line writes a line there (wrapping, scrolling the
  * screen up when it passes the bottom); _fill / _at draw in a fixed
- * place (clipped, no wrap), for the footer; _end hides the cursor and
- * shows the result. */
+ * place (clipped, no wrap), for the footer; _end shows the result, with
+ * any selection highlighted.  The text is laid out in a Screen (see
+ * x11_backend.c), so _text_screen() gives it to xscr_pointer() to select
+ * and copy from, like a program's screen. */
 void x11_backend_text_begin(void);
-void x11_backend_text_line(const char *utf8, int n, Style st);
+void x11_backend_text_line(const char *utf8, int n, Style st, int wrapped);
 void x11_backend_text_fill(int row, Style st);
 void x11_backend_text_at(int row, int col, const char *utf8, int n, Style st);
 void x11_backend_text_end(void);
+const Screen *x11_backend_text_screen(void);
 
 /* Mouse and clipboard: the pointer (xscr_pointer, ...) is in
  * ../_lib/xterm_screen.h.  _select says how much pointer traffic is wanted

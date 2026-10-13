@@ -208,8 +208,28 @@ static void scr_init(Screen *s, int rows, int cols)
     s->cur_bg         = COLOR_DEFAULT;
 }
 
+/* The alternate screen is a second grid with its own wrap flags, kept
+ * apart from the primary's: entering it swaps both in and clears the new
+ * pair, leaving swaps them back. */
+static void alt_swap(Screen *s)
+{
+    Cell **g = s->cells;     s->cells     = s->alt_cells;     s->alt_cells     = g;
+    uint8_t *f = s->row_flags; s->row_flags = s->alt_row_flags; s->alt_row_flags = f;
+    s->in_alt_screen = !s->in_alt_screen;
+}
+
+static void alt_enter(Screen *s)
+{
+    if (!s->alt_cells)      s->alt_cells      = alloc_cells(s->rows, s->cols);
+    if (!s->alt_row_flags)  s->alt_row_flags  = calloc((size_t)s->rows, 1);
+    alt_swap(s);
+    if (s->row_flags) memset(s->row_flags, 0, (size_t)s->rows);
+}
+
 static void scr_free(Screen *s)
 {
+    free(s->alt_row_flags);
+    s->alt_row_flags = NULL;
     free(s->row_flags);
     s->row_flags = NULL;
 #if SCROLLBACK_ENABLED
@@ -261,7 +281,7 @@ static void scrollback_capture(Screen *s, Cell **row_ptr, uint8_t rflags)
 
     for (int c = 0; c < s->cols && tlen < (int)sizeof(tmp) - 4; c++) {
         Cell *cell = &(*row_ptr)[c];
-        if (cell->flags & CELL_WIDE_CONT) continue;
+        if (cell->flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
 
         uint32_t cp = cell->ch ? cell->ch : ' ';
         /* Encode UTF-8 */
@@ -431,6 +451,19 @@ static void do_ri(Screen *s)   /* reverse index */
 /* Character output                                                     */
 /* ================================================================== */
 
+/* Columns a character takes: 2 for a wide one, 1 for most, 0 for the
+ * zero-width ones.  Width comes from our own tables, not libc's wcwidth(),
+ * which depends on the locale.  Zero-width (ZWJ, variation selectors, ...)
+ * must take no cell: wcwidth() says 0, and readline believes it, so taking
+ * a cell for one would put the screen out of step with the line being
+ * edited. */
+static int cp_width(uint32_t ch)
+{
+    if (ch == 0x200D || (ch >= 0xFE00 && ch <= 0xFE0F) || (ch >= 0x200B && ch <= 0x200F))
+        return 0;
+    return (ch >= 0x1100 && (emoji_wide(ch) || charset_wide(ch))) ? 2 : 1;
+}
+
 static void put_char(VTParser *p, uint32_t ch)
 {
     Screen *s = &p->scr;
@@ -446,16 +479,13 @@ static void put_char(VTParser *p, uint32_t ch)
      * a codepoint can actually be drawn is decided separately, at render
      * time. The >= 0x1100 guard keeps the table scans off the hot path
      * for all ordinary text. */
-    if (ch == 0x200D || (ch >= 0xFE00 && ch <= 0xFE0F) ||
-        (ch >= 0x200B && ch <= 0x200F))
-        return;  /* zero-width (ZWJ, variation selectors, ...): wcwidth() says 0, and
-                  * readline believes it, so taking a cell for one would put the
-                  * screen out of step with the line being edited */
-    int width = (ch >= 0x1100 && (emoji_wide(ch) || charset_wide(ch))) ? 2 : 1;
+    int width = cp_width(ch);
+    if (!width) return;
 
     /* Handle pending wrap: wrap to next line before placing char */
     if (s->pending_wrap) {
         if (s->auto_wrap) {
+            if (s->row_flags) s->row_flags[s->cur_row] |= ROW_WRAPPED;
             s->cur_col    = 0;
             s->pending_wrap = false;
             do_lf(s);
@@ -467,7 +497,9 @@ static void put_char(VTParser *p, uint32_t ch)
     /* If a double-wide char doesn't fit, pad with space and wrap */
     if (width == 2 && s->cur_col + 1 >= s->cols) {
         s->cells[s->cur_row][s->cur_col] = blank_cell(s);
+        s->cells[s->cur_row][s->cur_col].flags |= CELL_PAD;
         if (s->auto_wrap) {
+            if (s->row_flags) s->row_flags[s->cur_row] |= ROW_WRAPPED;
             s->cur_col = 0;
             do_lf(s);
         } else {
@@ -508,8 +540,7 @@ static void put_char(VTParser *p, uint32_t ch)
     int new_col = s->cur_col + width;
     if (new_col >= s->cols) {
         s->cur_col    = s->cols - 1;
-        s->pending_wrap = true;
-        if (s->row_flags) s->row_flags[s->cur_row] |= ROW_WRAPPED;
+        s->pending_wrap = true;     /* the wrap itself, and its flag, come with the next char */
     } else {
         s->cur_col    = new_col;
         s->pending_wrap = false;
@@ -858,13 +889,7 @@ static void dispatch_csi(VTParser *p, char final)
                         s->alt_saved_fg    = s->cur_fg;
                         s->alt_saved_bg    = s->cur_bg;
                         s->alt_saved_attrs = s->cur_attrs;
-                        /* Lazy alt-screen allocation */
-                        if (!s->alt_cells)
-                            s->alt_cells = alloc_cells(s->rows, s->cols);
-                        Cell **tmp = s->cells;
-                        s->cells     = s->alt_cells;
-                        s->alt_cells = tmp;
-                        s->in_alt_screen = true;
+                        alt_enter(s);
                         /* Primary grid (now in alt_cells) is no longer hot;
                          * let the kernel demote its pages in the LRU. */
                         cells_cold(s->alt_cells, s->rows, s->cols);
@@ -881,13 +906,7 @@ static void dispatch_csi(VTParser *p, char final)
                         s->alt_saved_fg    = s->cur_fg;
                         s->alt_saved_bg    = s->cur_bg;
                         s->alt_saved_attrs = s->cur_attrs;
-                        /* Lazy alt-screen allocation */
-                        if (!s->alt_cells)
-                            s->alt_cells = alloc_cells(s->rows, s->cols);
-                        Cell **tmp = s->cells;
-                        s->cells     = s->alt_cells;
-                        s->alt_cells = tmp;
-                        s->in_alt_screen = true;
+                        alt_enter(s);
                         /* Primary grid (now in alt_cells) is no longer hot;
                          * let the kernel demote its pages in the LRU. */
                         cells_cold(s->alt_cells, s->rows, s->cols);
@@ -924,10 +943,7 @@ static void dispatch_csi(VTParser *p, char final)
                 case 25: s->cur_visible = false; break;
                 case 47: case 1047:
                     if (s->in_alt_screen) {
-                        Cell **tmp = s->cells;
-                        s->cells     = s->alt_cells;
-                        s->alt_cells = tmp;
-                        s->in_alt_screen = false;
+                        alt_swap(s);
                         /* Alt grid (now in alt_cells) will be cold until
                          * next alt-screen entry; hint the kernel. */
                         cells_cold(s->alt_cells, s->rows, s->cols);
@@ -940,10 +956,7 @@ static void dispatch_csi(VTParser *p, char final)
                     break;
                 case 1049:
                     if (s->in_alt_screen) {
-                        Cell **tmp = s->cells;
-                        s->cells     = s->alt_cells;
-                        s->alt_cells = tmp;
-                        s->in_alt_screen = false;
+                        alt_swap(s);
                         /* Alt grid (now in alt_cells) will be cold until
                          * next alt-screen entry; hint the kernel. */
                         cells_cold(s->alt_cells, s->rows, s->cols);
@@ -1171,213 +1184,286 @@ static Cell **resize_grid(Cell **old_grid, int old_rows, int old_cols,
     return new_grid;
 }
 
-/* True if the row shows nothing: spaces (or NUL) on the default
- * background, with no attribute that would draw on a blank (underline,
- * strike, reverse video). */
-static bool row_is_blank(const Cell *row, int cols)
-{
-    for (int c = 0; c < cols; c++)
-        if ((row[c].ch != 0 && row[c].ch != ' ') ||
-            !(row[c].flags & CELL_BG_DFL) ||
-            (row[c].attrs & (ATTR_UNDERLINE | ATTR_STRIKE | ATTR_REVERSE)))
-            return false;
-    return true;
-}
-
 /*
  * Resize the Screen's cell grids and fix up all cursor/region state.
  * Called with the new terminal dimensions (not including the status row;
  * that adjustment is done by the caller).
  */
+#if SCROLLBACK_ENABLED
+/* ================================================================== */
+/* Reflow                                                              */
+/* ================================================================== */
+
+/*
+ * Resizing the primary screen re-lays its text out from logical lines: a
+ * run of rows joined by ROW_WRAPPED is one line, however the rows were cut
+ * (ROW_WRAPPED is set only where a wrap happened, see put_char).  The lines
+ * are written top down at the new width, so each keeps its place in order:
+ * a reflowed line that grows pushes the lines below it down, and one that
+ * shrinks lets them move up.  Rows that no longer fit above the bottom go
+ * into the scrollback, as scrolled-off rows do; a taller screen takes lines
+ * back from the scrollback, as it always has.  The cursor stays on the
+ * character it was on.
+ *
+ * The scrollback holds logical lines as text, and a line that continues on
+ * the screen has no newline yet (see scrollback_capture).  That open line is
+ * taken back first, as the start of row 0, so that nothing is split.
+ */
+
+static bool row_wraps(const Screen *s, int r)
+{
+    return s->row_flags && (s->row_flags[r] & ROW_WRAPPED);
+}
+
+static bool cell_blank(Cell c)
+{
+    return !(c.flags & CELL_WIDE_CONT) && (c.ch == 0 || c.ch == ' ') &&
+           (c.flags & CELL_BG_DFL) &&
+           !(c.attrs & (ATTR_UNDERLINE | ATTR_STRIKE | ATTR_REVERSE));
+}
+
+/* The UTF-8 text b[0..n) as cells, as put_char would have stored it (a wide
+ * character as a pair).  Returns the cell count, or -1 if it would not fit
+ * in cap. */
+static int decode_text(const char *b, int n, Cell *out, int cap)
+{
+    int k = 0;
+    for (int i = 0; i < n; ) {
+        unsigned char b0 = (unsigned char)b[i];
+        uint32_t cp; int len;
+        if      (b0 < 0x80) { cp = b0;        len = 1; }
+        else if (b0 < 0xE0) { cp = b0 & 0x1F; len = 2; }
+        else if (b0 < 0xF0) { cp = b0 & 0x0F; len = 3; }
+        else                { cp = b0 & 0x07; len = 4; }
+        for (int j = 1; j < len && i + j < n; j++)
+            cp = (cp << 6) | ((unsigned char)b[i + j] & 0x3F);
+        i += len;
+        int w = cp_width(cp);
+        if (!w) continue;
+        if (k + w > cap) return -1;
+        out[k] = (Cell){ .ch = cp, .flags = CELL_FG_DFL | CELL_BG_DFL | (w == 2 ? CELL_WIDE : 0) };
+        if (w == 2) out[k + 1] = (Cell){ .flags = CELL_FG_DFL | CELL_BG_DFL | CELL_WIDE_CONT };
+        k += w;
+    }
+    return k;
+}
+
+/*
+ * Lay one logical line (n cells at ln) out at nc columns, from output row
+ * `row`: it wraps before a character that does not fit (a wide one never
+ * splits), and each row that goes on into the next gets ROW_WRAPPED (and the
+ * padding a wide character leaves at the margin is CELL_PAD).  With tg == NULL
+ * it only counts.  Returns the rows used (at least one).
+ */
+static int lay_line(const Cell *ln, int n, int nc, Cell **tg, uint8_t *tf, int row)
+{
+    int r = 0, c = 0;
+    for (int i = 0; i < n; ) {
+        int w = (ln[i].flags & CELL_WIDE) ? 2 : 1;
+        if (c + w > nc) {                  /* only a wide char wraps early: its margin is padding */
+            if (tg) {
+                tf[row + r] |= ROW_WRAPPED;
+                for (int k = c; k < nc; k++) tg[row + r][k].flags |= CELL_PAD;
+            }
+            r++; c = 0;
+        }
+        if (tg) for (int k = 0; k < w; k++) tg[row + r][c + k] = ln[i + k];
+        c += w; i += w;
+    }
+    return r + 1;
+}
+
+/*
+ * Reflow the primary screen to nr x nc (nc >= 2, full scroll region).
+ * Returns false, with the screen untouched, if memory runs out.
+ *
+ * The cursor's line is not reflowed.  The shell at its prompt (readline)
+ * repaints its input after a resize, moving up by the rows it last drew the
+ * input over; that count is the cursor's distance below the line's first
+ * row, and it is kept: the line keeps its rows, its text cut or padded to the
+ * new width, and the shell draws the input again.  Every other line reflows:
+ * the lines above the cursor's line move with it, the ones below it follow.
+ * Rows above the new bottom go to the scrollback, as scrolled-off rows do,
+ * and a taller screen takes whole lines back from it.  A line that is cut
+ * by a narrower screen is not restored until its program redraws it.
+ */
+static bool reflow(Screen *s, int nr, int nc)
+{
+    const int or_ = s->rows, oc = s->cols;
+    char *buf = s->scrollback;
+    const int len = s->scrollback_len;
+
+    /* The open line at the end of the scrollback, if any, starts at cut; it
+     * continues the screen's row 0, whatever is done to that row. */
+    int cut = len;
+    while (cut > 0 && buf[cut - 1] != '\n') cut--;
+
+    /* The cursor's line: rows cf..cl, joined by ROW_WRAPPED. */
+    int cf = s->cur_row, cl = s->cur_row;
+    while (cf > 0 && row_wraps(s, cf - 1)) cf--;
+    while (cl + 1 < or_ && row_wraps(s, cl)) cl++;
+    const int R = cl - cf + 1;
+
+    /* Allocate everything first, so that failure changes nothing. */
+    Cell    *lin    = malloc(((size_t)or_ * oc + 2) * sizeof(Cell));
+    int     *lstart = malloc((size_t)or_ * sizeof(int));
+    int     *llen   = malloc((size_t)or_ * sizeof(int));
+    Cell    *tmp    = malloc(((size_t)nr * nc + 2) * sizeof(Cell));
+    Cell   **ng     = alloc_cells(nr, nc);
+    uint8_t *nf     = calloc((size_t)nr, 1);
+    if (!lin || !lstart || !llen || !tmp || !ng || !nf) goto fail;
+
+    /* 1. The other lines of the screen, as logical lines in lin, without
+     *    padding and with the blanks at each end trimmed off.  frozen is
+     *    the number of lines above the cursor's. */
+    int pos = 0, nl = 0, frozen = -1;
+    for (int r = 0; r < or_; ) {
+        if (r == cf) { frozen = nl; r = cl + 1; continue; }
+        int start = pos, b = r;
+        for (;;) {
+            for (int c = 0; c < oc; c++) {
+                const Cell *x = &s->cells[b][c];
+                if (!(x->flags & CELL_PAD)) lin[pos++] = *x;
+            }
+            if (b + 1 >= or_ || !row_wraps(s, b) || b + 1 == cf) break;
+            b++;
+        }
+        int n = pos - start;
+        while (n > 0 && cell_blank(lin[start + n - 1])) n--;
+        lstart[nl] = start; llen[nl] = n;
+        nl++;
+        r = b + 1;
+    }
+    if (frozen < 0) frozen = nl;               /* the cursor's line is always on the screen */
+    /* Blank lines below the cursor's line are not text. */
+    while (nl > frozen && llen[nl - 1] == 0) nl--;
+
+    /* 2. Rows the screen's lines take at the new width. */
+    int Sb = 0, Sa = 0;
+    for (int i = 0; i < nl; i++) {
+        int rows = lay_line(lin + lstart[i], llen[i], nc, NULL, NULL, 0);
+        if (i < frozen) Sb += rows; else Sa += rows;
+    }
+    const int S = Sb + R + Sa;
+
+    /* 3. A taller screen takes back whole lines from the end of the scrollback,
+     *    as long as they fit beside the screen's own.  Not while there is an open
+     *    line: it continues row 0, so nothing can come between it and the screen. */
+    int hrows = 0, pull = cut;
+    if (nr > or_ && cut == len) {
+        const int avail = nr - S;
+        for (int p = cut; p > 0; ) {
+            int q = p - 1;                 /* buf[p-1] is the newline ending the line */
+            while (q > 0 && buf[q - 1] != '\n') q--;
+            int n = decode_text(buf + q, p - 1 - q, tmp, nr * nc + 2);
+            if (n < 0) break;
+            int rows = lay_line(tmp, n, nc, NULL, NULL, 0);
+            if (hrows + rows > avail) break;
+            hrows += rows;
+            pull = p = q;
+        }
+    }
+
+    /* 4. Lay everything out: the pulled lines, the lines above the cursor's, the
+     *    cursor's own rows (cut or padded), then the lines below it. */
+    const int total = hrows + S;
+    Cell    **tg = alloc_cells(total, nc);
+    uint8_t  *tf = calloc((size_t)total, 1);
+    if (!tg || !tf) { free_cells(tg, total); free(tf); goto fail; }
+    int row = 0;
+    for (int p = pull; p < cut; ) {
+        int e = p;
+        while (e < cut && buf[e] != '\n') e++;
+        int n = decode_text(buf + p, e - p, tmp, nr * nc + 2);
+        row += lay_line(tmp, n, nc, tg, tf, row);
+        p = e + 1;
+    }
+    for (int i = 0; i < nl; i++) {
+        if (i == frozen) {
+            for (int k = 0; k < R; k++, row++) {
+                const int w = oc < nc ? oc : nc;
+                for (int c = 0; c < w; c++) {
+                    Cell x = s->cells[cf + k][c];
+                    if (c == nc - 1 && (x.flags & CELL_WIDE)) x = blank_cell(s);   /* cut in two */
+                    tg[row][c] = x;
+                }
+                if (row_wraps(s, cf + k)) tf[row] |= ROW_WRAPPED;
+            }
+        }
+        row += lay_line(lin + lstart[i], llen[i], nc, tg, tf, row);
+    }
+    if (frozen == nl) {                        /* the cursor's line comes last */
+        for (int k = 0; k < R; k++, row++) {
+            const int w = oc < nc ? oc : nc;
+            for (int c = 0; c < w; c++) {
+                Cell x = s->cells[cf + k][c];
+                if (c == nc - 1 && (x.flags & CELL_WIDE)) x = blank_cell(s);
+                tg[row][c] = x;
+            }
+            if (row_wraps(s, cf + k)) tf[row] |= ROW_WRAPPED;
+        }
+    }
+
+    const int cur_abs = hrows + Sb + (s->cur_row - cf);
+
+    /* 5. Rows above the new bottom go to the scrollback, but never the cursor's row. */
+    int over = total > nr ? total - nr : 0;
+    if (over > cur_abs) over = cur_abs;
+    const int keep = total - over < nr ? total - over : nr;
+
+    /* Nothing below can fail: commit. */
+    const bool pend = s->pending_wrap;
+    const int  ccol = s->cur_col + (pend ? 1 : 0);
+
+    s->scrollback_len = pull < cut ? pull : len;   /* history taken: back to its line; else all stays */
+    s->cols = nc;
+    for (int r = 0; r < over; r++)
+        scrollback_capture(s, &tg[r], tf[r]);
+    for (int r = 0; r < keep; r++) {
+        memcpy(ng[r], tg[over + r], (size_t)nc * sizeof(Cell));
+        nf[r] = tf[over + r];
+    }
+    free_cells(tg, total);
+    free(tf);
+    free(lin); free(lstart); free(llen); free(tmp);
+
+    if (s->alt_cells) s->alt_cells = resize_grid(s->alt_cells, or_, oc, nr, nc);
+    cells_dontneed(s->cells, or_, oc);
+    free_cells(s->cells, or_);
+    s->cells = ng;
+    free(s->row_flags);
+    s->row_flags = nf;
+    s->rows = nr;
+    s->scroll_top = 0;
+    s->scroll_bottom = nr - 1;
+
+    int crow = cur_abs - over;
+    s->cur_row = crow < nr ? crow : nr - 1;
+    s->cur_col = ccol < nc ? ccol : nc - 1;
+    s->pending_wrap = false;
+    if (s->saved_row     >= nr) s->saved_row     = nr - 1;
+    if (s->saved_col     >= nc) s->saved_col     = nc - 1;
+    if (s->alt_saved_row >= nr) s->alt_saved_row = nr - 1;
+    if (s->alt_saved_col >= nc) s->alt_saved_col = nc - 1;
+    return true;
+
+fail:
+    free(lin); free(lstart); free(llen); free(tmp);
+    free_cells(ng, nr); free(nf);
+    return false;
+}
+#endif /* SCROLLBACK_ENABLED */
+
 static void scr_resize(Screen *s, int new_rows, int new_cols)
 {
     int old_rows = s->rows;
     int old_cols = s->cols;
 
 #if SCROLLBACK_ENABLED
-    /*
-     * When growing vertically while NOT in the alt screen, pull lines from
-     * the scrollback buffer to fill the new space at the top, shifting
-     * existing content down so it stays flush with the bottom.  This
-     * mirrors xterm/tmux behaviour: the screen "unscrolls" on resize.
-     *
-     * We only do this for the primary grid (not alt_cells) and only when
-     * the scroll region covers the full screen (apps with private scroll
-     * regions, e.g. vim, handle their own geometry).
-     */
-    int extra = new_rows - old_rows;
-    if (extra > 0 && !s->in_alt_screen
-            && s->scroll_top == 0 && s->scroll_bottom == old_rows - 1
-            && s->scrollback && s->scrollback_len > 0) {
-
-        /* Count available scrollback lines */
-        int avail = 0;
-        for (int i = 0; i < s->scrollback_len; i++)
-            if (s->scrollback[i] == '\n') avail++;
-        if (extra > avail) extra = avail;   /* can't pull more than we have */
-
-        if (extra > 0) {
-            /* Allocate new grid */
-            Cell **ng = alloc_cells(new_rows, new_cols);
-
-            /* Find the start of the last `extra` lines in the buffer.
-             * The buffer always ends with '\n'.  Start the scan at len-1
-             * so that terminal newline doesn't count as a line boundary,
-             * which would otherwise cause an empty line to be decoded. */
-            int pos = s->scrollback_len - 1;   /* index of terminal '\n' */
-            for (int found = 0; found < extra && pos > 0; ) {
-                pos--;
-                if (s->scrollback[pos] == '\n') found++;
-            }
-            /* pos is now the '\n' preceding our block (or 0 if at start) */
-            int src_pos = (s->scrollback[pos] == '\n' && pos < s->scrollback_len - 1)
-                          ? pos + 1 : pos;
-            for (int r = 0; r < extra; r++) {
-                int end = src_pos;
-                while (end < s->scrollback_len && s->scrollback[end] != '\n') end++;
-                /* Write codepoints into row r of ng */
-                int c = 0;
-                int p2 = src_pos;
-                while (p2 < end && c < new_cols) {
-                    unsigned char b0 = (unsigned char)s->scrollback[p2];
-                    uint32_t cp; int seqlen;
-                    if      (b0 < 0x80)  { cp = b0; seqlen = 1; }
-                    else if (b0 < 0xE0)  { cp = b0 & 0x1F; seqlen = 2; }
-                    else if (b0 < 0xF0)  { cp = b0 & 0x0F; seqlen = 3; }
-                    else                  { cp = b0 & 0x07; seqlen = 4; }
-                    for (int k = 1; k < seqlen && p2+k < end; k++)
-                        cp = (cp << 6) | ((unsigned char)s->scrollback[p2+k] & 0x3F);
-                    ng[r][c].ch    = cp;
-                    ng[r][c].flags = CELL_FG_DFL | CELL_BG_DFL;
-                    p2 += seqlen;
-                    c++;
-                }
-                /* remaining cols already blank from alloc_cells */
-                src_pos = end + 1;
-            }
-
-            /* Copy old primary grid into ng[extra..extra+old_rows-1] */
-            int copy_cols = old_cols < new_cols ? old_cols : new_cols;
-            for (int r = 0; r < old_rows; r++)
-                memcpy(ng[extra + r], s->cells[r],
-                       (size_t)copy_cols * sizeof(Cell));
-
-            /* Adjust cursor and scroll region to account for shift */
-            s->cur_row  += extra;
-            s->saved_row += extra;
-            if (s->cur_row  >= new_rows) s->cur_row  = new_rows - 1;
-            if (s->saved_row >= new_rows) s->saved_row = new_rows - 1;
-
-            /* Retire the consumed lines.
-             * pos is the '\n' that separates the kept part from the consumed
-             * part.  We want to keep bytes 0..pos inclusive, so len = pos+1.
-             * If pos==0 we consumed everything. */
-            s->scrollback_len = (pos > 0) ? pos + 1 : 0;
-
-            /* Install new grid, free old */
-            cells_dontneed(s->cells, old_rows, old_cols);
-            free_cells(s->cells, old_rows);
-            s->cells = ng;
-
-            /* row_flags: shift down by extra, fill new top rows with 0 */
-            if (s->row_flags) {
-                s->row_flags = realloc(s->row_flags, (size_t)new_rows);
-                if (s->row_flags) {
-                    memmove(s->row_flags + extra, s->row_flags,
-                            (size_t)old_rows);
-                    memset(s->row_flags, 0, (size_t)extra);
-                }
-            }
-
-            /* alt_cells: resize normally (no scrollback fill for alt screen) */
-            if (s->alt_cells)
-                s->alt_cells = resize_grid(s->alt_cells, old_rows, old_cols,
-                                            new_rows, new_cols);
-
-            s->rows = new_rows;
-            s->cols = new_cols;
-            s->scroll_bottom = new_rows - 1;
-            if (s->alt_saved_row >= new_rows) s->alt_saved_row = new_rows - 1;
-            if (s->alt_saved_col >= new_cols) s->alt_saved_col = new_cols - 1;
-            if (s->saved_col     >= new_cols) s->saved_col     = new_cols - 1;
-            if (s->cur_col       >= new_cols) { s->cur_col = new_cols - 1; s->pending_wrap = false; }
-            return;
-        }
-    }
-#endif
-
-#if SCROLLBACK_ENABLED
-    /*
-     * When shrinking vertically on the primary screen with a full scroll
-     * region, rows have to go.  Empty ones below the cursor go first,
-     * from the bottom: a short session (a prompt and the output of a
-     * command or two) must not lose the top of its text just because the
-     * screen got a few rows shorter, as that looks like a fresh session.
-     * Only what is still left over -- the cursor would otherwise fall off
-     * the bottom -- is pushed off the top into scrollback.  The bottom of
-     * a full screen thus stays visually anchored, as in xterm/tmux.
-     */
-    int reduce = old_rows - new_rows;
-    if (reduce > 0 && !s->in_alt_screen
-            && s->scroll_top == 0 && s->scroll_bottom == old_rows - 1
-            && s->scrollback) {
-
-        int blank_below = 0;
-        for (int r = old_rows - 1; r > s->cur_row && blank_below < reduce; r--) {
-            if (!row_is_blank(s->cells[r], old_cols)) break;
-            blank_below++;
-        }
-        int top = reduce - blank_below;     /* rows to evict from the top */
-
-        /* Capture rows 0..top-1 into scrollback (oldest first) */
-        for (int r = 0; r < top; r++)
-            scrollback_capture(s, &s->cells[r],
-                               s->row_flags ? s->row_flags[r] : 0);
-
-        /* Allocate new smaller grid, copy surviving rows */
-        Cell **ng = alloc_cells(new_rows, new_cols);
-        int copy_cols = old_cols < new_cols ? old_cols : new_cols;
-        for (int r = 0; r < new_rows; r++)
-            memcpy(ng[r], s->cells[top + r],
-                   (size_t)copy_cols * sizeof(Cell));
-
-        /* Adjust cursor upward by the rows evicted from the top */
-        s->cur_row  -= top;
-        s->saved_row -= top;
-        if (s->cur_row  < 0) { s->cur_row  = 0; s->pending_wrap = false; }
-        if (s->saved_row < 0)  s->saved_row  = 0;
-
-        cells_dontneed(s->cells, old_rows, old_cols);
-        free_cells(s->cells, old_rows);
-        s->cells = ng;
-
-        /* row_flags: discard top `top` rows, realloc to new size */
-        if (s->row_flags) {
-            memmove(s->row_flags, s->row_flags + top,
-                    (size_t)new_rows);
-            s->row_flags = realloc(s->row_flags, (size_t)new_rows);
-        }
-
-        if (s->alt_cells)
-            s->alt_cells = resize_grid(s->alt_cells, old_rows, old_cols,
-                                        new_rows, new_cols);
-
-        s->rows = new_rows;
-        s->cols = new_cols;
-        s->scroll_bottom = new_rows - 1;
-        /* This branch returns, so it must clamp everything that the default
-         * path below clamps.  The saved row is the one that was missing: the
-         * eviction only subtracts from it, so it can still lie below the new
-         * bottom.  A later ESC 8 (restore cursor) then used it as a row index
-         * into a grid with fewer rows: a heap read out of bounds in put_char(). */
-        if (s->cur_row       >= new_rows) { s->cur_row = new_rows - 1; s->pending_wrap = false; }
-        if (s->cur_col       >= new_cols) { s->cur_col = new_cols - 1; s->pending_wrap = false; }
-        if (s->saved_row     >= new_rows)   s->saved_row     = new_rows - 1;
-        if (s->saved_col     >= new_cols)   s->saved_col     = new_cols - 1;
-        if (s->alt_saved_row >= new_rows)   s->alt_saved_row = new_rows - 1;
-        if (s->alt_saved_col >= new_cols)   s->alt_saved_col = new_cols - 1;
+    if (!s->in_alt_screen && s->scrollback && s->cells && new_cols >= 2 &&
+        s->scroll_top == 0 && s->scroll_bottom == old_rows - 1 &&
+        reflow(s, new_rows, new_cols))
         return;
-    }
 #endif
 
     /* Default resize (shrink with no scrollback, or alt screen) */
@@ -1424,7 +1510,15 @@ void vt_resize(VTParser *p, int rows, int cols)
 {
     if (rows == p->scr.rows && cols == p->scr.cols) return;
 
+    int old_rows = p->scr.rows;
     scr_resize(&p->scr, rows, cols);
+    if (p->scr.alt_row_flags) {
+        uint8_t *f = realloc(p->scr.alt_row_flags, (size_t)rows);
+        if (f) {
+            if (rows > old_rows) memset(f + old_rows, 0, (size_t)(rows - old_rows));
+            p->scr.alt_row_flags = f;
+        }
+    }
 
     /* Rebuild tab stops for the new column count.  scr_resize has already
      * updated p->scr.cols, so tabs_reset will use the new width. */

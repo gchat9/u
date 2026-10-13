@@ -1,6 +1,14 @@
 #ifndef _LIB_XTERM_H
 #define _LIB_XTERM_H
 
+/* The default foreground and background of a cell (what SGR 39 and 49
+ * select, and what a cell has before anything is set): palette slots 7
+ * (ANSI white) and 0 (ANSI black).  The palette has no separate default
+ * entries, and programs cannot change the defaults (OSC 10/11 are not
+ * handled), so these two slots are the defaults. */
+#define XTERM_FG_DEFAULT 7
+#define XTERM_BG_DEFAULT 0
+
 uint8_t *xterm_framebuffer(void);
 /* Parallel per-cell xterm 256-colour palette indices (0-255), same
  * layout as xterm_framebuffer() (row*columns()+col). Index 15 is this

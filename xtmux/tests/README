@@ -9,3 +9,9 @@ imagemagick   # or graphicsmagick-imagemagick-compat, to covert xwd's output to 
 
 make -C ../xtmux              # binary for this testsuite to drive
 make -C ../../_font install   # /etc/font.bfnt and /etc/emoji.bfnt
+
+palette.py   xtmux colours, sampled from a screenshot (no mouse needed): the default
+            background and foreground (slots 0 and 7), slot 15, bold, the cube and greyscale.
+            Run as: python3 xtmux/tests/palette.py
+vt_check.c   the primary screen's text, wrap flags and cursor against a model, for vt.c alone:
+             diet gcc -I_lib -I_font -I_sys -o vt_check xtmux/tests/vt_check.c _lib/vt.c && ./vt_check [seeds]

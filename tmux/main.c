@@ -379,12 +379,15 @@ static void auto_detach(void)
  * there is no terminal to write to (see the note by the main select()
  * loop), so it is drawn into the window's cells instead; the backend
  * wraps and scrolls just as a terminal would, so the two builds show the
- * same thing. */
-static void sb_line(const char *p, int n, bool dim)
+ * same thing.  wrapped: the line goes on in the next call, as the screen
+ * wrapped it (only the X11 build keeps that: a copy from the view must not
+ * put a newline where the program had none). */
+static void sb_line(const char *p, int n, bool dim, bool wrapped)
 {
 #ifdef X11_BACKEND
-    x11_backend_text_line(p, n, (Style){ dim ? 8 : 15, 0 });
+    x11_backend_text_line(p, n, (Style){ dim ? 8 : XTERM_FG_DEFAULT, XTERM_BG_DEFAULT }, wrapped);
 #else
+    (void)wrapped;
     if (dim)  (void)write(STDOUT_FILENO, "\033[2m", 4);
     if (n > 0) (void)write(STDOUT_FILENO, p, (size_t)n);
     if (dim)  (void)write(STDOUT_FILENO, "\033[m", 3);
@@ -413,8 +416,14 @@ static void render_scrollback_view(void)
     int sb_lines = 0;
     for (int i = 0; i < len; i++)
         if (buf[i] == '\n') sb_lines++;
+    /* A last line with no newline is the start of a line whose end is on
+     * the screen: its row wrapped and scrolled off before the row after it
+     * did, so its end is live row 0.  It is shown as a line of its own,
+     * wrapped into that row, so that a copy from the view is whole. */
+    int partial = len > 0 && buf[len - 1] != '\n';
+    int sb_total = sb_lines + partial;      /* history lines, that one included */
     int live_lines = s->rows;
-    int total = sb_lines + live_lines;
+    int total = sb_total + live_lines;
 
     /* Clamp offset: 0 = bottom (live screen visible), higher = further back */
     int max_off = total > view_rows ? total - view_rows : 0;
@@ -436,27 +445,27 @@ static void render_scrollback_view(void)
 
     /* Top-of-history marker */
     if (skip == 0) {
-        sb_line("-- top of scrollback --", 23, true);
+        sb_line("-- top of scrollback --", 23, true, false);
         row++;
     }
 
-    /* Phase 1: lines from the scrollback buffer */
-    int sb_skip = skip < sb_lines ? skip : sb_lines;
+    /* Phase 1: lines from the scrollback buffer, the unterminated one last */
+    int nl_skip = skip < sb_lines ? skip : sb_lines;
     int pos = 0;
-    for (int i = 0; i < sb_skip && pos < len; pos++)
+    for (int i = 0; i < nl_skip && pos < len; pos++)
         if (buf[pos] == '\n') i++;
 
-    int sb_row = sb_skip;   /* which sb line we're on */
-    while (row < view_rows && sb_row < sb_lines && pos <= len) {
+    int sb_row = skip < sb_total ? skip : sb_total;   /* which sb line we're on */
+    while (row < view_rows && sb_row < sb_total && pos <= len) {
         int end = pos;
         while (end < len && buf[end] != '\n') end++;
-        sb_line(buf + pos, end - pos, false);
+        sb_line(buf + pos, end - pos, false, end == len && partial);
         row++; sb_row++;
         pos = end + 1;
     }
 
     /* Phase 2: live screen rows (encoded on the fly, no allocation) */
-    int live_skip = skip > sb_lines ? skip - sb_lines : 0;
+    int live_skip = skip > sb_total ? skip - sb_total : 0;
     for (int r = live_skip; r < s->rows && row < view_rows; r++, row++) {
         /* Find last non-space cell for trimming */
         int last = -1;
@@ -484,7 +493,8 @@ static void render_scrollback_view(void)
                                      line[ll++] = (char)(0x80|((cp>>6)&0x3F));
                                      line[ll++] = (char)(0x80|(cp&0x3F)); }
         }
-        sb_line(line, ll, false);
+        sb_line(line, ll, false,
+                s->row_flags && (s->row_flags[r] & ROW_WRAPPED));
     }
 
     /* Scrollback status indicator in the status row, in the status
@@ -572,6 +582,11 @@ static bool scrollback_input_byte(uint8_t b)
 static bool scrollback_feed(uint8_t b, bool last)
 {
     if (!g_scrollback_mode) return false;
+#ifdef X11_BACKEND
+    /* The highlight is of text the key may move, so drop it and repaint
+     * without it before the key is handled. */
+    if (xscr_selection_drop()) render_scrollback_view();
+#endif
     bool exit_sb = scrollback_input_byte(b);
 #ifdef X11_BACKEND
     if (b == '\033' && last && _sb_esc == 1) exit_sb = true;
@@ -804,13 +819,13 @@ static int shown_mouse_mode(void)
 
 /* How much pointer traffic to ask the X server for: what that program
  * wants, but at least buttons and drags, since the mouse is also ours for
- * copy and paste (see x11_backend.c) -- except while the scrollback
- * viewer is up, which has nothing to select. */
+ * copy and paste (see x11_backend.c).  The scrollback viewer selects text
+ * too, so it gets the same; nothing is reported to a program from it. */
 static int mouse_level_wanted(void)
 {
     if (!g_wins[g_cur]) return 0;
 #if SCROLLBACK_ENABLED
-    if (g_scrollback_mode) return 0;
+    if (g_scrollback_mode) return 2;
 #endif
     int m = shown_mouse_mode();
     return m < 2 ? 2 : m;
@@ -823,6 +838,13 @@ static void pointer_sink(const uint8_t *b, size_t n, void *ctx)
     (void)ctx;
     Window *w = g_wins[g_cur];
     if (w && w->alive) { w->pristine = false; pty_write_all(w, b, n); }
+}
+
+/* The same for the scrollback viewer, which has no program to write to: a
+ * paste asked for there is dropped (xscr_pointer may still ask for one). */
+static void discard_sink(const uint8_t *b, size_t n, void *ctx)
+{
+    (void)b; (void)n; (void)ctx;
 }
 #endif
 
@@ -849,6 +871,9 @@ static void handle_event(InputEvent ev)
                 g_wins[g_cur]->vt.scr.scrollback_len > 0) {
             g_scrollback_mode   = true;
             _sb_esc             = 0;
+#ifdef X11_BACKEND
+            (void)xscr_selection_drop();   /* a live selection's highlight */
+#endif
             /* PgUp variant: pre-scroll one page so history is immediately
              * visible without an extra keypress. */
             g_scrollback_offset = (ev.cmd == CMD_SCROLLBACK_ENTER_PGUP)
@@ -1377,12 +1402,23 @@ int main(int argc, char *argv[])
             }
 
             /* Pointer events: for the displayed program, as the report it
-             * asked for, or else text selection, copy and paste. */
+             * asked for, or else text selection, copy and paste.  In the
+             * scrollback viewer the selection is in the viewer's own text,
+             * nothing is reported or pasted, and the wheel scrolls it. */
             {
                 Window *mw = g_wins[g_cur];
-                if (x11_backend_paste_key() && mw && !g_scrollback_mode)   /* Shift+Insert, Ctrl+V */
-                    xscr_paste(mw->vt.scr.bracketed_paste, pointer_sink, NULL);
-                if (mw && !g_scrollback_mode) {
+                int paste = x11_backend_paste_key();   /* Shift+Insert, Ctrl+V */
+                if (g_scrollback_mode) {
+                    int steps = xscr_pointer(x11_backend_text_screen(), 0, 0, 0,
+                                             child_rows(), g_cols, discard_sink, NULL);
+                    if (steps) {                /* the wheel scrolls it, as Up and Down do */
+                        (void)xscr_selection_drop();   /* as a key does */
+                        g_scrollback_offset += steps;
+                        render_scrollback_view();
+                    }
+                } else if (mw) {
+                    if (paste)
+                        xscr_paste(mw->vt.scr.bracketed_paste, pointer_sink, NULL);
                     Screen *ms = &mw->vt.scr;
                     xscr_pointer(ms, shown_mouse_mode(), ms->mouse_enc,
                                         ms->bracketed_paste, child_rows(), g_cols,

@@ -6,6 +6,7 @@
 #include "../_font/emoji_charset.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 int x11_backend_init(void)
@@ -73,7 +74,7 @@ void x11_backend_status(int row, int cols, int active,
      * than-cols case) rather than relying on that invariant alone. */
     for (int c = 0; c < cols; c++) {
         int i = row * xcols + c;
-        ctx.fb[i] = (uint8_t)xscr_glyph_slot(0); ctx.fgb[i] = 15; ctx.bgb[i] = 0; ctx.atb[i] = 0;
+        ctx.fb[i] = (uint8_t)xscr_glyph_slot(0); ctx.fgb[i] = XTERM_FG_DEFAULT; ctx.bgb[i] = XTERM_BG_DEFAULT; ctx.atb[i] = 0;
     }
 
     status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive);
@@ -81,31 +82,64 @@ void x11_backend_status(int row, int cols, int active,
 }
 
 /* ── Plain-text view (the scrollback viewer) ──────────────────────────
- * The scrollback is text, not cells, so it can't go through
- * xscr_render().  These draw UTF-8 into the same cell buffers and
- * behave like writing to a terminal: x11_backend_text_line() appends at a
- * text cursor, wraps long lines and scrolls the whole screen up when it
- * runs off the bottom, exactly as the plain build's output to a real
- * terminal does.  Colours come per call, as palette indices. */
-static int tr_row, tr_col;
+ * The scrollback is text, not the program's cells, but it is laid out in a
+ * Screen (vt.h) and drawn from that with xscr_render(), so xterm_screen.c
+ * can select and copy from it exactly as from a program's screen: the
+ * same cell grid, wrap flags and wide-character marks, see tv_* below.
+ * x11_backend_text_screen() exposes it to xscr_pointer().
+ *
+ * These functions behave like writing to a terminal: x11_backend_text_line()
+ * appends at a text cursor, wraps long lines and scrolls the whole screen
+ * up when it runs off the bottom, exactly as the plain build's output to a
+ * real terminal does.  Colours come per call, as palette indices.  The
+ * footer (the last row) is laid out in the same grid, but the viewer's
+ * pointer is kept to the rows above it (see main.c). */
 
-static void blank_cells(int i, int n, Style st)
+static Screen tv;                 /* the viewer's grid; cur_row -1: no cursor */
+static Cell  *tv_store;           /* the cells tv.cells[] point into */
+static int    tr_row, tr_col;     /* the text cursor */
+
+/* Make tv match the window's size.  It is blanked by _begin, and a resize
+ * redraws the viewer, so nothing needs carrying over.  On allocation
+ * failure tv.cells stays NULL and every function here does nothing. */
+static void tv_fit(void)
 {
-    memset(xterm_framebuffer() + i, xscr_glyph_slot(0), (size_t)n);
-    memset(xterm_fg_buffer() + i, st.fg, (size_t)n);
-    memset(xterm_bg_buffer() + i, st.bg, (size_t)n);
-    memset(xterm_attr_buffer() + i, 0,  (size_t)n);
+    int rows = xterm_rows(), cols = xterm_columns();
+    if (tv.cells && tv.rows == rows && tv.cols == cols) return;
+    free(tv.cells); free(tv_store); free(tv.row_flags);
+    tv.cells = NULL; tv_store = NULL; tv.row_flags = NULL; tv.rows = tv.cols = 0;
+    tv.cells     = malloc(sizeof *tv.cells * (size_t)rows);
+    tv_store     = malloc(sizeof *tv_store * (size_t)rows * (size_t)cols);
+    tv.row_flags = malloc((size_t)rows);
+    if (!tv.cells || !tv_store || !tv.row_flags) {
+        free(tv.cells); free(tv_store); free(tv.row_flags);
+        tv.cells = NULL; tv_store = NULL; tv.row_flags = NULL;
+        return;
+    }
+    for (int r = 0; r < rows; r++) tv.cells[r] = tv_store + (size_t)r * cols;
+    tv.rows = rows; tv.cols = cols;
+    tv.cur_row = tv.cur_col = -1;
+}
+
+static void blank_row(int r, Style st)
+{
+    for (int c = 0; c < tv.cols; c++) {
+        Cell *x = &tv.cells[r][c];
+        x->ch = 0; x->fg = st.fg; x->bg = st.bg; x->attrs = 0; x->flags = 0;
+    }
+    tv.row_flags[r] = 0;
 }
 
 void x11_backend_text_fill(int row, Style st)
 {
-    if (row >= 0 && row < xterm_rows())
-        blank_cells(row * xterm_columns(), xterm_columns(), st);
+    if (tv.cells && row >= 0 && row < tv.rows) blank_row(row, st);
 }
 
 void x11_backend_text_begin(void)
 {
-    blank_cells(0, xterm_rows() * xterm_columns(), (Style){ 15, 0 });
+    tv_fit();
+    if (!tv.cells) return;
+    for (int r = 0; r < tv.rows; r++) blank_row(r, (Style){ XTERM_FG_DEFAULT, XTERM_BG_DEFAULT });
     tr_row = tr_col = 0;
 }
 
@@ -128,65 +162,70 @@ static uint32_t next_char(const char **p, const char *end, int *width)
     return cp;
 }
 
-/* Store `cp` (width 1 or 2) at the given cell and, if wide, the next. */
-static void put_text_char(int i, uint32_t cp, int width, Style st)
+/* Store cp at (row, col) in the grid, `width` cells wide.  A wide character
+ * is a CELL_WIDE cell and a CELL_WIDE_CONT cell, which xscr_render draws as
+ * the two halves of one glyph; the continuation's ch stays 0 so that, if
+ * it is ever left without its partner, it is drawn blank. */
+static void put_text_char(int row, int col, uint32_t cp, int width, Style st)
 {
-    uint8_t *fb = xterm_framebuffer(), *atb = xterm_attr_buffer();
     for (int h = 0; h < width; h++) {
-        uint8_t attr = 0;
-        int g = width == 2 ? xscr_wide_glyph(cp, h, &attr) : xscr_glyph_slot(cp);
-        fb[i + h] = g < 0 ? 0 : (uint8_t)g;
-        atb[i + h] = (g < 0 && !attr) ? XTERM_ATTR_MISSING : attr;
-        xterm_fg_buffer()[i + h] = st.fg;
-        xterm_bg_buffer()[i + h] = st.bg;
+        Cell *x = &tv.cells[row][col + h];
+        x->ch    = h ? 0 : cp;
+        x->fg    = st.fg;
+        x->bg    = st.bg;
+        x->attrs = 0;
+        x->flags = width == 2 ? (h ? CELL_WIDE_CONT : CELL_WIDE) : 0;
     }
 }
 
 /* Draw up to n bytes of text at (row, col), clipped to the row, no wrap. */
 void x11_backend_text_at(int row, int col, const char *s, int n, Style st)
 {
-    int cols = xterm_columns();
-    if (row < 0 || row >= xterm_rows()) return;
+    if (!tv.cells || row < 0 || row >= tv.rows) return;
     for (const char *end = s + n; s < end; ) {
         int w; uint32_t cp = next_char(&s, end, &w);
         if (!cp) continue;
-        if (col + w > cols) break;
-        put_text_char(row * cols + col, cp, w, st);
+        if (col + w > tv.cols) break;
+        put_text_char(row, col, cp, w, st);
         col += w;
     }
 }
 
-/* Append a line at the text cursor (wrapping), then move to the next
- * row, scrolling the screen up by one row if that runs off the bottom. */
-static void text_newline(void)
+/* End the current row, then move to the next, scrolling the screen up by one
+ * row if that runs off the bottom.  wrapped: the line goes on in the next row
+ * (what ROW_WRAPPED records, so that a copy joins the two without a newline). */
+static void text_break(int wrapped)
 {
-    int cols = xterm_columns(), rows = xterm_rows();
+    if (wrapped) tv.row_flags[tr_row] |= ROW_WRAPPED;
     tr_col = 0;
-    if (++tr_row < rows) return;
-    tr_row = rows - 1;
-    memmove(xterm_framebuffer(),   xterm_framebuffer()   + cols, (size_t)(rows - 1) * cols);
-    memmove(xterm_fg_buffer(),     xterm_fg_buffer()     + cols, (size_t)(rows - 1) * cols);
-    memmove(xterm_bg_buffer(),     xterm_bg_buffer()     + cols, (size_t)(rows - 1) * cols);
-    memmove(xterm_attr_buffer(),   xterm_attr_buffer()   + cols, (size_t)(rows - 1) * cols);
-    blank_cells(tr_row * cols, cols, (Style){ 15, 0 });
+    if (++tr_row < tv.rows) return;
+    tr_row = tv.rows - 1;
+    Cell *top = tv.cells[0];
+    memmove(tv.cells, tv.cells + 1, sizeof *tv.cells * (size_t)(tv.rows - 1));
+    tv.cells[tv.rows - 1] = top;
+    memmove(tv.row_flags, tv.row_flags + 1, (size_t)(tv.rows - 1));
+    blank_row(tv.rows - 1, (Style){ XTERM_FG_DEFAULT, XTERM_BG_DEFAULT });
 }
 
-void x11_backend_text_line(const char *s, int n, Style st)
+void x11_backend_text_line(const char *s, int n, Style st, int wrapped)
 {
-    int cols = xterm_columns();
+    if (!tv.cells) return;
     for (const char *end = s + n; s < end; ) {
         int w; uint32_t cp = next_char(&s, end, &w);
         if (!cp) continue;
-        if (tr_col + w > cols) text_newline();
-        put_text_char(tr_row * cols + tr_col, cp, w, st);
+        if (w > tv.cols) continue;            /* would not fit on a row */
+        if (tr_col + w > tv.cols) text_break(1);
+        put_text_char(tr_row, tr_col, cp, w, st);
         tr_col += w;
     }
-    text_newline();
+    text_break(wrapped);                      /* wrapped: the next line continues it */
 }
 
-/* Show what was drawn above; the text view has no cursor. */
+/* Show what was drawn above, with the selection highlighted if there is
+ * one.  The text view has no cursor (cur_row is -1). */
 void x11_backend_text_end(void)
 {
-    xterm_set_cursor(-1, -1);
-    xterm_render();
+    if (tv.cells) xscr_render(&tv);
 }
+
+const Screen *x11_backend_text_screen(void) { return &tv; }

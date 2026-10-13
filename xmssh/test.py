@@ -112,6 +112,40 @@ try:
     check("...and closing it exits with status 1", wait(lambda: p.poll() == 1), p.poll())
     if p.poll() is None: p.kill()
 
+    print("## another client on the display")
+    def synth_keys(wid, text):
+        """Key presses sent by protocol (XSendEvent), as another X client would send them."""
+        KC = {'t':28,'o':32,'u':30,'c':54,'h':43,' ':65,'s':39,'y':29,'n':57,'\n':36,'r':27,'e':26,'a':38,'l':46}
+        d = display.Display(); win = d.create_resource_object("window", int(wid)); root = d.screen().root
+        for ch in text:
+            ev = protocol.event.KeyPress(time=X.CurrentTime, root=root, window=win, same_screen=1, child=X.NONE,
+                                         root_x=0, root_y=0, event_x=0, event_y=0, state=0, detail=KC[ch])
+            win.send_event(ev, event_mask=X.KeyPressMask); d.flush(); time.sleep(0.03)
+        d.sync(); d.close()
+    p = start(); wid = window(p); time.sleep(2)
+    typed("cd %s" % T); time.sleep(0.5)
+    synth_keys(wid, "touch syn\n"); time.sleep(1.5)
+    check("key presses sent by another client are not typed into the session", not os.path.exists(os.path.join(T, "syn")))
+    typed("touch real")
+    check("...and the window still takes the user's keyboard", wait(lambda: os.path.exists(os.path.join(T, "real"))))
+    typed("exit 0"); wait(lambda: p.poll() is not None)
+    if p.poll() is None: p.kill()
+
+    print("## the font file")
+    good_font = open("/etc/font.bfnt", "rb").read()
+    def font_refused(data, name):
+        """A damaged /etc/font.bfnt: refused with a message (it used to be a crash)."""
+        try:
+            open("/etc/font.bfnt", "wb").write(data)
+            q = subprocess.run([BIN, "-o", "UserKnownHostsFile=" + os.path.join(T, "known_hosts"), "-i", os.path.join(T, "key"),
+                                "-p", PORT, "root@127.0.0.1", "true"], capture_output=True, timeout=30)
+            check(name, q.returncode == 1 and b"BFNT" in q.stderr, (q.returncode, q.stderr[-200:]))
+        finally:
+            open("/etc/font.bfnt", "wb").write(good_font)
+    font_refused(good_font[:1000], "a truncated font is refused with a message, not a crash")
+    font_refused(good_font[:6] + b"\0\0" + good_font[8:], "a font with an empty cell is refused with a message")
+    check("the real font is back in place", open("/etc/font.bfnt", "rb").read() == good_font)
+
     print("## failing")
     p = subprocess.Popen([BIN, "-i", os.path.join(T, "key"), "-p", "1", "root@127.0.0.1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     wid = window(p); time.sleep(1.5)

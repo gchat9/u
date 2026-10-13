@@ -27,6 +27,8 @@
 #define CELL_WIDE_CONT 0x02  /* continuation cell of a double-width char */
 #define CELL_FG_DFL    0x04  /* use terminal default foreground          */
 #define CELL_BG_DFL    0x08  /* use terminal default background          */
+#define CELL_PAD       0x10  /* blank that pads a wide char to the next row:
+                              * not text (not copied, not reflowed)       */
 
 /*
  * fg/bg colour encoding in Cell.fg / Cell.bg (uint8_t, 0-255):
@@ -99,6 +101,9 @@ typedef struct {
 
     char     title[256];    /* set by OSC 0/1/2                         */
     uint8_t *row_flags;    /* per-row flags, e.g. ROW_WRAPPED           */
+    uint8_t *alt_row_flags;/* the other screen's flags: while in the alt
+                            * screen, the primary's (swapped with
+                            * row_flags, as cells and alt_cells are)     */
 
 #if SCROLLBACK_ENABLED
     /* Plain-text scrollback: UTF-8 lines, trailing-whitespace stripped,

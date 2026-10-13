@@ -7,3 +7,5 @@ header of each script for the rest.  They print what they observe; compare with 
   scrollback.sh XTMUX    Ctrl+B PgUp viewer: enter, scroll, Esc restores the screen exactly
   scrollback-plain.py TMUX   same for plain tmux, in a pty + terminal emulator (python3-pyte)
   sigwinch.sh XTMUX      SIGWINCH while blocked writing to the X server must not kill it
+  reflow.py XTMUX        a 100-character line, then the window widened and narrowed: it reflows
+  prompt_resize.py XTMUX [MIN] bash repaints its input after resizes: the prompt shows once, no letter runs

@@ -38,22 +38,13 @@ struct sockaddr_un {
 };
 
 /* ── palette (0x00RRGGBB) ─────────────────────────────────────────── */
-#define C_BG 0x0D1117u
-#define C_FG 0xCDD9E5u
-#define C_CU 0x57AB5Au
 
 /* Standard xterm 256-colour palette (see e.g.
  * https://www.ditig.com/256-colors-cheat-sheet), matching the encoding
  * documented in vt.h for Cell.fg/bg: 0-7 ANSI, 8-15 bright ANSI,
- * 16-231 the 6x6x6 colour cube, 232-255 the greyscale ramp.
- *
- * Slots 0 and 15 (ANSI black / bright white) are overwritten with this
- * backend's own C_BG/C_FG theme colours: CELL_FG_DFL/CELL_BG_DFL (SGR
- * "default colour") are resolved to indices 15/0 rather than needing a
- * separate default-flag byte per cell, so plain unstyled text renders
- * pixel-identical to before this change. The one cost: literal ANSI
- * black (SGR 40) and bright white (SGR 97) become indistinguishable
- * from "default" — a deliberate compactness trade-off. */
+ * 16-231 the 6x6x6 colour cube, 232-255 the greyscale ramp.  Nothing is
+ * overridden: the defaults are slots XTERM_FG_DEFAULT and XTERM_BG_DEFAULT
+ * (xterm.h), so SGR 39/49 and a plain cell render as slots 7 and 0. */
 static uint32_t palette[256];
 
 static void build_palette(void)
@@ -73,8 +64,6 @@ static void build_palette(void)
         uint32_t v = 8 + (uint32_t)i * 10;
         palette[232 + i] = (v << 16) | (v << 8) | v;
     }
-    palette[0]  = C_BG;
-    palette[15] = C_FG;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -521,8 +510,8 @@ static void grid_init(uint16_t screen_w, uint16_t screen_h,
     scr = screen;
     memset(scr, 0, cells);
     fgb = fg_storage; bgb = bg_storage; atb = attr_storage;
-    memset(fgb, 15, cells);  /* default fg (palette[15], see build_palette) */
-    memset(bgb, 0,  cells);  /* default bg (palette[0])                     */
+    memset(fgb, XTERM_FG_DEFAULT, cells);
+    memset(bgb, XTERM_BG_DEFAULT, cells);
     memset(atb, 0,  cells);
 }
 
@@ -882,7 +871,7 @@ static uint8_t xterm_depth;
 
 uint8_t *xterm_framebuffer(void) { return scr; }
 /* Parallel to xterm_framebuffer(): one xterm 256-colour palette index
- * per cell. Defaults (palette[15]/palette[0], see build_palette) fill
+ * per cell. Defaults (XTERM_FG_DEFAULT/XTERM_BG_DEFAULT, xterm.h) fill
  * cells the caller never touches. */
 uint8_t *xterm_fg_buffer(void) { return fgb; }
 uint8_t *xterm_bg_buffer(void) { return bgb; }

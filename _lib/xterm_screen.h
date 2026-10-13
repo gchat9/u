@@ -37,7 +37,11 @@ int xscr_wide_glyph(uint32_t wch, int right, uint8_t *attr);
  * xterm_paste_key() says, once, that Shift+Insert or Ctrl+V asked for that.
  * _selection_drop removes the highlight (nonzero if there was one to
  * repaint); _pointer_release says that send/ctx is going away. */
-void xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
+/* Returns the wheel steps that were not for the program: +1 for each
+ * wheel-up press, -1 for each wheel-down press, summed.  A caller with no
+ * program to report to (the scrollback viewer) scrolls by them; one that
+ * has a program ignores the result. */
+int  xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
                   int rows, int cols,
                   void (*send)(const uint8_t *, size_t, void *), void *ctx);
 void xscr_paste(int bracketed, void (*send)(const uint8_t *, size_t, void *), void *ctx);

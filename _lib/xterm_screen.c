@@ -16,29 +16,22 @@
 
 /* Resolve a Cell's colour down to two xterm-256-palette index bytes,
  * plus a small structural-attr bitmask (drawn as extra pixels, not a
- * colour swap — see xterm.c's fill_row).
- * CELL_FG_DFL/CELL_BG_DFL -> 15/0 (this backend's default fg/bg, see
- * xterm.c's build_palette). ATTR_BOLD brightens an 0-7 fg into its
- * 8-15 counterpart (there's no separate bold glyph, so colour is the
- * only bold cue available). Slot 15 is this backend's theme foreground
- * (C_FG), not real white, so a bold fg that lands on it -- default
- * colour, or white -- is moved to slot 231, the 6x6x6 cube's (255,255,
- * 255): bold default-coloured text shows as bright white, #ffffff.
- * (Plain bright white, SGR 97, stays the theme foreground: see
- * build_palette.) ATTR_REVERSE swaps the pair last, matching
- * how a real terminal composites reverse video. ATTR_UNDERLINE and
- * ATTR_STRIKE map straight through to XTERM_ATTR_UNDERLINE/STRIKE.
+ * colour swap -- see xterm.c's fill_row).  A default colour (CELL_FG_DFL /
+ * CELL_BG_DFL) is the palette slot XTERM_FG_DEFAULT / XTERM_BG_DEFAULT
+ * (xterm.h).  ATTR_BOLD brightens an 0-7 fg into its 8-15 counterpart
+ * (there's no separate bold glyph, so colour is the only bold cue
+ * available), so bold default text becomes slot 15, #ffffff.
+ * ATTR_REVERSE swaps the pair last, matching how a real terminal composites
+ * reverse video.  ATTR_UNDERLINE and ATTR_STRIKE map straight through to
+ * XTERM_ATTR_UNDERLINE/STRIKE.
  * TODO: ATTR_DIM, ATTR_ITALIC, ATTR_BLINK, ATTR_INVIS aren't rendered
  * by this backend yet. */
 static void resolve_colors(const Cell *cell, uint8_t *out_fg, uint8_t *out_bg,
                            uint8_t *out_attr)
 {
-    uint8_t fg = (cell->flags & CELL_FG_DFL) ? 15 : cell->fg;
-    uint8_t bg = (cell->flags & CELL_BG_DFL) ? 0  : cell->bg;
-    if (cell->attrs & ATTR_BOLD) {
-        if (fg < 8) fg = (uint8_t)(fg + 8);
-        if (fg == 15) fg = 231;
-    }
+    uint8_t fg = (cell->flags & CELL_FG_DFL) ? XTERM_FG_DEFAULT : cell->fg;
+    uint8_t bg = (cell->flags & CELL_BG_DFL) ? XTERM_BG_DEFAULT : cell->bg;
+    if ((cell->attrs & ATTR_BOLD) && fg < 8) fg = (uint8_t)(fg + 8);
     if (cell->attrs & ATTR_REVERSE) { uint8_t t = fg; fg = bg; bg = t; }
     *out_fg = fg; *out_bg = bg;
 
@@ -147,7 +140,7 @@ void xscr_render(const Screen *s)
         }
         for (int c = w; c < cols; c++) {
             int i = r * cols + c;
-            fb[i] = (uint8_t)xscr_glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+            fb[i] = (uint8_t)xscr_glyph_slot(0); fgb[i] = XTERM_FG_DEFAULT; bgb[i] = XTERM_BG_DEFAULT; atb[i] = 0;
         }
     }
     /* A frame shorter than the window (an observed session smaller than
@@ -158,7 +151,7 @@ void xscr_render(const Screen *s)
     for (int r = h; r < rows - 1; r++)
         for (int c = 0; c < cols; c++) {
             int i = r * cols + c;
-            fb[i] = (uint8_t)xscr_glyph_slot(0); fgb[i] = 15; bgb[i] = 0; atb[i] = 0;
+            fb[i] = (uint8_t)xscr_glyph_slot(0); fgb[i] = XTERM_FG_DEFAULT; bgb[i] = XTERM_BG_DEFAULT; atb[i] = 0;
         }
     /* This is called on every content update (unlike the status bar,
      * which is deliberately redrawn far less often — see main.c), so
@@ -341,7 +334,7 @@ static char *sel_extract(const Screen *s, size_t *len)
             while (b >= a && (s->cells[r][b].ch == 0 || s->cells[r][b].ch == ' ')) b--;
         for (int c = a; c <= b; c++) {
             const Cell *cell = &s->cells[r][c];
-            if (cell->flags & CELL_WIDE_CONT) continue;
+            if (cell->flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
             n += (size_t)utf8_encode((uint8_t *)buf + n, cell->ch ? cell->ch : ' ');
         }
         if (r < r1 && !wrapped) buf[n++] = '\n';
@@ -407,19 +400,21 @@ void xscr_pointer_release(void) { paste.send = NULL; }
  * for the mouse as mode/enc (see mouse_encode) and for bracketed paste or
  * not, and sees rows x cols cells.  What is for the program is passed to
  * `send(bytes, n, ctx)`, as is pasted text. */
-void xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
-                         int rows, int cols, SendFn send, void *ctx)
+int xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
+                 int rows, int cols, SendFn send, void *ctx)
 {
     paste.send = send; paste.ctx = ctx; paste.bracketed = (uint8_t)bracketed;
     XtermMouse m;
     uint8_t out[40];
-    int redraw = 0, n;
+    int redraw = 0, n, wheel = 0;
     while (xterm_read_mouse(&m)) {
         int forced = MOUSE_SELECT_MOD && (m.mods & MOUSE_SELECT_MOD) == MOUSE_SELECT_MOD;
         int pass = 0;
 
         if (m.button >= 4) {                    /* wheel */
             pass = mode && !forced && grab != 2;
+            if (!pass && m.kind == 0 && m.button <= 5)
+                wheel += m.button == 4 ? 1 : -1;
         } else if (m.kind == 0 && !grab) {      /* a button goes down */
             if (m.row >= rows || m.col >= cols) continue;   /* not the program's area */
             if (sel_on) { sel_on = 0; redraw = 1; }
@@ -455,4 +450,5 @@ void xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
             send(out, (size_t)n, ctx);
     }
     if (redraw) xscr_render(s);
+    return wheel;
 }

@@ -36,7 +36,7 @@ def logger(modes, first="ZZ-marker", env=""):
         time.sleep(.1)
     time.sleep(.5); clear()
 def sgr(cb, c, r, f="M"): return ESC + b"[<%d;%d;%d%s" % (cb, c + 1, r + 1, f.encode())
-tests = sys.argv[1:] or ["copy","select","policy","paste","serve","observer"]
+tests = sys.argv[1:] or ["copy","select","policy","paste","serve","observer","scrollback"]
 
 if "copy" in tests:
     print("## copying")
@@ -272,6 +272,97 @@ if "select" in tests:
     logger(["1000", "1006"], first="abcdefgh\\nijklmnop\\nqrstuvwx")
     xdo("keydown", "shift"); drag(2,0, 4,2, mod="alt"); xdo("keyup", "shift"); time.sleep(.3)
     check("shift+alt+drag (Shift forces copy/paste) selects a rectangle there too", xc("primary") == b"cde\nklm\nstu", xc("primary"))
+    done(xv, xt)
+
+if "scrollback" in tests:
+    print("## scrollback viewer (Ctrl+B PgUp): selecting and copying its text")
+    xv, xt = boot()
+    xdo("type", "clear; seq 1 100"); xdo("key", "Return"); time.sleep(.8)
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)     # the viewer, a page up: rows read 59, 60, 61, ...
+    own("primary", b"sentinel-P"); own("clipboard", b"sentinel-C")
+    shot("/tmp/sb_base.png")
+    drag(0,1, 1,3)
+    check("drag in the viewer copies the displayed lines to PRIMARY and CLIPBOARD", xc("primary") == b"60\n61\n62" and xc("clipboard") == b"60\n61\n62", (xc("primary"), xc("clipboard")))
+    shot("/tmp/sb_sel.png")
+    win = lambda p: Image.open(p).convert("RGB").crop((0, 0, 800, 572))      # the text rows, not the footer
+    check("the selection is highlighted in the viewer", ImageChops.difference(win("/tmp/sb_base.png"), win("/tmp/sb_sel.png")).getbbox() is not None)
+    xdo("type", "x"); time.sleep(.5); shot("/tmp/sb_typed.png")
+    check("a key in the viewer removes its highlight (the copy stays)", ImageChops.difference(win("/tmp/sb_base.png"), win("/tmp/sb_typed.png")).getbbox() is None and xc("primary") == b"60\n61\n62")
+    own("primary", b"sentinel-P")
+    move(0, 3); xdo("click", "--repeat", "2", "--delay", "100", "1"); time.sleep(.4)
+    check("double click selects a word in the viewer", xc("primary") == b"62", xc("primary"))
+    own("primary", b"sentinel-P")
+    move(1, 2); xdo("click", "--repeat", "3", "--delay", "100", "1"); time.sleep(.4)
+    check("triple click selects a line in the viewer", xc("primary") == b"61", xc("primary"))
+    xdo("key", "q"); time.sleep(.6)
+    drag(0,0, 3,0)                                   # a live selection, then the viewer again
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8); shot("/tmp/sb_after_live.png")
+    xdo("key", "q"); time.sleep(.6)
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8); shot("/tmp/sb_clean.png")
+    check("entering the viewer drops a live selection's highlight", ImageChops.difference(win("/tmp/sb_after_live.png"), win("/tmp/sb_clean.png")).getbbox() is None)
+    xdo("key", "q"); time.sleep(.6)
+    xdo("type", "clear; printf '%0100d\\n' 0; seq 1 40"); xdo("key", "Return"); time.sleep(.8)
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)
+    own("primary", b"sentinel-P")
+    drag(0,0, 60,20)
+    check("a line wrapped by the viewer is copied whole, with no newline in it", ("0" * 100) in xc("primary").decode("utf8", "replace"), xc("primary")[:80])
+    xdo("key", "q"); time.sleep(.6)
+    xdo("type", "clear; printf '%0100d\\n' 0"); xdo("key", "Return"); time.sleep(.8)
+    xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.8)    # Ctrl+B [ : the viewer at its bottom, the live rows
+    own("primary", b"sentinel-P")
+    drag(0,0, 60,20)
+    check("a line the program wrapped is copied without a newline in it", ("0" * 100) in xc("primary").decode("utf8", "replace"), xc("primary")[:80])
+    xdo("key", "q"); time.sleep(.6)
+    xdo("type", "clear; printf '%0100d\\n' 0; seq 1 20"); xdo("key", "Return"); time.sleep(.8)
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)
+    own("primary", b"sentinel-P")
+    drag(0,0, 60,21)                                  # every row of the view above the footer
+    check("a line that scrolled off in two halves is copied whole", ("0" * 100) in xc("primary").decode("utf8", "replace"), xc("primary")[:80])
+    xdo("key", "q"); time.sleep(.6)
+    xdo("type", "clear; printf '\\344\\270\\255\\346\\226\\207 ab\\n'; seq 1 40"); xdo("key", "Return"); time.sleep(.8)
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)
+    own("primary", b"sentinel-P")
+    drag(0,0, 60,20)
+    check("wide characters in the viewer copy as themselves", "\u4e2d\u6587 ab" in xc("primary").decode("utf8", "replace"), xc("primary")[:80])
+    xdo("key", "q"); time.sleep(.6)
+    try: os.unlink("/tmp/sb_paste.txt")
+    except FileNotFoundError: pass
+    xdo("type", "clear; cat > /tmp/sb_paste.txt"); xdo("key", "Return"); time.sleep(.5)
+    own("primary", b"ZZPASTE")
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)
+    click(20, 8, 3); time.sleep(.6)
+    xdo("key", "q"); time.sleep(.6)
+    xdo("key", "ctrl+d"); time.sleep(.6)
+    got = open("/tmp/sb_paste.txt").read() if os.path.exists("/tmp/sb_paste.txt") else "<no file>"
+    check("a right click in the viewer pastes nothing into the program", got == "", repr(got))
+    # the wheel: in the viewer one notch is one line, as Up and Down; in the live window, with no program asking for the mouse, nothing
+    xdo("type", "clear; seq 1 100"); xdo("key", "Return"); time.sleep(.8)
+    shot("/tmp/wh_live0.png"); move(20, 8)
+    xdo("click", "--repeat", "3", "--delay", "100", "4"); time.sleep(.6)
+    shot("/tmp/wh_live1.png")
+    check("the wheel does nothing in the live window when the program has not asked for the mouse", ImageChops.difference(win("/tmp/wh_live0.png"), win("/tmp/wh_live1.png")).getbbox() is None)
+    def viewer_copy():
+        own("primary", b"sentinel-P"); drag(0, 0, 60, 21); time.sleep(.2); return xc("primary")
+    xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.8)     # the viewer at the bottom
+    bottom = viewer_copy()
+    move(20, 8); xdo("click", "--repeat", "3", "--delay", "100", "4"); time.sleep(.6)   # wheel up 3
+    by_wheel = viewer_copy()
+    xdo("key", "q"); time.sleep(.6)
+    xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.8)
+    for _ in range(3): xdo("key", "Up"); time.sleep(.2)                  # Up 3, from the bottom
+    time.sleep(.3); by_keys = viewer_copy()
+    check("wheel up scrolls the viewer a line per notch, as Up does", by_wheel == by_keys and by_wheel != bottom, repr(by_wheel[:40]))
+    move(20, 8); xdo("click", "--repeat", "2", "--delay", "100", "5"); time.sleep(.6)    # wheel down 2 (from 3 back to 1)
+    down_wheel = viewer_copy()
+    xdo("key", "q"); time.sleep(.6)
+    xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.8)
+    xdo("key", "Up"); time.sleep(.5); up_once = viewer_copy()               # Up 1, from the bottom
+    check("wheel down scrolls it back, as Down does", down_wheel == up_once and up_once != bottom, repr(up_once[:40]))
+    xdo("key", "q"); time.sleep(.6)
+    xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.8)
+    move(20, 8); xdo("click", "--repeat", "3", "--delay", "100", "5"); time.sleep(.6)    # down past the bottom
+    check("wheel down at the bottom stays at the bottom", viewer_copy() == bottom)
+    xdo("key", "q"); time.sleep(.6)
     done(xv, xt)
 
 print("\nSUMMARY: %d/%d passed" % (sum(results), len(results)))
