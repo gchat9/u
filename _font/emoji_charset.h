@@ -45,6 +45,7 @@ static const uint32_t emoji_charset[] = {
     0x274c,  /* ❌ cross mark                   */
     0x2b50,  /* ⭐ star                         */
     0x1f4af, /* 💯 hundred points               */
+    0x1f631, /* 😱 FACE SCREAMING IN FEAR       */
     0x1f680, /* 🚀 rocket                       */
 };
 #define EMOJI_COUNT ((int)(sizeof(emoji_charset) / sizeof(emoji_charset[0])))
