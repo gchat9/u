@@ -19,7 +19,7 @@
  * Known MVP gaps:
  *   - No encrypted private key support (bcrypt kdf)
  *   - known_hosts: plain hostname lines only (no hashed entries, no certs)
- *   - No TCP keepalive / SSH keepalive
+ *   - No TCP keepalive (the SSH one is ssh_keepalive, below)
  *   - Single blocking poll loop (fine; needs ring-buffers for production)
  */
 
@@ -107,6 +107,18 @@ static int       g_connect_timeout = DEFAULT_CONNECT_TIMEOUT;
 static int       g_hs_active;                   /* the handshake is being timed */
 static long long g_hs_deadline_ms;
 
+/* Keepalive, as OpenSSH's ServerAliveInterval does it.  When the server has
+ * sent no valid packet for KEEPALIVE_SEND_S seconds, we send a request named
+ * keepalive@openssh.com that wants a reply (an unknown request, which sshd
+ * answers with REQUEST_FAILURE).  When it has sent none for KEEPALIVE_DEAD_S,
+ * the connection is taken as gone: the same end as a read from a closed socket.
+ * Every valid packet restarts the count, and one keepalive goes out per silence.
+ * The count starts with the session (hs_done), not with the handshake. */
+#define KEEPALIVE_SEND_S 150
+#define KEEPALIVE_DEAD_S 180
+static long long g_last_rx_ms;   /* when the last valid packet from the server came */
+static int       g_ka_sent;      /* a keepalive is out, and nothing has come back since */
+
 static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -121,6 +133,7 @@ static void hs_pause(void)  { g_hs_active = 0; }   /* the user is being asked a 
 static void hs_resume(void) { hs_arm(); }
 static void hs_done(int fd) {                      /* the session begins: no limit any more */
     g_hs_active = 0;
+    g_last_rx_ms = now_ms(); g_ka_sent = 0;        /* and the keepalive count starts (KEEPALIVE_SEND_S) */
     struct timeval none = { 0, 0 };                /* and no send limit either (see tcp_connect) */
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &none, sizeof none);
 }
@@ -410,6 +423,7 @@ static int tcp_connect(const char *host, const char *port) {
     for (r = res; r; r = r->ai_next) {
         fd = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
         if (fd < 0) continue;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);       /* a restarted client (xmssh) must not keep this one open */
         if (g_connect_timeout > 0) {          /* a blocking connect() honours SO_SNDTIMEO on Linux */
             struct timeval tv = { g_connect_timeout, 0 };
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -483,6 +497,8 @@ static int proxy_connect(const char *cmd, const char *host, const char *port) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
         die("socketpair: %s", strerror(errno));
+    fcntl(sv[0], F_SETFD, FD_CLOEXEC);        /* the child's copies are dup2()ed to 0 and 1, which clears it */
+    fcntl(sv[1], F_SETFD, FD_CLOEXEC);
 
     pid_t pid = fork();
     if (pid < 0) die("fork: %s", strerror(errno));
@@ -725,6 +741,7 @@ static uint8_t *pkt_recv(SSH *ssh, size_t *plen) {
         uint8_t *p;
         if (ssh->recv_enc) p = pkt_recv_enc(ssh, plen);
         else               p = pkt_recv_plain(ssh, plen);
+        g_last_rx_ms = now_ms(); g_ka_sent = 0;    /* valid data from the server (see KEEPALIVE_SEND_S) */
         /* Strict KEX: until NEWKEYS, only key exchange messages may arrive.
          * Quietly skipping an IGNORE here (or an empty packet) is what lets
          * a man in the middle shift the sequence numbers (Terrapin,
@@ -1550,6 +1567,27 @@ static int signal_status(const uint8_t *name, size_t n) {
     return 255;
 }
 
+/* The keepalive check, called by the front-end before each wait for input (see
+ * KEEPALIVE_SEND_S).  Sends the request when it is due; ends the session, as a
+ * closed connection would, when the server has been silent for too long.
+ * Returns how many milliseconds the wait may last before the next check is due. */
+int ssh_keepalive(SSH *ssh) {
+    long long idle = now_ms() - g_last_rx_ms;
+    if (idle >= KEEPALIVE_DEAD_S * 1000LL)
+        die("timed out: the server sent nothing for %d seconds", KEEPALIVE_DEAD_S);
+    if (!g_ka_sent && idle >= KEEPALIVE_SEND_S * 1000LL) {
+        Buf b; buf_init(&b);
+        buf_u8(&b, SSH_MSG_GLOBAL_REQUEST);
+        buf_cstr(&b, "keepalive@openssh.com");
+        buf_u8(&b, 1);                          /* want reply */
+        send_buf(ssh, &b);
+        g_ka_sent = 1;
+        idle = now_ms() - g_last_rx_ms;
+    }
+    long long due = (g_ka_sent ? KEEPALIVE_DEAD_S : KEEPALIVE_SEND_S) * 1000LL;
+    return due > idle ? (int)(due - idle) : 0;
+}
+
 /*
  * Read and handle one packet from the server (call when ssh->fd is readable):
  *   CHANNEL_DATA          → tty_out(0, ...)
@@ -1621,6 +1659,9 @@ int ssh_pump(SSH *ssh) {
             free(pkt);
             return 1;
         }
+        case SSH_MSG_REQUEST_SUCCESS:
+        case SSH_MSG_REQUEST_FAILURE:
+            break;                             /* the answer to a keepalive: counted above, nothing to do */
         case SSH_MSG_KEXINIT:
             do_kex(ssh, NULL, pkt, plen);      /* the server wants new keys */
             break;
@@ -1673,7 +1714,20 @@ static void ensure_std_fds(void) {
     }
 }
 
+char **ssh_argv;
+
 int main(int argc, char **argv) {
+    /* A copy of the arguments as given: the parsing below writes NULs into
+     * them ("-o Key=Value", "user@host"), so the originals no longer read
+     * as they were. */
+    ssh_argv = malloc(((size_t)argc + 1) * sizeof *ssh_argv);
+    if (!ssh_argv) { noret_write(STDERR_FILENO, "malloc\n", 7); return 1; }
+    for (int i = 0; i < argc; i++) {
+        ssh_argv[i] = strdup(argv[i]);
+        if (!ssh_argv[i]) { noret_write(STDERR_FILENO, "malloc\n", 7); return 1; }
+    }
+    ssh_argv[argc] = NULL;
+
     ensure_std_fds();
     if (sodium_init() < 0) die("libsodium init failed");
 #if defined(HAVE_PRCTL) && defined(PR_SET_DUMPABLE)

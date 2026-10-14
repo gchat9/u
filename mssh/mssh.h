@@ -59,6 +59,10 @@ typedef struct {
 /* ── client services, for the front-end ── */
 
 void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+
+/* The command line as main() got it, before anything was parsed: a front-end
+ * that starts the client afresh (xmssh, on a keypress) execs it again. */
+extern char **ssh_argv;
 void err(const char *s);                                   /* a message for the user, see tty_msg */
 void xwrite(int fd, const void *buf, size_t n);            /* write all, or die */
 void noret_write(int fd, const void *b, size_t n);         /* write, ignoring failure */
@@ -73,6 +77,10 @@ void ssh_send_eof(SSH *ssh);                               /* no more input */
 void ssh_window_change(SSH *ssh);                          /* the terminal changed size */
 int  ssh_pump(SSH *ssh);                                   /* handle one server packet (ssh->fd is
                                                             * readable); nonzero: session over */
+int  ssh_keepalive(SSH *ssh);                              /* before each wait for input: sends the keepalive when
+                                                            * due, ends the session (does not return) if the server
+                                                            * has been silent too long; returns the wait's maximum,
+                                                            * in ms, to pass to poll() */
 
 /* ── the terminal front-end, in tty.c ── */
 
@@ -105,6 +113,7 @@ void tty_exit(int code) __attribute__((noreturn));
 /* Run the session: pass the terminal's input to ssh_send_input() (and
  * ssh_send_eof() at its end), size changes to ssh_window_change(), and wait for
  * the server too: ssh_pump() when ssh->fd is readable, until it says the
- * session is over.  got_pty: a pty was requested; interactive: it is a shell,
- * not a command.  Returns the exit status (ssh->exit_status). */
+ * session is over.  Each wait is poll() with the timeout ssh_keepalive() returns,
+ * called just before it.  got_pty: a pty was requested; interactive: it is a
+ * shell, not a command.  Returns the exit status (ssh->exit_status). */
 int  tty_run(SSH *ssh, int got_pty, int interactive);

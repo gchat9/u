@@ -5,7 +5,8 @@
  *
  * The window is the terminal from the start: it opens before the connection
  * does, so prompts and errors appear in it, and it stays up after a failure
- * (or a command's output) until closed.  The session always has a pty: there
+ * (or a command's output) until it is closed, or until a space is pressed,
+ * which starts the client again with the same command line.  The session always has a pty: there
  * is no cooked-mode terminal behind this window to echo and edit for a remote
  * program that has none.
  */
@@ -24,6 +25,12 @@
 
 static int opened;                       /* the window exists */
 
+/* The one way to close the window: its screen is freed with it, so nothing
+ * may draw after this.  Every other use below checks opened first. */
+static void window_close(void) {
+    if (opened) { opened = 0; xtty_close(); }
+}
+
 void tty_open(const char *title) {
     if (xtty_open(title)) die("cannot open the X11 window ($DISPLAY, /etc/font.bfnt)");
     opened = 1;
@@ -32,13 +39,16 @@ void tty_open(const char *title) {
 const char *tty_term(int want_pty) { (void)want_pty; return "xterm-256color"; }
 
 int tty_size(uint32_t *cols, uint32_t *rows, uint32_t *xpix, uint32_t *ypix) {
-    int r, c;
-    xtty_size(&r, &c);
+    int r = 24, c = 80;
+    if (opened) xtty_size(&r, &c);
     *cols = (uint32_t)c; *rows = (uint32_t)r; *xpix = *ypix = 0;
     return 0;
 }
 
-void tty_out(int is_err, const uint8_t *data, size_t n) { (void)is_err; xtty_write(data, n); }
+void tty_out(int is_err, const uint8_t *data, size_t n) {
+    (void)is_err;
+    if (opened) xtty_write(data, n);      /* the window closed by the user: the output has nowhere to go */
+}
 
 /* Our own text, unlike the session's, has no pty to turn LF into CR LF. */
 void tty_msg(const char *s) {
@@ -66,9 +76,38 @@ static void ask_input(const uint8_t *b, size_t n, void *ctx) {
     }
 }
 
-static void ignore_input(const uint8_t *b, size_t n, void *ctx) { (void)b; (void)n; (void)ctx; }
+/* A keypress comes as a chunk of exactly one byte; a paste or a mouse report
+ * is longer, so only a lone space counts. */
+static int space_pressed;
+static void space_input(const uint8_t *b, size_t n, void *ctx) {
+    (void)ctx;
+    if (n == 1 && b[0] == ' ') space_pressed = 1;
+}
+
+/* Starts the client afresh with the command line it was given.  The window is
+ * closed, and the process becomes a new copy of itself, which does everything
+ * from the start: the host key check, the key, the connection, the session.
+ * The connection is closed by exec (it is close-on-exec), and nothing of the
+ * old session survives in the new image.  Returns only if the exec failed. */
+static void reconnect(void) {
+    window_close();
+    execv("/proc/self/exe", ssh_argv);
+    noret_write(STDERR_FILENO, "xmssh: cannot start again\n", strlen("xmssh: cannot start again\n"));
+    _exit(1);
+}
+
+/* With the window up after the session (or a failure): waits until the window
+ * is closed, or a space is pressed, which reconnects. */
+static void wait_for_close_or_space(void) {
+    space_pressed = 0;
+    while (!xtty_closed()) {
+        xtty_poll(1000, space_input, NULL);
+        if (space_pressed) reconnect();
+    }
+}
 
 ssize_t tty_ask(char *buf, size_t n) {
+    if (!opened) return -1;
     ans_n = 0; ans_done = 0;
     while (!ans_done && !xtty_closed()) xtty_poll(1000, ask_input, NULL);
     if (!ans_done) return -1;
@@ -78,14 +117,15 @@ ssize_t tty_ask(char *buf, size_t n) {
     return (ssize_t)n;
 }
 
-/* Failing with the window up: leave what it shows to be read. */
+/* Failing with the window up: leave what it shows to be read, and offer to
+ * start again. */
 void tty_exit(int code) {
     if (opened && code) {
-        const char *m = "\r\n[close the window]";
+        const char *m = "\r\n[press space to reconnect, or close the window]";
         xtty_write(m, strlen(m));
-        while (!xtty_closed()) xtty_poll(1000, ignore_input, NULL);
+        wait_for_close_or_space();
     }
-    if (opened) xtty_close();
+    window_close();
     exit(code);
 }
 
@@ -103,18 +143,18 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
     int closed = 0;                      /* the window was closed under us */
 
     for (;;) {
-        xtty_flush();
+        if (opened) xtty_flush();
         struct pollfd fds[2];
         fds[0].fd = closed ? -1 : xtty_fd();  fds[0].events = POLLIN;
         fds[1].fd = ssh->fd;                  fds[1].events = POLLIN;
 
-        if (poll(fds, 2, -1) < 0 && errno != EINTR) die("poll: %s", strerror(errno));
+        if (poll(fds, 2, ssh_keepalive(ssh)) < 0 && errno != EINTR) die("poll: %s", strerror(errno));
 
         if (!closed && fds[0].revents) {
             xtty_poll(0, on_input, ssh);
             if (xtty_resized()) ssh_window_change(ssh);
             if (xtty_closed()) {         /* hang up; the server's CLOSE ends the session */
-                xtty_close(); closed = 1;
+                window_close(); closed = 1;
                 if (!ssh->client_eof) ssh_send_eof(ssh);
             }
         }
@@ -123,12 +163,13 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
 
     if (!closed) {
         if (!interactive) {              /* a command's output must stay readable */
-            char m[64];
-            snprintf(m, sizeof m, "\r\n[exit status %d - close the window]", ssh->exit_status);
+            char m[96];
+            snprintf(m, sizeof m, "\r\n[exit status %d - press space to reconnect, or close the window]",
+                     ssh->exit_status);
             xtty_write(m, strlen(m));
-            while (!xtty_closed()) xtty_poll(1000, ignore_input, NULL);
+            wait_for_close_or_space();
         }
-        xtty_close();
+        window_close();
     }
     return ssh->exit_status;
 }

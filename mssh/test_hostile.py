@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # Tests mssh against a scripted SSH server and against its trust decisions:
-#     python3 mssh/test_hostile.py [path/to/mssh]        (default: ./mssh next to this file)
+#     python3 mssh/test_hostile.py [--keepalive] [path/to/mssh]
+#                                   (default path: ./mssh next to this file)
+# --keepalive also runs the keepalive scenarios, which wait out the real 150 s and
+# 180 s timers: about seven minutes, so they are not part of the default run.
 #
 # The server (in a thread of this process) speaks real SSH-2 -- curve25519-sha256,
 # ssh-ed25519, chacha20-poly1305@openssh.com, publickey auth of any key -- so that
@@ -17,7 +20,9 @@ from cryptography.hazmat.primitives.poly1305 import Poly1305
 from cryptography.hazmat.primitives import hashes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MSSH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "mssh")
+FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
+_ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+MSSH = _ARGS[0] if _ARGS else os.path.join(HERE, "mssh")
 SERVER_VER = b"SSH-2.0-mssh_test_server"
 
 # ── wire helpers ────────────────────────────────────────────────────────────
@@ -127,6 +132,7 @@ def rekey(c, signer, srv_kexinit=None):
     srv = srv_kexinit or kexinit()
     c.send_pkt(srv)
     cli = c.recv_pkt()
+    while cli[0] == 96: cli = c.recv_pkt()  # mssh's EOF, when its stdin has ended, can come first
     ecdh = c.recv_pkt(); assert ecdh[0] == 30
     Qc = ecdh[5:5 + struct.unpack(">I", ecdh[1:5])[0]]
     eph = X25519PrivateKey.generate(); Qs = pub_raw(eph)
@@ -254,6 +260,44 @@ def sc_banner_flood(c, hk):   # never sends SSH-2.0: the client must give up, no
         time.sleep(30)
     except OSError:
         pass
+
+# ── keepalive: the server goes quiet once the session runs ──────────────────
+# rec collects what the server saw: when the keepalive came (seconds since the
+# session began), its request, and when mssh closed the connection.
+
+def ka_request(m):
+    """(name, want_reply) of a GLOBAL_REQUEST payload."""
+    nl = struct.unpack(">I", m[1:5])[0]
+    return m[5:5 + nl], m[5 + nl]
+
+def wait_keepalive(c, rec):
+    """Read until the keepalive request arrives; other packets from mssh (its EOF, say) are skipped."""
+    while True:
+        m = c.recv_pkt()
+        if m[0] == 80:
+            rec["at"] = time.time() - rec["t0"]
+            rec["req"] = ka_request(m)
+            return
+
+def sc_keepalive_dead(c, hk, rec):    # never answers: mssh sends the keepalive at 150 s, gives up at 180 s
+    c.s.settimeout(None)
+    handshake(c, hk); serve_session(c)
+    rec["t0"] = time.time()
+    wait_keepalive(c, rec)
+    try:
+        while True: c.recv_pkt()          # no reply; wait for mssh to close the connection
+    except Exception: pass
+    rec["end"] = time.time() - rec["t0"]
+
+def sc_keepalive_reset(c, hk, rec):   # data at 20 s moves the keepalive to 170 s; answering it moves the limit on
+    c.s.settimeout(None)
+    handshake(c, hk); ch = serve_session(c)
+    rec["t0"] = time.time()
+    time.sleep(20); chan_data(c, ch, b"tick\n")
+    wait_keepalive(c, rec)
+    c.send_pkt(bytes([82]))               # REQUEST_FAILURE: what sshd answers an unknown request
+    time.sleep(max(0.0, rec["t0"] + 250 - time.time()))   # past 200 s: only the answer keeps the session up
+    chan_data(c, ch, b"hello from test server\n"); close_with(c, ch, 7)
 
 # ── the test driver ─────────────────────────────────────────────────────────
 
@@ -448,6 +492,34 @@ def t_bad_connect_timeout(env):
     rc, out, err = run(mssh_cmd(env, free_port(), extra=("-o", "ConnectTimeout=soon")), timeout=15)
     return (rc == 1 and "bad ConnectTimeout" in err), (rc, err.strip()[-120:])
 
+def t_keepalive_then_give_up(env):
+    """Silence: a keepalive at 150 s, and the connection given up on at 180 s, as a closed one would be."""
+    rec = {}; port = free_port()
+    t = run_server_scenario(env, lambda c, hk: sc_keepalive_dead(c, hk, rec), port); time.sleep(0.2)
+    rc, out, err = run(mssh_cmd(env, port), timeout=240)
+    t.join(10)
+    good = (rc == 1 and "timed out" in err and "sent nothing for 180 seconds" in err
+            and rec.get("req") == (b"keepalive@openssh.com", 1)
+            and 145 <= rec.get("at", 0) <= 160 and 170 <= rec.get("end", 0) <= 195)
+    return good, (rc, {k: round(v, 1) if isinstance(v, float) else v for k, v in rec.items()},
+                  err.strip()[-160:])
+
+def t_keepalive_restarted_by_data(env):
+    """Data restarts the count (keepalive at 170 s, not 150 s); answering the keepalive restarts it again."""
+    rec = {}; port = free_port()
+    t = run_server_scenario(env, lambda c, hk: sc_keepalive_reset(c, hk, rec), port); time.sleep(0.2)
+    rc, out, err = run(mssh_cmd(env, port), timeout=300)
+    t.join(10)
+    good = (rc == 7 and "tick" in out and "hello from test server" in out
+            and 165 <= rec.get("at", 0) <= 178 and rec.get("req") == (b"keepalive@openssh.com", 1))
+    return good, (rc, {k: round(v, 1) if isinstance(v, float) else v for k, v in rec.items()},
+                  err.strip()[-160:])
+
+KEEPALIVE_TESTS = [
+    ("silent server: keepalive at 150 s, give up at 180 s", t_keepalive_then_give_up),
+    ("data and answers restart the count",                   t_keepalive_restarted_by_data),
+]
+
 CLIENT_TESTS = [
     ("known_hosts unreadable is an error",   t_unreadable_known_hosts),
     ("first use: answer piped, refused",     t_piped_answer_is_refused),
@@ -483,6 +555,12 @@ def main():
         good, detail = fn(env)
         ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
         print("  %s %s  %s" % ("PASS" if good else "FAIL", name, "" if good else detail))
+    if "--keepalive" in FLAGS:
+        print("## keepalive (slow: waits out the real timers)")
+        for name, fn in KEEPALIVE_TESTS:
+            good, detail = fn(env)
+            ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
+            print("  %s %s  %s" % ("PASS" if good else "FAIL", name, "" if good else detail))
     env.cleanup()
     print("\nSUMMARY: %d/%d passed" % (ok, ok + fail))
     return 1 if fail else 0
