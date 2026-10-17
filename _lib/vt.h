@@ -157,6 +157,10 @@ typedef struct {
     /* Set when child asks for cursor-position report (CSI 6 n) */
     bool     cpr_requested;
 
+    /* The last graphic character printed, repeated by REP (CSI Ps b);
+     * 0 until something has been printed. */
+    uint32_t last_graphic;
+
     /* The virtual screen */
     Screen   scr;
 } VTParser;

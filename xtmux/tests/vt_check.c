@@ -135,6 +135,44 @@ static void scenario_exact_fill(void)
     free(p);
 }
 
+/* REP (CSI Ps b) repeats the last graphic character with the current
+ * rendition.  irssi paints its status bar this way: one blank with a blue
+ * background, then ESC [ 79 b; without REP the rest of the bar stays blank
+ * in the default colour. */
+static void scenario_rep(void)
+{
+    printf("repeat scenario\n");
+    VTParser *p = calloc(1, sizeof *p);
+    vt_init(p, 4, 10);
+    feed(p, "\x1b[44m \x1b[9b\x1b[0m");                  /* ten blue blanks in all */
+    int blue = 0;
+    for (int c = 0; c < 10; c++)
+        if (!(p->scr.cells[0][c].flags & CELL_BG_DFL) && p->scr.cells[0][c].bg == 4) blue++;
+    EXPECT(blue == 10, "REP paints the whole row blue, got %d of 10 cells", blue);
+    EXPECT(p->scr.cur_row == 0 && p->scr.cur_col == 9 && p->scr.pending_wrap,
+           "cursor left at the margin with pending wrap, got %d,%d", p->scr.cur_row, p->scr.cur_col);
+
+    feed(p, "\r\ny\x1b[b");                              /* no count: one more */
+    EXPECT(row_is(p, 1, "yy", 0), "REP with no count repeats once");
+    feed(p, "\x1b[0b");                                  /* count 0 is read as 1 */
+    EXPECT(row_is(p, 1, "yyy", 0), "REP with count 0 repeats once");
+
+    feed(p, "\r\nz\x1b[12b");                            /* runs past the margin */
+    EXPECT(row_is(p, 2, "zzzzzzzzzz", 1) && row_is(p, 3, "zzz", 0),
+           "REP wraps at the margin like any printed text");
+
+    VTParser *q = calloc(1, sizeof *q);
+    vt_init(q, 4, 10);
+    feed(q, "\x1b[5b");                                  /* nothing printed yet */
+    EXPECT(q->scr.cur_row == 0 && q->scr.cur_col == 0 && row_is(q, 0, "", 0),
+           "REP before any character prints nothing");
+    vt_free(q);
+    free(q);
+
+    vt_free(p);
+    free(p);
+}
+
 /* ------------------------------------------------------------------ */
 /* Random printing and resizing, against a model                       */
 /* ------------------------------------------------------------------ */
@@ -391,6 +429,7 @@ int main(int argc, char **argv)
     int seeds = argc > 1 ? atoi(argv[1]) : 300;
     scenario_reflow();
     scenario_exact_fill();
+    scenario_rep();
     scenario_wide();
     scenario_readline();
     for (unsigned s = 1; s <= (unsigned)seeds; s++) random_run(s, 400);

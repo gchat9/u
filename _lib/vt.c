@@ -481,6 +481,7 @@ static void put_char(VTParser *p, uint32_t ch)
      * for all ordinary text. */
     int width = cp_width(ch);
     if (!width) return;
+    p->last_graphic = ch;   /* what REP repeats */
 
     /* Handle pending wrap: wrap to next line before placing char */
     if (s->pending_wrap) {
@@ -758,6 +759,15 @@ static void dispatch_csi(VTParser *p, char final)
             int end = s->cur_col + n - 1;
             if (end >= s->cols) end = s->cols - 1;
             clear_row_range(s, s->cells[s->cur_row], s->cur_col, end);
+            break;
+        }
+
+        /* ---- repeat ---- */
+        case 'b': { /* REP – repeat the last graphic char P(0,1) times,
+                     * with the current rendition, as if typed again */
+            int n = P(0,1);
+            while (p->last_graphic && n-- > 0)
+                put_char(p, p->last_graphic);
             break;
         }
 
