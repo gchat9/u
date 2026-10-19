@@ -32,19 +32,6 @@ static void proc_name(pid_t pid, char *buf, size_t buflen)
 }
 
 /* ================================================================== */
-/* Output buffer                                                        */
-/* ================================================================== */
-
-typedef struct { char *data; size_t pos, cap; } SBuf;
-
-static void sb_init(SBuf *b, size_t cap)
-    { b->data = malloc(cap); b->pos = 0; b->cap = cap; }
-static void sb_cat(SBuf *b, const char *s, size_t n)
-    { if (b->pos + n < b->cap) { memcpy(b->data+b->pos, s, n); b->pos += n; } }
-static void sb_str(SBuf *b, const char *s) { sb_cat(b, s, strlen(s)); }
-static void sb_free(SBuf *b) { free(b->data); b->data = NULL; }
-
-/* ================================================================== */
 /* Public API                                                           */
 /* ================================================================== */
 
@@ -123,59 +110,48 @@ void status_layout(StatusEmit emit, void *ctx, int cols, int active,
     emit(ctx, " ", 1, STATUS_RIGHT_COLOR);
 }
 
-/* VT-to-VT emit: one combined SGR sequence per piece of text, then the
- * text itself. A style fully specifies both fg and bg, so each call is
- * self-contained -- no "reset to bar colour" bookkeeping needed between
- * pieces the way separate _FG()/_BG() macro pairs would have required. */
-static void vt_emit(void *vctx, const char *s, int n, Style style)
+/* Cell emit: the text goes into a row of cells, in the style given.  Only
+ * printable ASCII is kept; any other byte (a label is a program's own name,
+ * which it chooses) shows as '?', so it can never reach the terminal as a
+ * control sequence, and one byte is one column as the layout counts it. */
+typedef struct { Cell *row; int cols, x; } CellFill;
+
+int status_put(Cell *row, int cols, int x, const char *s, int n, Style st)
 {
-    if (n <= 0) return;
-    SBuf *b = vctx;
-    char sgr[24];
-    int m = snprintf(sgr, sizeof sgr, "\033[38;5;%u;48;5;%um",
-                     style.fg, style.bg);
-    sb_cat(b, sgr, (size_t)m);
-    sb_cat(b, s, (size_t)n);
+    for (int i = 0; i < n && x < cols; i++, x++) {
+        unsigned char ch = (unsigned char)s[i];
+        Cell *c = &row[x];
+        memset(c, 0, sizeof *c);          /* flags 0: colours are explicit */
+        c->ch = (ch >= 0x20 && ch < 0x7f) ? ch : '?';
+        c->fg = st.fg;
+        c->bg = st.bg;
+    }
+    return x;
 }
 
-int status_render(char *_out, size_t _outlen,
-                  int rows, int cols, int active,
+static void cell_emit(void *ctx, const char *s, int n, Style st)
+{
+    CellFill *f = ctx;
+    f->x = status_put(f->row, f->cols, f->x, s, n, st);
+}
+
+void status_cells(Cell *row, int cols, int active,
                   pid_t child_pids[], bool wins_exist[], bool wins_alive[])
 {
-    size_t _need = (size_t)(cols * 8 + 512);
-    SBuf b;
-    sb_init(&b, _need);
-
-    /* Move to last row, col 1.
-     * Disable auto-wrap (DECAWM off) so writing into the very last cell
-     * of the last row does not trigger a terminal scroll. */
-    char move[48];
-    snprintf(move, sizeof(move), "\033[%d;1H\033[?7l", rows);
-    sb_str(&b, move);
-
-    status_layout(vt_emit, &b, cols, active, child_pids, wins_exist, wins_alive);
-
-    /* Reset colours and re-enable auto-wrap */
-    sb_str(&b, _RESET "\033[?7h");
-
-    int _ret = -1;
-    if (b.pos <= _outlen) {
-        memcpy(_out, b.data, b.pos);
-        _ret = (int)b.pos;
+    CellFill f = { row, cols, 0 };
+    status_layout(cell_emit, &f, cols, active, child_pids, wins_exist, wins_alive);
+    for (; f.x < cols; f.x++) {           /* a layout that came out short */
+        memset(&row[f.x], 0, sizeof row[f.x]);
+        row[f.x].ch = ' ';
+        row[f.x].fg = STATUS_BAR_FG;
+        row[f.x].bg = STATUS_BAR_BG;
     }
-    sb_free(&b);
-    return _ret;
 }
 
+#ifdef X11_BACKEND
 void status_draw(int rows, int cols, int active,
                  pid_t child_pids[], bool wins_exist[], bool wins_alive[])
 {
-#ifdef X11_BACKEND
     x11_backend_status(rows - 1, cols, active, child_pids, wins_exist, wins_alive);
-    return;
-#endif
-    char _buf[4096];
-    int n = status_render(_buf, sizeof(_buf), rows, cols, active,
-                          child_pids, wins_exist, wins_alive);
-    if (n > 0) (void)write(STDOUT_FILENO, _buf, (size_t)n);
 }
+#endif

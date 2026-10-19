@@ -38,6 +38,8 @@
 #include "x11_backend.h"
 #endif
 
+#include <time.h>
+#include <stddef.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -540,12 +542,10 @@ int session_observer_push(int obs_fd, const Screen *s,
         if (i < 10)    h.win_pids[i]      = (int32_t)pids[i];
     }
 
-    /* Pre-render the status bar (uses s->cols for width) */
-    char status_buf[4096];
-    int slen = status_render(status_buf, sizeof(status_buf),
-                             s->rows + 1, s->cols, cur_win,
-                             pids, exists, alive);
-    h.status_len = (slen > 0) ? (uint16_t)slen : 0;
+    /* The status bar is not sent: the header carries the window table, and
+     * an observer draws the bar from it itself (status_len stays 0; a
+     * reader of this format skips that many bytes after the cells). */
+    h.status_len = 0;
 
     if (write_all(obs_fd, &h, sizeof(h)) < 0) return -1;
 
@@ -553,8 +553,6 @@ int session_observer_push(int obs_fd, const Screen *s,
     for (int r = 0; r < s->rows; r++)
         if (write_all(obs_fd, s->cells[r], row_bytes) < 0) return -1;
 
-    if (h.status_len > 0)
-        if (write_all(obs_fd, status_buf, h.status_len) < 0) return -1;
     return 0;
 }
 
@@ -679,21 +677,39 @@ static void obs_pointer_sink(const uint8_t *b, size_t n, void *ctx)
 }
 #endif
 
-/* Show one frame: the cells (clipped to scr's view size), then the status
- * bar.  On a terminal the frame carries the status bar already rendered
- * as escape sequences; in a window it is drawn from the window table in
- * the header. */
+/* What the status bar on an observer's terminal was last built from.  Its
+ * labels are read from /proc, so it is built again only when the window
+ * table changes or a second has passed, not on every frame. */
+typedef struct {
+    uint16_t exists, alive;
+    uint8_t  cur;
+    int32_t  pids[10];
+    time_t   at;
+} ObsStatusKey;
+
+/* Same window table and pids?  Compared field by field: the struct has
+ * padding after cur, and its bytes are not to be relied on to match. */
+#ifndef X11_BACKEND
+static bool obs_key_same(const ObsStatusKey *a, const ObsStatusKey *b)
+{
+    return a->exists == b->exists && a->alive == b->alive && a->cur == b->cur
+        && memcmp(a->pids, b->pids, sizeof a->pids) == 0;
+}
+#endif
+
+/* Show one frame: the cells (clipped to scr's view size) and the status
+ * bar, drawn from the window table in the header: in a window by the
+ * backend, on a terminal as the renderer's status row just under the cells,
+ * so that a tick or a changed label costs a few bytes. */
 static void obs_draw(RenderState *rs, Screen *scr, Cell **local,
-                     const ObsHeader *h, const char *status, int slen,
-                     int our_rows, int our_cols)
+                     const ObsHeader *h, int our_rows, int our_cols,
+                     ObsStatusKey *key)
 {
     scr->cells       = local;
     scr->cur_row     = h->cur_row < scr->rows ? h->cur_row : scr->rows - 1;
     scr->cur_col     = h->cur_col < scr->cols ? h->cur_col : scr->cols - 1;
     scr->cur_visible = h->cur_visible;
-    render_screen(rs, scr);
-#ifdef X11_BACKEND
-    (void)status; (void)slen;
+
     pid_t pids[MAX_WINDOWS] = {0};
     bool  exists[MAX_WINDOWS] = {false}, alive[MAX_WINDOWS] = {false};
     for (int i = 0; i < MAX_WINDOWS && i < 10; i++) {
@@ -701,16 +717,20 @@ static void obs_draw(RenderState *rs, Screen *scr, Cell **local,
         alive[i]  = (h->win_alive_mask  >> i) & 1;
         pids[i]   = (pid_t)h->win_pids[i];
     }
+#ifdef X11_BACKEND
+    (void)key;
+    render_screen(rs, scr);
     status_draw(our_rows, our_cols, h->cur_win, pids, exists, alive);
 #else
     (void)our_rows; (void)our_cols;
-    if (slen > 0) {
-        (void)write(STDOUT_FILENO, status, (size_t)slen);
-        char mv[16];
-        int mvn = snprintf(mv, sizeof(mv), "\033[%d;%dH",
-                           scr->cur_row + 1, scr->cur_col + 1);
-        (void)write(STDOUT_FILENO, mv, (size_t)mvn);
+    ObsStatusKey now = { h->win_exists_mask, h->win_alive_mask, h->cur_win, {0}, time(NULL) };
+    for (int i = 0; i < 10; i++) now.pids[i] = h->win_pids[i];
+    if (rs->status_row < 0 || now.at != key->at || !obs_key_same(&now, key)) {
+        Cell *row = render_status_row(rs, scr->rows);
+        if (row) status_cells(row, scr->cols, h->cur_win, pids, exists, alive);
+        *key = now;
     }
+    render_screen(rs, scr);
 #endif
 }
 
@@ -751,8 +771,8 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
 
     ObsHeader last_h;
     memset(&last_h, 0, sizeof(last_h));
-    char last_status_buf[4096];
-    int  last_status_len = 0;
+    ObsStatusKey status_key;
+    memset(&status_key, 0, sizeof(status_key));
 
     for (;;) {
         /* The display changed size (or was exposed): lay the last frame
@@ -771,10 +791,9 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
 #ifndef X11_BACKEND
             (void)write(STDOUT_FILENO, "\033[2J", 4);
 #endif
-            render_init(&rs, our_rows, our_cols);
+            render_init(&rs, our_rows, our_cols);   /* (status row unclaimed: rebuilt) */
             if (last_h.rows > 0)
-                obs_draw(&rs, &scr, local, &last_h, last_status_buf,
-                         last_status_len, our_rows, our_cols);
+                obs_draw(&rs, &scr, local, &last_h, our_rows, our_cols, &status_key);
             continue;
         }
 
@@ -884,6 +903,9 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
                 scr.rows = view_rows;
                 scr.cols = view_cols;
                 render_free(&rs);
+#ifndef X11_BACKEND
+                (void)write(STDOUT_FILENO, "\033[2J", 4);   /* a smaller session leaves old rows */
+#endif
                 render_init(&rs, our_rows, our_cols);
             }
 
@@ -891,19 +913,19 @@ int session_observe_fd(int sock, int ses_rows, int ses_cols)
             for (int r = 0; r < (int)h.rows; r++)
                 if (read_all(sock, local[r], row_bytes) < 0) goto done;
 
-            char status_buf[4096];
-            uint16_t slen = h.status_len;
-            if (slen > 0 && slen <= sizeof(status_buf)) {
-                if (read_all(sock, status_buf, slen) < 0) goto done;
-            } else { slen = 0; }
-
-            last_status_len = (int)slen;
-            if (slen > 0) memcpy(last_status_buf, status_buf, slen);
+            /* A status bar sent by an older server: not needed, but it is in
+             * the stream, so it is skipped. */
+            for (uint16_t left = h.status_len; left > 0; ) {
+                char skip[64];
+                uint16_t k = left < sizeof(skip) ? left : (uint16_t)sizeof(skip);
+                if (read_all(sock, skip, k) < 0) goto done;
+                left = (uint16_t)(left - k);
+            }
 
 #ifdef X11_BACKEND
             (void)xscr_selection_drop();   /* (the frame is drawn next) */
 #endif
-            obs_draw(&rs, &scr, local, &h, status_buf, slen, our_rows, our_cols);
+            obs_draw(&rs, &scr, local, &h, our_rows, our_cols, &status_key);
 #ifdef X11_BACKEND
             x11_backend_mouse_select((h.mouse & 3) < 2 ? 2 : (h.mouse & 3));
 #endif

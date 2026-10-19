@@ -3,14 +3,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include "config.h"  /* MAX_WINDOWS */
-
-/*
- * Render the status bar into buf (escape sequences, not NUL-terminated).
- * Returns the number of bytes written, or -1 if buf is too small.
- */
-int status_render(char *buf, size_t buflen,
-                  int rows, int cols, int active,
-                  pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+#include "../_lib/vt.h"  /* Cell */
 
 /*
  * Shared status-bar content: hostname, per-window tab labels/highlight
@@ -26,9 +19,20 @@ typedef void (*StatusEmit)(void *ctx, const char *s, int n, Style style);
 void status_layout(StatusEmit emit, void *ctx, int cols, int active,
                    pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
 
-/* Render and write directly to STDOUT_FILENO. */
-void status_draw(int rows, int cols,
-                 int active,
-                 pid_t child_pids[],
-                 bool  wins_exist[],
-                 bool  wins_alive[]);
+/*
+ * Fill row (cols cells) with the status bar: the same content, as cells, to
+ * be drawn by the renderer (render_status_row), which sends only what
+ * changed since the last time.
+ */
+void status_cells(Cell *row, int cols, int active,
+                  pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+
+/* Write text into row at column x, in style st; returns the column after
+ * it.  Anything but printable ASCII is written as '?'. */
+int status_put(Cell *row, int cols, int x, const char *s, int n, Style st);
+
+#ifdef X11_BACKEND
+/* The X11 build draws the bar itself (x11_backend.c). */
+void status_draw(int rows, int cols, int active,
+                 pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+#endif

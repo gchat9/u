@@ -25,6 +25,9 @@
 #include "x11_backend.h"
 #endif
 
+/* How often the status row is re-read, for window labels (see main loop). */
+#define LABEL_REFRESH_MS 1000
+
 static Window     *g_wins[MAX_WINDOWS];
 static int         g_cur;
 static RenderState g_rs;
@@ -122,6 +125,29 @@ static int child_rows(void) { return g_rows > 1 ? g_rows - 1 : 1; }
 static void render_scrollback_view(void);
 #endif
 
+static void status_table(pid_t pids[], bool exist[], bool alive[])
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = g_wins[i];
+        exist[i]  = (w != NULL);
+        alive[i]  = (w != NULL && w->alive);
+        pids[i]   = (w && w->alive) ? w->pty.child : 0;
+    }
+}
+
+#ifndef X11_BACKEND
+/* Put the status bar into the renderer's status row; the next render_screen
+ * draws what differs from what the row shows. */
+static void set_status(void)
+{
+    if (g_rows < 2) return;               /* no room for one */
+    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS];
+    status_table(pids, exist, alive);
+    Cell *row = render_status_row(&g_rs, child_rows());
+    if (row) status_cells(row, g_cols, g_cur, pids, exist, alive);
+}
+#endif
+
 static void redraw_status(void)
 {
 #if SCROLLBACK_ENABLED
@@ -129,41 +155,21 @@ static void redraw_status(void)
      * redraw -- the minute tick, say -- repaints the viewer instead. */
     if (g_scrollback_mode) { render_scrollback_view(); return; }
 #endif
-    pid_t pids[MAX_WINDOWS]  = {0};
-    bool  exist[MAX_WINDOWS] = {false};
-    bool  alive[MAX_WINDOWS] = {false};
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        Window *w = g_wins[i];
-        exist[i]  = (w != NULL);
-        alive[i]  = (w != NULL && w->alive);
-        pids[i]   = (w && w->alive) ? w->pty.child : 0;
-    }
-    /* Under X11_BACKEND the cursor is kept current by xscr_render()
-     * itself (see render.c / x11_backend.c) — it fires on every content
-     * update, whereas this status-bar redraw deliberately doesn't (see
-     * the "NOT redrawn on every PTY update" comment further down), so
-     * setting the cursor from here would either lag a frame or need its
-     * own staleness tracking for no benefit. */
+#ifdef X11_BACKEND
+    /* The cursor is kept current by xscr_render() itself (see render.c /
+     * x11_backend.c); it fires on every content update, whereas this
+     * status-bar redraw deliberately doesn't. */
+    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS];
+    status_table(pids, exist, alive);
     status_draw(g_rows, g_cols, g_cur, pids, exist, alive);
-
-#ifndef X11_BACKEND
-    /*
-     * status_draw leaves the real cursor somewhere on the status row.
-     * Re-park it at the window's cursor position immediately so it is
-     * never visibly stuck in the wrong place between renders.
-     * Also update the renderer's cursor accounting so it knows where
-     * the real cursor now is and won't emit a redundant CSI H on the
-     * next render_screen call.
-     */
-    Window *_w = g_wins[g_cur];
-    if (_w) {
-        int r = _w->vt.scr.cur_row, c = _w->vt.scr.cur_col;
-        char _mv[32];
-        snprintf(_mv, sizeof(_mv), "\033[%d;%dH", r + 1, c + 1);
-        (void)write(STDOUT_FILENO, _mv, strlen(_mv));
-        g_rs.cursor_row = r;
-        g_rs.cursor_col = c;
-    }
+#else
+    /* The status row is drawn with the screen: a changed cell or two is a
+     * few bytes, nothing changed is nothing, and the cursor is parked by
+     * the same render. */
+    Window *w = g_wins[g_cur];
+    if (!w) return;
+    set_status();
+    render_screen(&g_rs, &w->vt.scr);
 #endif
 }
 
@@ -336,6 +342,7 @@ static void handle_session_conn(void)
 }
 
 static void full_redraw(void);  /* forward declaration */
+static void refresh(void);       /* forward declaration */
 
 /*
  * Auto-detach sequence shared by SIGHUP and stdin-EOF (controlling
@@ -382,16 +389,25 @@ static void auto_detach(void)
  * same thing.  wrapped: the line goes on in the next call, as the screen
  * wrapped it (only the X11 build keeps that: a copy from the view must not
  * put a newline where the program had none). */
+/* The viewer's rows are fed into a scratch screen (g_view), which is then
+ * drawn like any other screen: moving the view a line is then a scroll
+ * rather than a clear and a rewrite.  Rows are separated by CR LF, not
+ * ended by one, so that the last row does not scroll the scratch screen. */
+#ifndef X11_BACKEND
+static VTParser *g_view;
+static int       g_view_lines;
+#endif
+
 static void sb_line(const char *p, int n, bool dim, bool wrapped)
 {
 #ifdef X11_BACKEND
     x11_backend_text_line(p, n, (Style){ dim ? 8 : XTERM_FG_DEFAULT, XTERM_BG_DEFAULT }, wrapped);
 #else
     (void)wrapped;
-    if (dim)  (void)write(STDOUT_FILENO, "\033[2m", 4);
-    if (n > 0) (void)write(STDOUT_FILENO, p, (size_t)n);
-    if (dim)  (void)write(STDOUT_FILENO, "\033[m", 3);
-    (void)write(STDOUT_FILENO, "\r\n", 2);
+    if (g_view_lines++) vt_feed(g_view, (const uint8_t *)"\r\n", 2);
+    if (dim)  vt_feed(g_view, (const uint8_t *)"\033[2m", 4);
+    if (n > 0) vt_feed(g_view, (const uint8_t *)p, (size_t)n);
+    if (dim)  vt_feed(g_view, (const uint8_t *)"\033[m", 3);
 #endif
 }
 
@@ -434,11 +450,15 @@ static void render_scrollback_view(void)
     int skip = total - view_rows - g_scrollback_offset;
     if (skip < 0) skip = 0;
 
-    /* Clear screen and home cursor */
 #ifdef X11_BACKEND
     x11_backend_text_begin();
 #else
-    (void)write(STDOUT_FILENO, "\033[2J\033[H", 8);
+    /* A scratch screen with no history of its own: its scroll (if the rows
+     * were to overflow) must not enter the window's scrollback. */
+    VTParser view;
+    vt_init_view(&view, view_rows, g_cols);
+    g_view       = &view;
+    g_view_lines = 0;
 #endif
 
     int row = 0;
@@ -497,6 +517,11 @@ static void render_scrollback_view(void)
                 s->row_flags && (s->row_flags[r] & ROW_WRAPPED));
     }
 
+#ifndef X11_BACKEND
+    g_view = NULL;
+    view.scr.cur_visible = false;
+#endif
+
     /* Scrollback status indicator in the status row, in the status
      * bar's own colours (config.h) */
     char ind_text[64];
@@ -510,21 +535,17 @@ static void render_scrollback_view(void)
     x11_backend_text_at(g_rows - 1, 12, ind_text, ilen, STATUS_BAR_COLOR);
     x11_backend_text_end();
 #else
-    static const char sb_prefix[] =
-        STATUS_BAR_STYLE "\033[2K"
-        WINDOW_STATUS_CURRENT_STYLE " SCROLLBACK "
-        STATUS_BAR_STYLE;
-    char ind_pos[24];
-    snprintf(ind_pos, sizeof(ind_pos), "\033[%d;1H", g_rows);
-    (void)write(STDOUT_FILENO, ind_pos, strlen(ind_pos));
-    (void)write(STDOUT_FILENO, sb_prefix, sizeof(sb_prefix) - 1);
-    (void)write(STDOUT_FILENO, ind_text, (size_t)ilen);
-    (void)write(STDOUT_FILENO, _RESET, sizeof(_RESET) - 1);
-
-    /* Park cursor out of the way */
-    char mv[16];
-    snprintf(mv, sizeof(mv), "\033[%d;1H", view_rows);
-    (void)write(STDOUT_FILENO, mv, strlen(mv));
+    /* The footer is the status row's cells, so the view and its footer are
+     * drawn together and only what differs from the last view is sent. */
+    if (g_rows > 1) {
+        Cell *row = render_status_row(&g_rs, child_rows());
+        int   x   = status_put(row, g_cols, 0, " SCROLLBACK ", 12,
+                               WINDOW_STATUS_CURRENT_COLOR);
+        x = status_put(row, g_cols, x, ind_text, ilen, STATUS_BAR_COLOR);
+        while (x < g_cols) x = status_put(row, g_cols, x, " ", 1, STATUS_BAR_COLOR);
+    }
+    render_screen(&g_rs, &view.scr);
+    vt_free(&view);
 #endif
 }
 
@@ -597,12 +618,13 @@ static bool scrollback_feed(uint8_t b, bool last)
         g_scrollback_mode   = false;
         g_scrollback_offset = 0;
         _sb_esc             = 0;
-        full_redraw();
+        refresh();
     }
     return true;
 }
 #endif /* SCROLLBACK_ENABLED */
 
+/* Clear the terminal and draw the displayed window afresh. */
 static void full_redraw(void)
 {
 #ifdef X11_BACKEND
@@ -611,8 +633,31 @@ static void full_redraw(void)
 #if SCROLLBACK_ENABLED
     if (g_scrollback_mode) { render_scrollback_view(); return; }
 #endif
+#ifdef X11_BACKEND
     render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
     redraw_status();
+#else
+    set_status();                 /* (the clear takes the status row too) */
+    render_full_redraw(&g_rs, &g_wins[g_cur]->vt.scr);
+#endif
+    observer_push();
+}
+
+/* Bring the terminal up to date with the displayed window, sending only what
+ * differs from what it shows: no clear, so switching to a window that is
+ * already shown sends nothing. */
+static void refresh(void)
+{
+#ifdef X11_BACKEND
+    (void)xscr_selection_drop();
+#endif
+#ifdef X11_BACKEND
+    render_screen(&g_rs, &g_wins[g_cur]->vt.scr);
+    redraw_status();
+#else
+    set_status();
+    render_screen(&g_rs, &g_wins[g_cur]->vt.scr);
+#endif
     observer_push();
 }
 
@@ -633,7 +678,7 @@ static void switch_to(int idx)
     /* Exit scrollback mode when switching windows */
     g_scrollback_mode = false;
     g_scrollback_offset = 0;
-    full_redraw();
+    refresh();
 }
 
 /* ================================================================== */
@@ -1126,6 +1171,7 @@ int main(int argc, char *argv[])
      * On non-Linux platforms we fall back to now_ms().
      */
     long clock_remaining_ms = ms_to_next_minute();
+    long label_remaining_ms = LABEL_REFRESH_MS;
     long esc_remaining_ms   = -1;   /* -1 = no ESC pending */
 
     while (!g_quit) {
@@ -1330,6 +1376,8 @@ int main(int argc, char *argv[])
 
         /* Select timeout = min(clock_remaining, esc_remaining) */
         long timeout_ms = clock_remaining_ms;
+        if (label_remaining_ms < timeout_ms)
+            timeout_ms = label_remaining_ms;
         if (esc_remaining_ms >= 0 && esc_remaining_ms < timeout_ms)
             timeout_ms = esc_remaining_ms;
         if (timeout_ms < 0) timeout_ms = 0;
@@ -1360,6 +1408,7 @@ int main(int argc, char *argv[])
 #endif
 
         clock_remaining_ms -= elapsed_ms;
+        label_remaining_ms -= elapsed_ms;
         if (esc_remaining_ms > 0) esc_remaining_ms -= elapsed_ms;
 
         /* Flush ESC if its timer just expired */
@@ -1478,6 +1527,17 @@ int main(int argc, char *argv[])
         if (clock_remaining_ms <= 0) {
             redraw_status();
             clock_remaining_ms = ms_to_next_minute();
+        }
+
+        /* Window labels are the programs' names, which change without any
+         * other event (a shell execs its command).  Redraw the status row
+         * now and then.  It is written only when it changed, so an idle
+         * session sends nothing.  Not while the scrollback viewer is up:
+         * it owns the screen then. */
+        if (label_remaining_ms <= 0) {
+            if (!g_scrollback_mode)
+                redraw_status();
+            label_remaining_ms = LABEL_REFRESH_MS;
         }
 
         /* Output that was read to make room for a long write (a paste)

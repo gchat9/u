@@ -170,6 +170,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 void vt_init  (VTParser *p, int rows, int cols);
+/* As vt_init, for a scratch screen: no scrollback buffer is allocated (a
+ * scrolled-off line is just dropped). */
+void vt_init_view(VTParser *p, int rows, int cols);
 void vt_free  (VTParser *p);
 void vt_resize(VTParser *p, int rows, int cols);
 void vt_feed  (VTParser *p, const uint8_t *data, size_t len);

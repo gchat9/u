@@ -188,7 +188,7 @@ static void tab_clear(VTParser *p, int col)
 /* Screen operations                                                    */
 /* ================================================================== */
 
-static void scr_init(Screen *s, int rows, int cols)
+static void scr_init(Screen *s, int rows, int cols, bool history)
 {
     memset(s, 0, sizeof(*s));
     s->rows           = rows;
@@ -197,8 +197,10 @@ static void scr_init(Screen *s, int rows, int cols)
     s->alt_cells = NULL;   /* allocated lazily on first ?1047h/?1049h */
     s->row_flags = calloc((size_t)rows, 1);
 #if SCROLLBACK_ENABLED
-    s->scrollback     = calloc(1, SCROLLBACK_BYTES);
+    s->scrollback     = history ? calloc(1, SCROLLBACK_BYTES) : NULL;
     s->scrollback_len = 0;
+#else
+    (void)history;
 #endif
     s->cur_visible    = true;
     s->auto_wrap      = true;
@@ -398,6 +400,14 @@ static void scroll_down(Screen *s, int n)
     memmove(&s->cells[s->scroll_top + n],
             &s->cells[s->scroll_top],
             (size_t)(height - n) * sizeof(Cell *));
+    /* The wrap flag belongs to its line: it moves down with it, and the
+     * blank lines put in at the top have none. */
+    if (s->row_flags) {
+        memmove(&s->row_flags[s->scroll_top + n],
+                &s->row_flags[s->scroll_top],
+                (size_t)(height - n));
+        memset(&s->row_flags[s->scroll_top], 0, (size_t)n);
+    }
 
     for (int i = 0; i < n; i++) {
         s->cells[s->scroll_top + i] = save[i];
@@ -719,11 +729,10 @@ static void dispatch_csi(VTParser *p, char final)
                 clear_row_range(s, s->cells[start_row], start_col, s->cols - 1);
                 for (int r = start_row + 1; r < s->rows; r++)
                     clear_row_range(s, s->cells[r], 0, s->cols - 1);
-                /* Rows erased whole are no longer wrapped lines (as for EL). */
-                if (s->row_flags) {
-                    int f = start_row + (start_col > 0);
-                    memset(s->row_flags + f, 0, (size_t)(s->rows - f));
-                }
+                /* The rows from the start of the erase down lose their wrap
+                 * flags (as xterm does, the row the erase starts on too). */
+                if (s->row_flags)
+                    memset(s->row_flags + start_row, 0, (size_t)(s->rows - start_row));
             } else if (m == 1) {
                 /* erase from top to cursor */
                 for (int r = 0; r < s->cur_row; r++)
@@ -740,17 +749,16 @@ static void dispatch_csi(VTParser *p, char final)
         }
         case 'K': {
             int m = P(0,0);
+            /* What xterm does with the wrap flag of the row (observed on
+             * xterm with a line that wraps and is then erased): EL 0, from
+             * any column, clears it; EL 2 does not. */
             if (m == 0) {
-                /* Erase to end of line: kills the trailing content that
-                 * established the wrap, so clear the wrap flag. */
                 clear_row_range(s, s->cells[s->cur_row], s->cur_col, s->cols - 1);
-                if (s->cur_col == 0 && s->row_flags)
-                    s->row_flags[s->cur_row] = 0;
+                if (s->row_flags) s->row_flags[s->cur_row] = 0;
             } else if (m == 1) {
                 clear_row_range(s, s->cells[s->cur_row], 0, s->cur_col);
             } else if (m == 2) {
                 clear_row_range(s, s->cells[s->cur_row], 0, s->cols - 1);
-                if (s->row_flags) s->row_flags[s->cur_row] = 0;
             }
             break;
         }
@@ -1053,7 +1061,7 @@ static void dispatch_esc(VTParser *p, char final)
         break;
     case 'c': /* RIS – full reset */
         scr_free(s);
-        scr_init(s, s->rows, s->cols);
+        scr_init(s, s->rows, s->cols, true);
         tabs_reset(p);
         break;
     case '\\': /* ST – string terminator (already handled inline) */
@@ -1154,7 +1162,15 @@ static void csi_sep(VTParser *p)
 void vt_init(VTParser *p, int rows, int cols)
 {
     memset(p, 0, sizeof(*p));
-    scr_init(&p->scr, rows, cols);
+    scr_init(&p->scr, rows, cols, true);
+    tabs_reset(p);
+    p->state = ST_GROUND;
+}
+
+void vt_init_view(VTParser *p, int rows, int cols)
+{
+    memset(p, 0, sizeof(*p));
+    scr_init(&p->scr, rows, cols, false);
     tabs_reset(p);
     p->state = ST_GROUND;
 }
