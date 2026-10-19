@@ -23,7 +23,7 @@
  *   alive windows only).
  *
  *   Client sends 1-byte ACK (0x06) to signal successful receipt.
- *   Daemon unlinks socket and exits.
+ *   Daemon exits; the attaching client rebinds the socket.
  */
 
 #include "session.h"
@@ -41,6 +41,7 @@
 #include <time.h>
 #include <stddef.h>
 #include <signal.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/un.h>
@@ -295,34 +296,111 @@ static int recv_session(int fd, Window *wins[], int *cur_out)
 }
 
 /* ------------------------------------------------------------------ */
+/* Cursor-position reports                                              */
+/* ------------------------------------------------------------------ */
+
+/* The program that asked for its cursor position is waiting for the answer,
+ * and the answer is the window's own state, so it is given when the output
+ * is read: not when the window happens to be on screen.  Written without
+ * blocking: a program that is not reading its input drops the reply. */
+void window_answer_cpr(Window *w)
+{
+    if (!w->vt.cpr_requested || w->pty.master < 0) return;
+    w->vt.cpr_requested = false;
+
+    char reply[32];
+    int n = snprintf(reply, sizeof reply, "\033[%d;%dR",
+                     w->vt.scr.cur_row + 1, w->vt.scr.cur_col + 1);
+    (void)write(w->pty.master, reply, (size_t)n);
+}
+
+/* ------------------------------------------------------------------ */
 /* Daemon loop                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Read one chunk of a window's output while detached and feed it to the VT,
+ * as the live loop does, so that the screen a later attach receives is
+ * current and cursor-position requests get their answer.  One read, not a
+ * drain: a program writing faster than it can be parsed must not keep us
+ * from serving an attach.  Returns -1 once the program's side has closed. */
+static int daemon_pump(Window *w)
+{
+    uint8_t buf[4096];
+    ssize_t n = read(w->pty.master, buf, sizeof buf);
+    if (n > 0) {
+        vt_feed(&w->vt, buf, (size_t)n);
+        window_answer_cpr(w);
+    }
+    return n > 0 || (n < 0 && errno == EAGAIN) ? 0 : -1;
+}
+
+/* Serve one connection.  Returns 1 if it was an attach that got the whole
+ * session, after which this daemon is no longer needed; anything else (the
+ * probe session_listen() makes, an observer, a client that went away) is
+ * dropped and the daemon carries on. */
+static int daemon_serve(int sock, Window *wins[], int cur)
+{
+    int conn = accept(sock, NULL, NULL);
+    if (conn < 0) return 0;
+
+    /* The programs wait on us: a client that connects and then says nothing
+     * (or stops reading) must not hold them up for long. */
+    struct timeval tmo = { 0, 500000 };
+    setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof tmo);
+    setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof tmo);
+
+    int ok = 0;
+    uint8_t type = 0, cmd = 0;
+    if (read_all(conn, &type, 1) == 0 && type == '?') {
+        uint8_t resp = 'D';
+        write_all(conn, &resp, 1);
+        if (read_all(conn, &cmd, 1) == 0 && cmd == SESSION_TYPE_ATTACH)
+            ok = send_session(conn, wins, cur) == 0;
+    }
+    if (ok) {
+        uint8_t ack;
+        read_all(conn, &ack, 1);
+    }
+    close(conn);
+    return ok;
+}
+
 static void daemon_run(int sock, Window *wins[], int cur)
 {
-    /* Accept exactly one connection */
-    int conn = accept(sock, NULL, NULL);
-    if (conn >= 0) {
-        uint8_t type = 0;
-        if (read_all(conn, &type, 1) == 0 && type == '?') {
-            uint8_t resp = 'D';
-            write_all(conn, &resp, 1);
-            uint8_t cmd = 0;
-            if (read_all(conn, &cmd, 1) == 0 && cmd == SESSION_TYPE_ATTACH) {
-                if (send_session(conn, wins, cur) == 0) {
-                    uint8_t ack;
-                    read_all(conn, &ack, 1);
-                }
-            }
-        }
-        close(conn);
+    /* One entry per window slot, then the listening socket.  poll() skips a
+     * negative fd: that is a slot with no live program, or one whose child
+     * has exited (its master stays open and is handed over by the next
+     * attach, which notices the hangup as it always has; a hung-up master
+     * would be readable for ever, so it is not watched). */
+    struct pollfd p[MAX_WINDOWS + 1];
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        p[i].fd = wins[i] && wins[i]->alive ? wins[i]->pty.master : -1;
+        p[i].events = POLLIN;
     }
+    p[MAX_WINDOWS].fd = sock;
+    p[MAX_WINDOWS].events = POLLIN;
 
-    close(sock);
-    /* Do NOT unlink here: the new live instance that just received the
-     * session will call session_listen() to rebind the path.  Unlinking
-     * by path here would race against that and delete their fresh socket. */
-    _exit(0);
+    for (;;) {
+        if (poll(p, MAX_WINDOWS + 1, -1) < 0) {
+            if (errno == EINTR) continue;
+            _exit(1);
+        }
+
+        /* Keep every program's output going: a program whose pty is not
+         * read blocks in write() once the kernel's buffer is full. */
+        for (int i = 0; i < MAX_WINDOWS; i++)
+            if (p[i].revents && daemon_pump(wins[i]) < 0)
+                p[i].fd = -1;
+
+        if (p[MAX_WINDOWS].revents && daemon_serve(sock, wins, cur)) {
+            close(sock);
+            /* Do NOT unlink here: the new live instance that just received
+             * the session will call session_rebind() to rebind the path.
+             * Unlinking by path here would race against that and delete
+             * their fresh socket. */
+            _exit(0);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */

@@ -699,6 +699,9 @@ static bool drain_pty(Window *w)
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
         w->alive = false;
 
+    /* Answered here, for any window, not by whoever is displaying it. */
+    window_answer_cpr(w);
+
     return got_data;
 }
 
@@ -769,7 +772,7 @@ static void handle_resize(void)
 /* ================================================================== */
 
 /* Set when pty_write_all read the window's output to get on: the screen
- * is behind and the main loop must repaint (and answer what it asked). */
+ * is behind and the main loop must repaint. */
 static bool g_pty_drained;
 
 /* Write all of buf to the window's terminal.  The master is non-blocking
@@ -1545,13 +1548,6 @@ int main(int argc, char *argv[])
         if (g_pty_drained) {
             g_pty_drained = false;
             Window *w = g_wins[g_cur];
-            if (w && w->alive && w->vt.cpr_requested) {
-                w->vt.cpr_requested = false;
-                char reply[32];
-                int rlen = snprintf(reply, sizeof(reply), "\033[%d;%dR",
-                                    w->vt.scr.cur_row + 1, w->vt.scr.cur_col + 1);
-                (void)write(w->pty.master, reply, (size_t)rlen);
-            }
             if (w && !g_scrollback_mode) {
                 render_screen(&g_rs, &w->vt.scr);
                 observer_push();
@@ -1563,14 +1559,6 @@ int main(int argc, char *argv[])
             Window *w = g_wins[i];
             if (!w || w->pty.master < 0 || !FD_ISSET(w->pty.master, &rfds)) continue;
             if (drain_pty(w) && i == g_cur) {
-                if (w->vt.cpr_requested) {
-                    w->vt.cpr_requested = false;
-                    char reply[32];
-                    int rlen = snprintf(reply, sizeof(reply), "\033[%d;%dR",
-                                        w->vt.scr.cur_row + 1,
-                                        w->vt.scr.cur_col + 1);
-                    (void)write(w->pty.master, reply, (size_t)rlen);
-                }
                 if (!g_scrollback_mode) {
 #ifdef X11_BACKEND
                     (void)xscr_selection_drop();   /* (the render below repaints) */
