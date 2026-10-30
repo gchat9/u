@@ -2,7 +2,7 @@
 # usage: xtmux_bold_test.sh XTMUX_BINARY [DEPTH]  (needs Xvfb, xdotool, ImageMagick, python3-pil)
 # Prints the brightest pixel of "normal" vs bold "bright" text; expect #ffffff for the latter (patch 0007).
 D=${2:-24}
-setsid Xvfb :2 -screen 0 800x600x$D -nolisten tcp >/dev/null 2>&1 </dev/null &
+setsid Xvfb :2 -screen 0 1000x780x$D -nolisten tcp >/dev/null 2>&1 </dev/null &
 sleep 1; export DISPLAY=:2
 setsid bash -c "sleep 60 | $1 2>/tmp/xtmux.err" >/dev/null 2>&1 </dev/null &
 sleep 1.5

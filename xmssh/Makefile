@@ -1,6 +1,6 @@
 # xmssh: the SSH client of ../mssh in a window of its own, with a built-in xterm
 # emulator (the xtty layer of ../_lib) instead of the user's terminal.  Same
-# sources as mssh; only tty.c differs (this directory's). Needs /etc/font.bfnt
+# sources as mssh; only tty.c differs (this directory's). Needs /etc/bfnt/font2
 # at run time (make -C ../_font install), as xtmux does.
 TARGET     := xmssh
 SRCS       := mssh.c tty.c

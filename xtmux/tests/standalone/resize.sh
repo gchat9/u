@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: resize_test.sh xtmux-binary [wm]  -> prints expected vs actual `stty size` (rows cols) after each resize
-setsid Xvfb :2 -screen 0 800x600x24 -nolisten tcp >/dev/null 2>&1 </dev/null &
+setsid Xvfb :2 -screen 0 1000x780x24 -nolisten tcp >/dev/null 2>&1 </dev/null &
 sleep 1; export DISPLAY=:2
 [ "${2:-openbox}" != none ] && { setsid openbox >/dev/null 2>&1 </dev/null & sleep 1; }
 setsid bash -c "sleep 120 | $1 2>/tmp/xtmux.err" >/dev/null 2>&1 </dev/null &

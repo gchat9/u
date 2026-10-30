@@ -1,8 +1,10 @@
 /*
- * mkemoji.c — builds emoji.bfnt from Twemoji PNG source art.
+ * mkemoji.c — builds emoji<STEP>.bfnt from Twemoji PNG source art.
  *
- * Needs font.bfnt to already exist, to read its cell_w/cell_h from (see
- * below); the Makefile builds it first. Expects emoji_src/<hex
+ *   ./mkemoji font<STEP>.bfnt emoji<STEP>.bfnt
+ *
+ * Needs the font of the same size to already exist, to read its cell_w/cell_h
+ * from (see below); the Makefile builds it first. Expects emoji_src/<hex
  * codepoint>.png for every entry in emoji_charset.h; the exact files
  * used were fetched from https://github.com/jdecked/twemoji
  * (assets/72x72/<codepoint>.png), which is Twemoji artwork, CC-BY 4.0.
@@ -15,11 +17,11 @@
  * shaded with few distinct colours per glyph already, so 15 is enough
  * to stay visually close to lossless for this set.
  *
- * Output format (emoji.bfnt):
+ * Output format (emoji<STEP>.bfnt):
  *   12-byte header: magic "EMOJ", cell_w, cell_h, count, reserved
  *     (all u16 except the 4-byte magic)
  *   then, per emoji, in emoji_charset[] order (nothing per-record
- *   labels which emoji it is -- exactly like font.bfnt's glyph slots,
+ *   labels which emoji it is -- exactly like font<STEP>.bfnt's glyph slots,
  *   the shared header is the only mapping):
  *     45 bytes: 15 RGB triples (palette indices 1-15; index 0 is
  *               always "transparent" and needs no storage)
@@ -151,25 +153,26 @@ static int nearest(RGB8 c, const RGB8 *pal, int npal)
     return best;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    /* Read cell_w/cell_h from font.bfnt's own header rather than
+    if (argc != 3) { fprintf(stderr, "usage: mkemoji font<STEP>.bfnt emoji<STEP>.bfnt\n"); return 2; }
+    /* Read cell_w/cell_h from the font's own header rather than
      * hardcoding them here -- they're computed from the TTF at mkfont
      * build time, not fixed constants, so this is the only way
-     * emoji.bfnt is guaranteed to match whatever font was actually
+     * the emoji is guaranteed to match whatever font was actually
      * built, with nothing to keep manually in sync. */
-    FILE *fin = fopen("font.bfnt", "rb");
-    if (!fin) { fprintf(stderr, "font.bfnt not found -- run ./mkfont first\n"); return 1; }
+    FILE *fin = fopen(argv[1], "rb");
+    if (!fin) { fprintf(stderr, "%s not found -- run ./mkfont first\n", argv[1]); return 1; }
     uint8_t fhdr[16];
-    if (fread(fhdr, 1, sizeof fhdr, fin) != sizeof fhdr) { fprintf(stderr, "font.bfnt too short\n"); return 1; }
+    if (fread(fhdr, 1, sizeof fhdr, fin) != sizeof fhdr) { fprintf(stderr, "%s too short\n", argv[1]); return 1; }
     fclose(fin);
     uint16_t cell_w, cell_h;
     memcpy(&cell_w, fhdr + 4, 2);
     memcpy(&cell_h, fhdr + 6, 2);
     int gw = cell_w * 2, gh = cell_h;
 
-    FILE *out = fopen("emoji.bfnt", "wb");
-    if (!out) { perror("emoji.bfnt"); return 1; }
+    FILE *out = fopen(argv[2], "wb");
+    if (!out) { perror(argv[2]); return 1; }
 
     uint8_t hdr[12] = { 'E','M','O','J' };
     uint16_t count = (uint16_t)EMOJI_COUNT, rsv = 0;
@@ -237,6 +240,6 @@ int main(void)
 
     free(rgb); free(alpha); free(opaque); free(packed);
     fclose(out);
-    fprintf(stderr, "wrote emoji.bfnt (%d emoji, %dx%d each)\n", EMOJI_COUNT, gw, gh);
+    fprintf(stderr, "wrote %s (%d emoji, %dx%d each)\n", argv[2], EMOJI_COUNT, gw, gh);
     return 0;
 }

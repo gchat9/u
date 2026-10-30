@@ -70,6 +70,9 @@ static inline long openat(int dirfd, const char *pathname, int flags, int mode)
 static inline long close(int fd)
     { _syscall1(57, fd); }
 
+static inline long lseek(int fd, long offset, int whence)
+    { _syscall3(62, fd, offset, whence); }
+
 static inline long read(int fd, void *buf, size_t count)
     { _syscall3(63, fd, buf, count); }
 

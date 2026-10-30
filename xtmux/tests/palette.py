@@ -32,7 +32,7 @@ DEFAULT_BG = "1a1a1a"      # a plain cell, row 0
 def px(im, col, row):
     return "%02x%02x%02x" % im.getpixel((OX + col*CW + CW//2, OY + row*CH + CH//2))
 
-reset(); os.environ["XRES"] = "800x600x24"
+reset(); os.environ["XRES"] = "1000x780x24"
 xv = start_xvfb(); xt = start_xtmux(XTMUX); time.sleep(2)
 # row 0 stays plain; each case then gets its own row, 1 onward
 cmd = "clear; printf '\\n'; " + "; ".join("printf '%s\\n'" % esc for _, esc, _ in CASES)

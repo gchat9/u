@@ -32,7 +32,7 @@ def start_xvfb():
     for f in ("/tmp/.X2-lock", "/tmp/.X11-unix/X2"):
         try: os.unlink(f)
         except FileNotFoundError: pass
-    p = subprocess.Popen(["Xvfb", ":2", "-screen", "0", os.environ.get("XRES","800x600x24"), "-nolisten", "tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(["Xvfb", ":2", "-screen", "0", os.environ.get("XRES","1000x780x24"), "-nolisten", "tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1); os.environ["DISPLAY"] = ":2"; return p
 class XTmuxProc:
     """xtmux launched like from a terminal: stdio on a pty of the given size (default 40x120, unlike the X grid)."""

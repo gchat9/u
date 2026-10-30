@@ -2,7 +2,7 @@
 # usage: xtmux_sigwinch_test.sh XTMUX_BINARY  (needs Xvfb, xdotool)
 # Freezes the X server so xtmux blocks in write(), then sends SIGWINCH. Run it against an xtmux whose
 # SIGWINCH handler lacks SA_RESTART (dietlibc builds) to see "xwrite failed" without patch 0006.
-setsid Xvfb :2 -screen 0 800x600x24 -nolisten tcp >/dev/null 2>&1 </dev/null &
+setsid Xvfb :2 -screen 0 1000x780x24 -nolisten tcp >/dev/null 2>&1 </dev/null &
 sleep 1; export DISPLAY=:2
 XV=$(pgrep -x Xvfb | head -1)
 setsid bash -c "sleep 120 | $1 2>/tmp/xtmux.err" >/dev/null 2>&1 </dev/null &

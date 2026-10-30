@@ -1,4 +1,4 @@
-Test and benchmark programs for _lib/xterm.c. Both need /etc/font.bfnt (make -C ../_font install)
+Test and benchmark programs for _lib/xterm.c. Both need /etc/bfnt/font0..font7 (make -C ../_font install)
 and Xvfb. Build with `make`.
 
 xt_test   Renders 6 frames of a random stress grid (glyphs, colours, underline/strike, fullwidth,

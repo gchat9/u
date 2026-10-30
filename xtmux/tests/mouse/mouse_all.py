@@ -5,7 +5,7 @@ XTMUX = os.environ.get("XTMUX_BIN", os.path.join(_root, "xtmux", "xtmux")); TMUX
 ESC = b"\x1b"
 def sgr(cb, c, r, final="M"): return ESC + b"[<%d;%d;%d%s" % (cb, c + 1, r + 1, final.encode())
 def classic(cb, c, r): return ESC + b"[M" + bytes([cb + 32, c + 33, r + 33])
-def boot(res="800x600x24"):
+def boot(res="1000x780x24"):
     reset(); os.environ["XRES"] = res
     xv = start_xvfb(); xt = start_xtmux(XTMUX); time.sleep(2); return xv, xt
 def done(xv, xt): 
@@ -14,7 +14,7 @@ tests = sys.argv[1:] or ["enc","drag","mods","toggle","edges","windows","handoff
 
 if "enc" in tests:
     print("## encodings")
-    xv, xt = boot("1920x1080x24")
+    xv, xt = boot("1920x840x24")
     check("no mode requested: pointer events are not delivered", (click(5,3), log())[1] == b"")
     start_logger(None, ["1000"]);            click(5,3)
     check("1000 classic: left press+release", log() == classic(0,5,3) + classic(3,5,3), log().hex(" "))
@@ -103,20 +103,22 @@ if "edges" in tests:
     xv, xt = boot()
     xdo("type", "seq 1 100"); xdo("key", "Return"); time.sleep(.8)
     start_logger(None, ["1000", "1006"])
-    click(5, 22)
-    check("status row (row 22 of 23) is not the program's area", log() == b"", log())
-    clear(); click(5, 21)
-    check("last program row (21) is", log() == sgr(0,5,21) + sgr(0,5,21,"m"), log())
+    W, H, COLS, ROWS = screen_cells()           # the status row is the last one of the window
+    click(5, ROWS-1)
+    check("status row (row %d of %d) is not the program's area" % (ROWS-1, ROWS), log() == b"", log())
+    clear(); click(5, ROWS-2)
+    check("last program row (%d) is" % (ROWS-2), log() == sgr(0,5,ROWS-2) + sgr(0,5,ROWS-2,"m"), log())
     clear(); move(5,3); xdo("mousedown","1"); time.sleep(.1); 
-    xdo("mousemove", "799", "100"); time.sleep(.1); xdo("mouseup","1"); time.sleep(.15)
-    check("a drag released outside the window is clamped to the last column (61), same row", log() == sgr(0,5,3) + sgr(0,60,3,"m"), log())
+    xdo("mousemove", str(W-1), "100"); time.sleep(.1); xdo("mouseup","1"); time.sleep(.15)
+    check("a drag released outside the window is clamped to the last column (%d), same row" % COLS,
+          log() == sgr(0,5,3) + sgr(0,COLS-1,3,"m"), log())
     clear()
     xdo("key", "ctrl+b"); xdo("key", "bracketleft"); time.sleep(.6); click(5,3)
     check("scrollback viewer open: nothing is forwarded", log() == b"", log())
     xdo("key", "Escape"); time.sleep(.6); click(5,3)
     check("viewer closed: forwarded again", log() == sgr(0,5,3) + sgr(0,5,3,"m"), log())
     stop_logger(); done(xv, xt)
-    xv, xt = boot("4000x1000x24")
+    xv, xt = boot("4000x840x24")
     start_logger(None, ["1000"])
     click(250, 3); click(10, 3)
     check("classic encoding drops positions it cannot represent (col 250), still sends col 10", log() == classic(0,10,3) + classic(3,10,3), log().hex(" "))

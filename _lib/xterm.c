@@ -7,7 +7,7 @@
  *   - File-backed BFNT font mapping; protocol buffers supplied by main's stack frame
  *   - One PutImage per tile of cells (no full-screen framebuffer)
  *
- * The font is fixed at /etc/font.bfnt.  xterm_init() creates the
+ * The font is loaded from /etc/bfnt/font2 (see BFNT font).  xterm_init() creates the
  * surface; callers update xterm_framebuffer() and call xterm_render().
  *
  * Assumes: little-endian host; supports 16-bit RGB565 and 32-bpp TrueColor.
@@ -293,6 +293,9 @@ static void push_str(const char *s) { while (*s) key_push((uint8_t)*s++); }
 #define XTERM_PASTE_CTRL_V 1
 #endif
 static uint8_t paste_key;
+/* Font size steps asked for by the font keys (see handle_keypress), not yet
+ * applied: xterm_wait() changes the size. */
+static int     font_delta;
 
 int xterm_paste_key(void)
 {
@@ -324,6 +327,18 @@ static void handle_keypress(const uint8_t *ev)
         paste_key = 1;
         return;
     }
+
+#if XTERM_FONT_KEYS
+    /* Font size: Ctrl+= and Ctrl+KP_Add one size larger, Ctrl+- and Ctrl+KP_Subtract
+     * one smaller.  Unshifted only, so that Ctrl+_ (Ctrl+Shift+-, the readline and
+     * Emacs undo key) reaches the program, as the other shifted forms do.  Like the
+     * paste keys these are not typed to the program; the size is changed in
+     * xterm_wait(), where the grid is re-derived. */
+    if (ctrl && !shift && !alt) {
+        if (ks == '=' || ks == 0xFFAB) { font_delta++; return; }   /* KP_Add */
+        if (ks == '-' || ks == 0xFFAD) { font_delta--; return; }   /* KP_Subtract */
+    }
+#endif
 
     if (!ks) return;
 
@@ -400,92 +415,115 @@ static void handle_keypress(const uint8_t *ev)
  * BFNT font
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define FONT_MAX       (256 * 1024)   /* keep equal to _font/mkfont.c's */
 #define GRID_MAX_CELLS (32 * 1024)
 #define SETUP_MAX      (8 * 1024)
+/* The bytes of one tile of cells, see cell_storage and render_all(). */
+#define TILE_BYTES     (PUT_HDR + 64*64*4)
 
-static uint8_t  *mmap_base;
-static size_t    mmap_size;
+/* The font comes in FONT_SIZES sizes (see _font/mkfont.c), each in files of
+ * its own: /etc/bfnt/font<k> and /etc/bfnt/emoji<k> for size k.  Size k's
+ * cell is 2^((k - BASE_SIZE)/4) times the base size's in both directions.
+ * The font starts at BASE_SIZE.  The cell size is in the file's header, so
+ * the name only says which size the file is. */
+#define FONT_SIZES     8
+#define BASE_SIZE      2
+#define BFNT_DIR       "/etc/bfnt/"
+
+static uint8_t  *font_data;     /* the font in use, mapped; NULL until one is loaded */
+static size_t    font_len;
 static uint16_t  cell_w, cell_h, baseline, first_cp, num_glyphs, num_wide;
 static uint8_t  *glyph_data;
 static uint8_t  *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
 static int       WIN_W, WIN_H, cols, rows;
-static int       cfg_w, cfg_h;    /* window size as last reported by the server */
+static int       cfg_w, cfg_h;  /* window size as last reported by the server */
+static int       font_size = BASE_SIZE;  /* the size in use */
+static char      font_path[]  = BFNT_DIR "font2";     /* the digit is the size: */
+static char      emoji_path[] = BFNT_DIR "emoji2";   /* see font_switch() */
+#define FONT_DIGIT  (sizeof BFNT_DIR "font" - 1)
+#define EMOJI_DIGIT (sizeof BFNT_DIR "emoji" - 1)
 
-/* The length of the file, read through (the syscall layer has no fstat or
- * lseek on every architecture).  At most `limit`: longer is the same to us,
- * as nothing past the mapping is read.  The mapping itself is taken from
- * offset 0, so the descriptor's position does not matter afterwards. */
-static size_t file_length(int fd, size_t limit)
-{
-    uint8_t tmp[1024];
-    size_t total = 0;
-    for (;;) {
-        long r = read(fd, tmp, sizeof tmp);
-        if (r == -EINTR) continue;
-        if (r <= 0) return total;               /* end of file, or an error: short, and refused below */
-        total += (size_t)r;
-        if (total >= limit) return limit;
-    }
-}
+#ifndef SEEK_END
+#define SEEK_END 2
+#endif
 
-static void font_load(const char *path)
+/* A 16-bit little-endian field of a BFNT or EMOJ header. */
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+
+/* Map the whole of a file read-only.  Its length comes from lseek, so the
+ * mapping is exactly the file: nothing is read past its end, which would be
+ * SIGBUS, whatever a header claims.  Returns NULL, with *len set, on failure. */
+static uint8_t *map_file(const char *path, size_t *len)
 {
     int fd = (int)open(path, O_RDONLY, 0);
-    if (fd < 0) die("could not open font\n");
-    /* The mapping is FONT_MAX bytes whatever the file holds, and a read past
-     * the file's end is SIGBUS: so what the header claims is checked against
-     * the file's real size before any of it is read. */
-    size_t fsize = file_length(fd, FONT_MAX);
-    if (fsize < 16) { close(fd); die("invalid BFNT font: the file is too short\n"); }
-    mmap_base = mmap(0, FONT_MAX, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fd < 0) return NULL;
+    long n = lseek(fd, 0, SEEK_END);
+    uint8_t *m = n > 0 ? mmap(0, (size_t)n, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
     close(fd);
-    if (mmap_base == MAP_FAILED) die("could not map font\n");
-    mmap_size = FONT_MAX;
-    if (mmap_base[0] != 'B' || mmap_base[1] != 'F' ||
-        mmap_base[2] != 'N' || mmap_base[3] != 'T') {
-        die("invalid BFNT font\n");
+    if (m == MAP_FAILED) return NULL;
+    *len = (size_t)n;
+    return m;
+}
+
+/* Map and check the font at path, without changing the font in use: the
+ * caller commits it with font_commit(), or unmaps it.  The check covers all
+ * that the renderer relies on, so a font that passes can be drawn. */
+static uint8_t *font_open(const char *path, size_t *len)
+{
+    uint8_t *m = map_file(path, len);
+    if (!m) return NULL;
+    size_t n = *len;
+    uint16_t w = n >= 16 ? rd16(m+4) : 0, h = n >= 16 ? rd16(m+6) : 0;
+    if (n < 16 || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != 'T' ||
+        w == 0 || h == 0 ||
+        /* the glyphs are all in the file: (n-16) / (w*h) bitmaps fit in it */
+        (n - 16) / h / w < (size_t)rd16(m+12) + 2 * (size_t)rd16(m+14) ||
+        /* a cell fits a tile at the widest depth, with the tile's padding (tile_fit) */
+        (TILE_BYTES - PUT_HDR) / h < 3 + (size_t)w * 4) {
+        munmap(m, n);
+        return NULL;
     }
-    memcpy(&cell_w,     mmap_base+ 4, 2);
-    memcpy(&cell_h,     mmap_base+ 6, 2);
-    memcpy(&baseline,   mmap_base+ 8, 2);
-    memcpy(&first_cp,   mmap_base+10, 2);
-    memcpy(&num_glyphs, mmap_base+12, 2);
-    memcpy(&num_wide,   mmap_base+14, 2);     /* 0 in a file without wide glyphs */
-    if (cell_w == 0 || cell_h == 0) die("invalid BFNT font: empty cell\n");
-    size_t glyph_bytes = (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
-    if (glyph_bytes > FONT_MAX - 16) die("font is too large\n");
-    if (16 + glyph_bytes > fsize)
-        die("invalid BFNT font: the file is shorter than its header says\n");
-    glyph_data = mmap_base + 16;
+    return m;
+}
+
+/* Make m, from font_open(), the font in use; the one it replaces is unmapped. */
+static void font_commit(uint8_t *m, size_t len)
+{
+    if (font_data) munmap(font_data, font_len);
+    font_data = m; font_len = len;
+    cell_w = rd16(m+4); cell_h = rd16(m+6); baseline = rd16(m+8); first_cp = rd16(m+10);
+    num_glyphs = rd16(m+12); num_wide = rd16(m+14);     /* 0 in a file without wide glyphs */
+    glyph_data = m + 16;
     wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
 }
 
-/* emoji.bfnt (see _font/mkemoji.c): optional -- if it's missing or doesn't
- * match the font's cell size, every emoji draws as a placeholder box
- * (see draw_box) rather than killing the terminal. */
-#define EMOJI_MAX (32 * 1024)
-static const uint8_t *emoji_data;   /* NULL = no emoji available */
+/* emoji<k>.bfnt (see _font/mkemoji.c): optional.  If it is missing, or does
+ * not match the font's cell size, every emoji draws as a placeholder box (see
+ * draw_box) rather than killing the terminal.  It replaces the emoji in use
+ * whatever happens, so with no good file there are no emoji at all. */
+#define EMOJI_HDR 12
+static const uint8_t *emoji_data;   /* NULL = no emoji available; the mapping's start */
+static size_t   emoji_len;
 static uint16_t emoji_count;
 static size_t   emoji_rec;          /* bytes per record: 45 palette + packed 4bpp pixels */
 
 static void emoji_load(const char *path)
 {
-    int fd = (int)open(path, O_RDONLY, 0);
-    if (fd < 0) return;
-    size_t fsize = file_length(fd, EMOJI_MAX);   /* as font_load: nothing is read past the end */
-    if (fsize < 12) { close(fd); return; }
-    uint8_t *m = mmap(0, EMOJI_MAX, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return;
-    uint16_t w, h, n;
-    memcpy(&w, m + 4, 2); memcpy(&h, m + 6, 2); memcpy(&n, m + 8, 2);
-    size_t rec = 45 + ((size_t)w * 2 * h + 1) / 2;
-    if (m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != 'J' ||
-        w != cell_w || h != cell_h || 12 + (size_t)n * rec > EMOJI_MAX ||
-        12 + (size_t)n * rec > fsize)
+    if (emoji_data) { munmap((void *)emoji_data, emoji_len); emoji_data = NULL; }
+    size_t len;
+    uint8_t *m = map_file(path, &len);
+    if (!m) return;
+    if (len < EMOJI_HDR || m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != 'J' ||
+        rd16(m+4) != cell_w || rd16(m+6) != cell_h) {
+        munmap(m, len);
         return;
-    emoji_data = m; emoji_count = n; emoji_rec = rec;
+    }
+    size_t rec = 45 + ((size_t)cell_w * 2 * cell_h + 1) / 2;
+    size_t count = rd16(m+8);
+    if (count * rec > len - EMOJI_HDR) {          /* the records are all in the file */
+        munmap(m, len);
+        return;
+    }
+    emoji_data = m; emoji_len = len; emoji_count = (uint16_t)count; emoji_rec = rec;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -526,7 +564,7 @@ static void grid_init(uint16_t screen_w, uint16_t screen_h,
  * with a single PutImage; cell_buf is the current cell's top-left corner
  * inside it and cell_stride the tile's scanline pitch.  The tile is also
  * the only pixel storage: there is no full-screen framebuffer. */
-static uint8_t cell_storage[PUT_HDR + 64*64*4] __attribute__((aligned(4)));
+static uint8_t cell_storage[TILE_BYTES] __attribute__((aligned(4)));
 #define TILE (cell_storage + PUT_HDR)
 static uint8_t *cell_buf;
 static size_t   cell_stride;
@@ -628,7 +666,7 @@ static void draw_glyph(const uint8_t *g, int stride, int sh, uint8_t depth)
  * pixel `off` -- so a double-width emoji (w = 2 cells) draws its left
  * and right halves as two pieces of one rectangle, and an ordinary
  * cell (off = 0, w = 1 cell) draws the whole thing. Drawn rather than
- * stored, so it needs no data (and works with no emoji.bfnt at all)
+ * stored, so it needs no data (and works with no emoji file at all)
  * and follows fg colour, including the cursor's inversion. */
 static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
 {
@@ -644,7 +682,7 @@ static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
 static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
 {
     if (!emoji_data || k >= emoji_count) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
-    const uint8_t *rec = emoji_data + 12 + (size_t)k * emoji_rec;
+    const uint8_t *rec = emoji_data + EMOJI_HDR + (size_t)k * emoji_rec;
     const uint8_t *pix = rec + 45;
     int gw = cell_w * 2;
     for (int y = 0; y < cell_h; y++)
@@ -872,6 +910,96 @@ void xterm_set_title(const char *name, int len)
 int xterm_close_requested(void) { return close_requested; }
 static uint8_t xterm_depth;
 
+/* The size to start at: the one whose grid is nearest XTERM_START_LINES lines
+ * on a screen screen_h pixels high (the screen's height is the only input: the
+ * DPI the server reports is often wrong).  Size k's cells are the base size's
+ * times size_mul[k] / 1000, the same as mkfont's 2^((k-BASE_SIZE)/4) rounded to
+ * thousandths; the files round to whole pixels, which is as close as this needs.
+ * All the arithmetic is 32-bit, which every target has (64-bit division would
+ * need a libgcc routine on some of them).  Ties go to the smaller size. */
+static const uint16_t size_mul[FONT_SIZES] = { 707, 841, 1000, 1189, 1414, 1682, 2000, 2378 };
+
+static int size_for_screen(uint16_t screen_h)
+{
+    int best = BASE_SIZE;
+    unsigned best_err = ~0u;
+    for (int k = 0; k < FONT_SIZES; k++) {
+        unsigned h     = ((unsigned)cell_h * size_mul[k] + 500) / 1000;
+        unsigned lines = (unsigned)screen_h * 1000 / h;           /* thousandths of a line */
+        unsigned want  = XTERM_START_LINES * 1000u;
+        unsigned err   = lines > want ? lines - want : want - lines;
+        if (err < best_err) { best_err = err; best = k; }
+    }
+    return best;
+}
+
+/* Whole cells per tile: each scanline may need up to 3 bytes of padding.
+ * Cells are drawn a tile at a time (see xterm_render), so this follows the font. */
+static void tile_fit(void)
+{
+    batch = (int)(((TILE_BYTES - PUT_HDR) / cell_h - 3) /
+                  ((size_t)cell_w * (xterm_depth == 16 ? 2 : 4)));
+}
+
+/* ClearArea (opcode 61), exposures off, over the whole window (width and height
+ * 0 extend it to the right and bottom edges).  The window goes back to its
+ * background, so nothing drawn at the old size stays visible past the new grid. */
+static void clear_window(void)
+{
+    uint8_t r[16] = {0}; uint16_t len = 4;
+    r[0] = 61;
+    memcpy(r+2, &len, 2); memcpy(r+4, &xterm_win, 4);
+    xreq(r, 16);
+}
+
+/* Whether a grid of cw x ch cells fits the grid buffer in the window (cfg_w x
+ * cfg_h).  regrid() would truncate a grid that does not, leaving the bottom of
+ * the window blank, so a size that needs it is refused instead. */
+static int grid_fits(int cw, int ch, int win_w, int win_h)
+{
+    int c = win_w / cw, r = win_h / ch;
+    if (c < 1) c = 1;
+    if (r < 1) r = 1;
+    return (size_t)c * r <= GRID_MAX_CELLS;
+}
+
+/* Make size k the one in use, if its font loads and its grid fits the grid
+ * buffer in a win_w x win_h window.  Otherwise the size stays as it was, and 0 is
+ * returned.  The emoji follow the font (no good file: they draw as boxes).  The
+ * caller re-derives the grid from the window. */
+static int font_switch(int k, int win_w, int win_h)
+{
+    if (k == font_size) return 0;
+    font_path[FONT_DIGIT] = emoji_path[EMOJI_DIGIT] = (char)('0' + k);
+    size_t len;
+    uint8_t *m = font_open(font_path, &len);
+    if (m && !grid_fits(rd16(m+4), rd16(m+6), win_w, win_h)) { munmap(m, len); m = NULL; }
+    if (!m) {
+        font_path[FONT_DIGIT] = emoji_path[EMOJI_DIGIT] = (char)('0' + font_size);
+        return 0;
+    }
+    font_commit(m, len);
+    emoji_load(emoji_path);
+    font_size = k;
+    tile_fit();
+    return 1;
+}
+
+/* A font size step from a key (see xterm_wait): clamped to the sizes there are.
+ * The grid follows in xterm_wait(), from the window's size; nothing else is done
+ * if the size does not change.  Returns nonzero if it changed. */
+static int font_size_set(int k)
+{
+    if (k < 0) k = 0;
+    if (k >= FONT_SIZES) k = FONT_SIZES - 1;
+    if (!font_switch(k, cfg_w, cfg_h)) return 0;
+    WIN_W = cols * cell_w;
+    WIN_H = rows * cell_h;
+    synced = 0;                         /* every row is drawn again */
+    clear_window();
+    return 1;
+}
+
 uint8_t *xterm_framebuffer(void) { return scr; }
 /* Parallel to xterm_framebuffer(): one xterm 256-colour palette index
  * per cell. Defaults (XTERM_FG_DEFAULT/XTERM_BG_DEFAULT, xterm.h) fill
@@ -902,8 +1030,11 @@ int xterm_init(void)
     uint8_t setup_storage[SETUP_MAX];
     x_max_request_words = 65535;
     build_palette();
-    font_load("/etc/font.bfnt");
-    emoji_load("/etc/emoji.bfnt");
+    size_t flen;
+    uint8_t *fm = font_open(font_path, &flen);
+    if (!fm) die("could not load a BFNT font: /etc/bfnt/font2\n");
+    font_commit(fm, flen);
+    emoji_load(emoji_path);
 
     /* Close-on-exec (SOCK_CLOEXEC has O_CLOEXEC's value): the shells and
      * programs we start must not inherit the connection.  They would keep
@@ -961,9 +1092,10 @@ int xterm_init(void)
     uint16_t screen_w; memcpy(&screen_w, d+soff+20, 2);
     uint16_t screen_h; memcpy(&screen_h, d+soff+22, 2);
     xterm_depth = d[soff+38];
-    /* Whole cells per tile: each scanline may need up to 3 bytes of padding. */
-    batch = (int)(((sizeof cell_storage - PUT_HDR) / cell_h - 3) /
-                  ((size_t)cell_w * (xterm_depth == 16 ? 2 : 4)));
+    /* Start at the size that suits this screen.  If that size's font will not
+     * load, the base size stays, which is loaded already. */
+    font_switch(size_for_screen(screen_h), screen_w, screen_h);
+    tile_fit();
     if (batch < 1) die("font cell is too large\n");
     min_keycode = d[26];
     max_keycode = d[27];
@@ -1356,6 +1488,11 @@ int xterm_wait(int timeout_ms)
         p.revents = 0;
         ready = poll(&p, 1, 0);
         if (ready <= 0) break;
+    }
+    if (font_delta) {                   /* Ctrl+= / Ctrl+- (see handle_keypress) */
+        int k = font_size + font_delta;
+        font_delta = 0;
+        if (font_size_set(k)) redraw_pending = 1;
     }
     if (regrid(cfg_w, cfg_h)) redraw_pending = 1;
     int redraw = redraw_pending;

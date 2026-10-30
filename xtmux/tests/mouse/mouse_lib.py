@@ -2,8 +2,20 @@ import sys, os, time, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 # mc_lib.py (alongside): PlainTmux, start_xvfb, start_xtmux, xdo, shot
 from mc_lib import *   # noqa: sibling module
-CW, CH, OX, OY = 13, 26, 3, 1      # cell size; window origin (no WM): window at +3,+1
-def cell_xy(c, r): return (OX + c*CW + CW//2, OY + r*CH + CH//2)
+# cell size of the base font, which xtmux starts with on a screen 780 pixels high (30 lines:
+# see XTERM_START_LINES).  The window is centred on the screen (xterm.c), so its origin is
+# the screen minus the whole cells, halved; it depends on the screen the current group boots.
+CW, CH = 13, 26
+def origin():
+    w, h = (int(v) for v in os.environ.get("XRES", "1000x780x24").split("x")[:2])
+    return (w - w // CW * CW) // 2, (h - h // CH * CH) // 2
+def screen_cells():
+    """(screen width, height in px, whole columns, whole rows) of the current XRES screen."""
+    w, h = (int(v) for v in os.environ.get("XRES", "1000x780x24").split("x")[:2])
+    return w, h, w // CW, h // CH
+def cell_xy(c, r):
+    ox, oy = origin()
+    return (ox + c*CW + CW//2, oy + r*CH + CH//2)
 def move(c, r): x, y = cell_xy(c, r); xdo("mousemove", str(x), str(y)); time.sleep(0.08)
 def click(c, r, b=1): move(c, r); xdo("click", str(b)); time.sleep(0.12)
 def log(): 

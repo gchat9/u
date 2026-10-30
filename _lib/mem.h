@@ -4,7 +4,9 @@
 #include <stddef.h>
 
 static inline void *memcpy(void *dest, const void *src, size_t n);
+#ifndef MEMSET_EXTERN
 static inline void *memset(void *ptr, int c, size_t n);
+#endif
 static inline void *memchr(const void *ptr, int c, size_t n);
 static inline void *memmem(const void *haystack, size_t haystacklen,
                     const void *needle,   size_t needlelen);
@@ -54,6 +56,7 @@ static inline void *memmem(const void *haystack, size_t haystacklen,
     return 0;
 }
 
+#ifndef MEMSET_EXTERN
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
 static inline void *memset(void *ptr, int c, size_t n)
 {
@@ -65,6 +68,8 @@ static inline void *memset(void *ptr, int c, size_t n)
 
     return ptr;
 }
+
+#endif
 
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
 static inline void *memchr(const void *ptr, int c, size_t n)

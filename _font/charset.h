@@ -32,12 +32,12 @@
  *
  * Double-width glyphs are a second, separate array of the same kind: a
  * "wide slot" indexes charset_wide_extra[] and a wide bitmap in
- * font.bfnt that is two cells wide (see charset_wide_slot() below).
+ * font<STEP>.bfnt that is two cells wide (see charset_wide_slot() below).
  *
  * The font file only holds CHARSET_COUNT narrow and CHARSET_WIDE_COUNT
  * wide glyphs (mkfont writes exactly that many; the renderer takes the
  * counts from the file header), so every glyph dropped here is also
- * dropped from font.bfnt. Extending the charset later means appending
+ * dropped from font<STEP>.bfnt. Extending the charset later means appending
  * to charset_extra[] or charset_wide_extra[] (order doesn't matter);
  * the _Static_asserts below keep CHARSET_RESERVE slots of each kind
  * free, to be spent on purpose by lowering that number.
@@ -79,7 +79,7 @@ static const uint16_t charset_extra[] = {
 };
 #define CHARSET_EXTRA_COUNT ((int)(sizeof(charset_extra) / sizeof(charset_extra[0])))
 
-/* Number of glyphs actually baked into font.bfnt (slots 0..COUNT-1). */
+/* Number of glyphs actually baked into font<STEP>.bfnt (slots 0..COUNT-1). */
 #define CHARSET_COUNT (CHARSET_EXTRA_BASE + CHARSET_EXTRA_COUNT)
 
 /* Slots deliberately kept free in each of the two glyph arrays, for
@@ -145,7 +145,7 @@ static inline uint32_t charset_fullwidth_alias(uint32_t cp)
  * Characters drawn from their own two-cell bitmap, rather than by
  * centring a narrow twin (above) or as an emoji. They live in a second
  * array of glyphs, with its own slot numbering (0..CHARSET_WIDE_COUNT-1),
- * stored after the narrow glyphs in font.bfnt; a cell holding one is
+ * stored after the narrow glyphs in font<STEP>.bfnt; a cell holding one is
  * flagged XTERM_ATTR_WIDE (see xterm.h). Add to the end, as above.
  */
 static const uint16_t charset_wide_extra[] = {

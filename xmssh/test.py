@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Tests xmssh against a local sshd, on Xvfb:  python3 xmssh/test.py
 # Needs sshd (OpenSSH server), ssh-keygen, Xvfb, xdotool, xclip, python-xlib,
-# and /etc/font.bfnt (make -C _font install); the helpers of xtmux/tests/mouse.
+# and /etc/bfnt/font2 (make -C _font install); the helpers of xtmux/tests/mouse.
 import os, sys, subprocess, tempfile, time, shutil
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xtmux", "tests", "mouse"))
 from mouse_lib import *
@@ -62,6 +62,9 @@ time.sleep(1)
 hk = subprocess.run(["ssh-keygen", "-y", "-f", os.path.join(T, "hostkey")], capture_output=True, text=True).stdout.split()
 open(os.path.join(T, "known_hosts"), "w").write("127.0.0.1 %s %s\n" % (hk[0], hk[1]))   # for the tests that are not about this
 
+# A 1000x780 screen: 780/26 = 30 lines, so the start size is the base size, 2 (13x26 cells),
+# which the size checks below count from.
+os.environ["XRES"] = "1000x780x24"
 xv = start_xvfb()
 try:
     print("## a session in a window")
@@ -77,6 +80,12 @@ try:
     xdo("windowsize", wid, "520", "260"); time.sleep(1)
     typed("stty size > %s/s2" % T)
     check("resizing the window sends a window-change", wait(lambda: rd("s2") == "10 40"), rd("s2"))
+    xdo("key", "ctrl+equal"); time.sleep(.6)            # the font one size larger: 520/15 x 260/31 = 34x8 cells
+    typed("stty size > %s/s3" % T)
+    check("Ctrl+= changes the font, so the pty follows the grid (8x34 cells)", wait(lambda: rd("s3") == "8 34"), rd("s3"))
+    xdo("key", "ctrl+minus"); time.sleep(.6)
+    typed("stty size > %s/s4" % T)
+    check("Ctrl+- takes it back (10x40 cells)", wait(lambda: rd("s4") == "10 40"), rd("s4"))
     typed("clear; echo hello-copy-test"); time.sleep(1)
     own("primary", b"sentinel"); mclick = lambda c, r, n: [move(c, r)] + [xdo("click", "1") or time.sleep(.05) for _ in range(n)] + [time.sleep(.3)]
     mclick(3, 0, 2)                                   # (after clear, the output is on row 0)
@@ -132,19 +141,19 @@ try:
     if p.poll() is None: p.kill()
 
     print("## the font file")
-    good_font = open("/etc/font.bfnt", "rb").read()
+    good_font = open("/etc/bfnt/font2", "rb").read()
     def font_refused(data, name):
-        """A damaged /etc/font.bfnt: refused with a message (it used to be a crash)."""
+        """A damaged /etc/bfnt/font2: refused with a message (it used to be a crash)."""
         try:
-            open("/etc/font.bfnt", "wb").write(data)
+            open("/etc/bfnt/font2", "wb").write(data)
             q = subprocess.run([BIN, "-o", "UserKnownHostsFile=" + os.path.join(T, "known_hosts"), "-i", os.path.join(T, "key"),
                                 "-p", PORT, "root@127.0.0.1", "true"], capture_output=True, timeout=30)
             check(name, q.returncode == 1 and b"BFNT" in q.stderr, (q.returncode, q.stderr[-200:]))
         finally:
-            open("/etc/font.bfnt", "wb").write(good_font)
+            open("/etc/bfnt/font2", "wb").write(good_font)
     font_refused(good_font[:1000], "a truncated font is refused with a message, not a crash")
     font_refused(good_font[:6] + b"\0\0" + good_font[8:], "a font with an empty cell is refused with a message")
-    check("the real font is back in place", open("/etc/font.bfnt", "rb").read() == good_font)
+    check("the real font is back in place", open("/etc/bfnt/font2", "rb").read() == good_font)
 
     print("## failing")
     p = subprocess.Popen([BIN, "-i", os.path.join(T, "key"), "-p", "1", "root@127.0.0.1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)

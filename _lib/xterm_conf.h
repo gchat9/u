@@ -34,6 +34,27 @@
 #endif
 
 /* ================================================================== */
+/* Font size                                                            */
+/* ================================================================== */
+
+/* Ctrl+= and Ctrl+- (and the keypad's Ctrl+KP_Add and Ctrl+KP_Subtract) make
+ * the font one size larger or smaller: xterm has FONT_SIZES of them, each in
+ * its own files (see _font/).  Only without Shift, so that Ctrl+_ (Ctrl+Shift+-)
+ * and the other shifted forms reach the program.  Like the paste keys, these
+ * keys are not typed to the program.  Define this to 0 to leave them to it; the
+ * size is then the start size alone. */
+#ifndef XTERM_FONT_KEYS
+#define XTERM_FONT_KEYS 1
+#endif
+
+/* At start, the font size is the one whose grid is nearest this many lines on
+ * the screen (by the screen's pixel height).  Which size that is depends on the
+ * screen, as the sizes are fixed steps, so the line count is only close. */
+#ifndef XTERM_START_LINES
+#define XTERM_START_LINES 30
+#endif
+
+/* ================================================================== */
 /* Scrollback                                                           */
 /* ================================================================== */
 

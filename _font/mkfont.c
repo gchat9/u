@@ -1,26 +1,32 @@
 /*
- * mkfont.c — bake a monospace TTF into font.bfnt, one glyph per slot of
+ * mkfont.c — bake a monospace TTF into font<STEP>.bfnt, one glyph per slot of
  * the layout defined in charset.h.
  *
  * Normally run via this directory's Makefile (which also fetches
  * stb_truetype.h). By hand:
- *   cc -O2 -o mkfont mkfont.c -lm && ./mkfont [narrow.ttf [wide.ttf]]
+ *   cc -O2 -o mkfont mkfont.c -lm && ./mkfont STEP OUT.bfnt [narrow.ttf [wide.ttf]]
+ * STEP (0..FONT_SIZES-1) picks the size: the cell is 2^((STEP-FONT_BASE)/4) times
+ * the size the font was always built at (FONT_PX below), in both directions. So
+ * STEP FONT_BASE is that size, STEP FONT_BASE+4 is twice it, and xterm starts at
+ * FONT_BASE.
  * The narrow TTF defaults to DejaVu Sans Mono; any monospace font works.
  * The wide TTF supplies the double-width glyphs (charset_wide_extra[]):
  * it defaults to Noto Sans CJK; any font with those characters works
  * (a .ttc is read at index 0).
  *
- * font.bfnt layout, all little-endian:
+ * font<STEP>.bfnt layout, all little-endian:
  *   "BFNT", cell_w, cell_h, baseline, first_cp, num_glyphs, num_wide  (16 bytes)
  *   num_glyphs   narrow glyphs, cell_w x cell_h bytes of alpha each
  *   num_wide     wide glyphs, (2*cell_w) x cell_h bytes of alpha each
  * (num_wide is the header's old "reserved" word, 0 in files without a
- * wide section.)
+ * wide section.)  The header is the only record of the size: the cell dimensions
+ * are in it, not in the file name.
  */
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,9 +37,10 @@
 #define DEFAULT_TTF  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 #define DEFAULT_WTTF "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 #define FONT_PX     26
+#define FONT_SIZES  8                    /* STEP 0..7; keep equal to xterm.c's */
+#define FONT_BASE   2                    /* the size FONT_PX high, as always built */
 #define NUM_GLYPHS  CHARSET_COUNT        /* only what charset.h defines */
 #define NUM_WIDE    CHARSET_WIDE_COUNT
-#define FONT_MAX    (256 * 1024)         /* keep equal to xterm.c's */
 
 static void w16(FILE *f, uint16_t v) {          /* write LE uint16 */
     uint8_t b[2] = { v & 0xFF, v >> 8 };
@@ -87,33 +94,52 @@ static void draw_cp(stbtt_fontinfo *fi, float scale, uint32_t cp, uint8_t *cell,
 
 int main(int argc, char **argv)
 {
+    /* ── arguments ────────────────────────────────────────────────── */
+    if (argc < 3) {
+        fprintf(stderr, "usage: mkfont STEP OUT.bfnt [narrow.ttf [wide.ttf]]\n");
+        return 2;
+    }
+    int step = atoi(argv[1]);
+    if (step < 0 || step >= FONT_SIZES) {
+        fprintf(stderr, "mkfont: STEP must be 0..%d\n", FONT_SIZES - 1);
+        return 2;
+    }
+    const char *out_path  = argv[2];
+    const char *ttf_path  = argc > 3 ? argv[3] : DEFAULT_TTF;
+    const char *wttf_path = argc > 4 ? argv[4] : DEFAULT_WTTF;
+
     /* ── load TTF ─────────────────────────────────────────────────── */
-    const char *ttf_path  = argc > 1 ? argv[1] : DEFAULT_TTF;
-    const char *wttf_path = argc > 2 ? argv[2] : DEFAULT_WTTF;
     uint8_t *ttf = load_file(ttf_path);
 
     stbtt_fontinfo fi;
     stbtt_InitFont(&fi, ttf, stbtt_GetFontOffsetForIndex(ttf, 0));
 
-    float scale = stbtt_ScaleForPixelHeight(&fi, FONT_PX);
+    /* The base size's scale and metrics: FONT_PX high, as the font was always built. */
+    float base_scale = stbtt_ScaleForPixelHeight(&fi, FONT_PX);
 
     int asc, desc, lgap;
     stbtt_GetFontVMetrics(&fi, &asc, &desc, &lgap);
 
-    uint16_t baseline = (uint16_t)(asc * scale + 0.5f);
-    uint16_t cell_h   = (uint16_t)((asc - desc) * scale + 0.5f);
-
     /* For a monospace font every advance is identical; use 'M'. */
     int adv, lsb;
     stbtt_GetCodepointHMetrics(&fi, 'M', &adv, &lsb);
-    uint16_t cell_w = (uint16_t)(adv * scale + 0.5f);
+    uint16_t cell_w0 = (uint16_t)(adv * base_scale + 0.5f);
 
-    fprintf(stderr, "cell %u×%u  baseline %u  scale %.4f\n",
-            cell_w, cell_h, baseline, (double)scale);
+    /* This size: 2^((STEP-FONT_BASE)/4) times the base cell in both directions.
+     * The width is scaled from its rounded base value, not from the advance:
+     * the advance at twice the size would round to 27 px, not twice 13. */
+    float f     = powf(2.0f, (step - FONT_BASE) / 4.0f);
+    float scale = base_scale * f;
+    uint16_t cell_w   = (uint16_t)(cell_w0 * f + 0.5f);
+    uint16_t cell_h   = (uint16_t)((asc - desc) * scale + 0.5f);
+    uint16_t baseline = (uint16_t)(asc * scale + 0.5f);
+
+    fprintf(stderr, "step %d: cell %u×%u  baseline %u  scale %.4f\n",
+            step, cell_w, cell_h, baseline, (double)scale);
 
     /* ── write header ─────────────────────────────────────────────── */
-    FILE *out = fopen("font.bfnt", "wb");
-    if (!out) { perror("font.bfnt"); return 1; }
+    FILE *out = fopen(out_path, "wb");
+    if (!out) { perror(out_path); return 1; }
 
     fwrite("BFNT", 1, 4, out);
     w16(out, cell_w);
@@ -174,12 +200,7 @@ int main(int argc, char **argv)
     free(wcell); free(wttf); free(ttf); fclose(out);
 
     unsigned total = 16 + NUM_GLYPHS * cell_w * cell_h + NUM_WIDE * ww * cell_h;
-    fprintf(stderr, "wrote font.bfnt  (%d narrow + %d wide glyphs, %u bytes; "
-            "+%d of each would be %u)\n", NUM_GLYPHS, NUM_WIDE, total, CHARSET_RESERVE,
-            total + CHARSET_RESERVE * (cell_w * cell_h + ww * cell_h));
-    if (total + CHARSET_RESERVE * (cell_w * cell_h + ww * cell_h) > FONT_MAX) {
-        fprintf(stderr, "error: that would exceed FONT_MAX (%d) in xterm.c\n", FONT_MAX);
-        return 1;
-    }
+    fprintf(stderr, "wrote %s  (%d narrow + %d wide glyphs, %u bytes)\n",
+            out_path, NUM_GLYPHS, NUM_WIDE, total);
     return 0;
 }

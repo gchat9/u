@@ -32,7 +32,7 @@ static void window_close(void) {
 }
 
 void tty_open(const char *title) {
-    if (xtty_open(title)) die("cannot open the X11 window ($DISPLAY, /etc/font.bfnt)");
+    if (xtty_open(title)) die("cannot open the X11 window ($DISPLAY, /etc/bfnt/font2)");
     opened = 1;
 }
 

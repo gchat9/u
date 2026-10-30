@@ -77,6 +77,9 @@ static inline int execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(11, pathname, argv, envp); }
 
+static inline long lseek(int fd, long offset, int whence)
+    { _syscall3(19, fd, offset, whence); }
+
 static inline long getpid(void)
     { _syscall0(20); }
 

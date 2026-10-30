@@ -13,7 +13,7 @@ def reset():
 def session_alive(): return os.path.exists("/run/utmux") and bool(sh("pgrep -x xtmux; pgrep -x tmux").split())
 def wshot(w, path): sh("xwd -id %s -silent | convert xwd:- %s" % (w, path)); return Image.open(path).convert("RGB")
 def differs(a, b): return ImageChops.difference(a, b).getbbox() is not None
-def env(res="800x600x24", wm=True):
+def env(res="1000x780x24", wm=True):
     reset(); os.environ["XRES"] = res
     xv = start_xvfb(); w = None
     if wm: w = subprocess.Popen(["openbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(1)
@@ -220,7 +220,7 @@ if "shrink" in tests:
     b.send(b"\x02["); b.pump(0.6)
     check("...and the cropped lines are in scrollback", any("SCROLLBACK" in l for l in nb(b)))
     a.kill(); b.kill(); sh("rm -f /run/utmux; pkill -9 -x tmux"); time.sleep(0.7)
-    xv, wm = env("800x600x24", wm=False)
+    xv, wm = env("1000x780x24", wm=False)
     a = PlainTmux(TMUX, rows=40, cols=100); a.pump(1.0); a.send(b"echo hello-xshort\n"); a.pump(0.8)
     x = start_xtmux(XTMUX, ["attach"]); time.sleep(2.5); a.pump(1.0)
     check("xtmux (smaller grid) attaching also keeps it visible (seen via the plain observer's mirror)", any("hello-xshort" in l for l in nb(a)))

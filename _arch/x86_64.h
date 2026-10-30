@@ -78,6 +78,9 @@ static inline long close(int fd)
 static inline long poll(struct pollfd *fds, unsigned long nfds, int timeout)
     { _syscall3(7, fds, nfds, timeout); }
 
+static inline long lseek(int fd, long offset, int whence)
+    { _syscall3(8, fd, offset, whence); }
+
 static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
                             int fd, long offset)
     { _syscall6(9, addr, length, prot, flags, fd, offset); }

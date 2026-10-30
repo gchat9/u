@@ -8,7 +8,10 @@ imagemagick   # or graphicsmagick-imagemagick-compat, to covert xwd's output to 
 # internal dependencies
 
 make -C ../xtmux              # binary for this testsuite to drive
-make -C ../../_font install   # /etc/font.bfnt and /etc/emoji.bfnt
+make -C ../../_font install   # /etc/bfnt/font0..font7 and emoji0..emoji7
+
+The harnesses run on a 1000x780 screen, not 800x600: xtmux starts at the font size nearest 30
+lines on the screen, and 780/26 = 30 is the base size (13x26 cells), which the tests count in.
 
 palette.py   xtmux colours, sampled from a screenshot (no mouse needed): the default
             background and foreground (slots 0 and 7), slot 15, bold, the cube and greyscale.

@@ -2,12 +2,12 @@
  * emoji_charset.h — the emoji font's contents, and nothing more.
  *
  * Twenty commonly-used emoji, rendered at build time (see mkemoji.c,
- * which produces emoji.bfnt) into small fixed-palette colour glyphs.
+ * which produces emoji<STEP>.bfnt) into small fixed-palette colour glyphs.
  * This array is the single source of truth for both: index i here is
- * exactly record i in emoji.bfnt, and mkemoji.c fetches art for these
+ * exactly record i in emoji<STEP>.bfnt, and mkemoji.c fetches art for these
  * codepoints in this order. The runtime (vt.c for cell width,
  * x11_backend.c for which glyph to draw) looks a codepoint up here to
- * get that same index -- nothing is stored per-record in emoji.bfnt
+ * get that same index -- nothing is stored per-record in emoji<STEP>.bfnt
  * itself, exactly like charset.h's glyph slots aren't self-labelled
  * either.
  *
@@ -50,7 +50,7 @@ static const uint32_t emoji_charset[] = {
 };
 #define EMOJI_COUNT ((int)(sizeof(emoji_charset) / sizeof(emoji_charset[0])))
 
-/* codepoint -> index into emoji_charset[]/emoji.bfnt, or -1 if this
+/* codepoint -> index into emoji_charset[]/emoji<STEP>.bfnt, or -1 if this
  * codepoint isn't one of ours. EMOJI_COUNT is small enough that a
  * linear scan is simpler code than anything smarter, for no measurable
  * cost (same reasoning as charset.h's charset_slot() extras lookup). */

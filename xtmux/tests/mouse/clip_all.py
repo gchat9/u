@@ -17,7 +17,7 @@ def rclick(c=20, r=8, mod=None):
     if mod: xdo("keydown", mod); time.sleep(.1)
     click(c, r, 3)
     if mod: xdo("keyup", mod); time.sleep(.1)
-def boot(res="800x600x24"):
+def boot(res="1000x780x24"):
     reset(); sh("pkill -9 xclip"); os.environ["XRES"] = res
     xv = start_xvfb(); xt = start_xtmux(XTMUX); time.sleep(2); return xv, xt
 def done(xv, xt, *more):
@@ -278,22 +278,29 @@ if "scrollback" in tests:
     print("## scrollback viewer (Ctrl+B PgUp): selecting and copying its text")
     xv, xt = boot()
     xdo("type", "clear; seq 1 100"); xdo("key", "Return"); time.sleep(.8)
-    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)     # the viewer, a page up: rows read 59, 60, 61, ...
+    _w, _h, COLS, ROWS = screen_cells()
+    # The page-up view (tmux/main.c) starts child_rows()-1 = ROWS-2 lines above the live screen, and the
+    # live screen, after "seq 1 100" and the prompt, starts at line 103-ROWS. So the viewer's row 1 reads
+    # T = 106-2*ROWS: 60 on the 23-row screen these were written for, 46 on the 30-row one (the test
+    # checks the base 23 rows the same way).  T, T+1, T+2 are the lines on screen rows 1, 2, 3.
+    T = 106 - 2 * ROWS
+    xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8)
     own("primary", b"sentinel-P"); own("clipboard", b"sentinel-C")
     shot("/tmp/sb_base.png")
     drag(0,1, 1,3)
-    check("drag in the viewer copies the displayed lines to PRIMARY and CLIPBOARD", xc("primary") == b"60\n61\n62" and xc("clipboard") == b"60\n61\n62", (xc("primary"), xc("clipboard")))
+    want = ("%d\n%d\n%d" % (T, T+1, T+2)).encode()
+    check("drag in the viewer copies the displayed lines to PRIMARY and CLIPBOARD", xc("primary") == want and xc("clipboard") == want, (xc("primary"), xc("clipboard")))
     shot("/tmp/sb_sel.png")
-    win = lambda p: Image.open(p).convert("RGB").crop((0, 0, 800, 572))      # the text rows, not the footer
+    win = lambda p: Image.open(p).convert("RGB").crop((0, 0, COLS*CW, (ROWS-1)*CH))      # the text rows, not the footer
     check("the selection is highlighted in the viewer", ImageChops.difference(win("/tmp/sb_base.png"), win("/tmp/sb_sel.png")).getbbox() is not None)
     xdo("type", "x"); time.sleep(.5); shot("/tmp/sb_typed.png")
-    check("a key in the viewer removes its highlight (the copy stays)", ImageChops.difference(win("/tmp/sb_base.png"), win("/tmp/sb_typed.png")).getbbox() is None and xc("primary") == b"60\n61\n62")
+    check("a key in the viewer removes its highlight (the copy stays)", ImageChops.difference(win("/tmp/sb_base.png"), win("/tmp/sb_typed.png")).getbbox() is None and xc("primary") == want)
     own("primary", b"sentinel-P")
     move(0, 3); xdo("click", "--repeat", "2", "--delay", "100", "1"); time.sleep(.4)
-    check("double click selects a word in the viewer", xc("primary") == b"62", xc("primary"))
+    check("double click selects a word in the viewer", xc("primary") == str(T+2).encode(), xc("primary"))
     own("primary", b"sentinel-P")
     move(1, 2); xdo("click", "--repeat", "3", "--delay", "100", "1"); time.sleep(.4)
-    check("triple click selects a line in the viewer", xc("primary") == b"61", xc("primary"))
+    check("triple click selects a line in the viewer", xc("primary") == str(T+1).encode(), xc("primary"))
     xdo("key", "q"); time.sleep(.6)
     drag(0,0, 3,0)                                   # a live selection, then the viewer again
     xdo("key", "ctrl+b"); time.sleep(.2); xdo("key", "Prior"); time.sleep(.8); shot("/tmp/sb_after_live.png")

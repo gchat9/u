@@ -21,7 +21,7 @@ uint8_t *xterm_bg_buffer(void);
  * of vt.h's ATTR_* bit values by design — callers translate. */
 #define XTERM_ATTR_UNDERLINE 0x01
 #define XTERM_ATTR_STRIKE    0x02
-/* Emoji occupy two adjacent cells (see emoji.bfnt / emoji_charset.h).
+/* Emoji occupy two adjacent cells (see emoji<k>.bfnt / emoji_charset.h).
  * For a cell flagged EMOJI_L or EMOJI_R, the byte in xterm_framebuffer()
  * is the emoji's *index* (not a glyph slot), and the cell draws the left
  * or right half of that emoji's colour bitmap; transparent pixels show
@@ -96,6 +96,12 @@ void xterm_selection_set(const char *text, size_t len);
  * should paste, with xterm_paste_request, as for any other paste gesture. */
 int xterm_paste_key(void);
 void xterm_paste_request(void (*cb)(const uint8_t *data, size_t n, void *ctx), void *ctx);
+
+/* Ctrl+= and Ctrl+- (and the keypad's Ctrl+KP_Add and Ctrl+KP_Subtract) change
+ * the font size instead of being typed to the program (XTERM_FONT_KEYS, in
+ * xterm_conf.h).  The grid follows the size, so the program sees the same resize
+ * it sees for any other change of the window's size.  A size that would need a
+ * grid larger than the buffer is refused, and the key does nothing. */
 
 /* Nonzero once the connection to the server has been lost (see xterm.c);
  * the window is gone and every further call is a harmless no-op. */

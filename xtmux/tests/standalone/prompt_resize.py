@@ -15,7 +15,7 @@ CW, CH = 13, 26
 PROMPT = "QZ-prompt-with-a-rather-long-path-/home/claude/u/xtmux/tests$ "
 def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
 subprocess.run("pkill -x xtmux; pkill Xvfb", shell=True); time.sleep(0.5)
-subprocess.Popen("Xvfb :2 -screen 0 800x600x24 -nolisten tcp", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.Popen("Xvfb :2 -screen 0 1000x780x24 -nolisten tcp", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1); os.environ["DISPLAY"] = ":2"
 subprocess.Popen("sleep 300 | %s 2>/tmp/prompt_resize.err" % XT, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1.5)

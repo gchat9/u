@@ -36,6 +36,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) logf = fopen(argv[++i], "w");
     }
     if (xtty_open("xtty demo")) { fputs("xtty_demo: cannot open the window\n", stderr); return 1; }
+    if (logf) {                                 /* the start size, as the resizes are logged */
+        int r, c; xtty_size(&r, &c);
+        fprintf(logf, "size %dx%d\n", r, c); fflush(logf);
+    }
     xtty_write("\033[?2004h", 8);                       /* bracketed paste */
     if (mouse) xtty_write("\033[?1000h\033[?1006h", 16);
     draw();

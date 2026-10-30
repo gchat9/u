@@ -73,6 +73,9 @@ static inline long openat(int dirfd, const char *pathname, int flags, int mode)
 static inline long close(int fd)
     { _syscall1(57, fd); }
 
+static inline long lseek(int fd, long offset, int whence)
+    { _syscall3(62, fd, offset, whence); }
+
 static inline long read(int fd, void *buf, size_t count)
     { _syscall3(63, fd, buf, count); }
 
@@ -163,9 +166,24 @@ static inline void *mmap(void *addr, size_t length, int prot, int flags,
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(278, buf, buflen, flags); }
 
+/* memset: the compiler calls it for large zero-initialisations, and on riscv64 that
+ * call is left external. The one definition is in the program's main TU (EXPORT__START
+ * below), so it is linked once; mem.h does not give memset a static definition here. */
+#define MEMSET_EXTERN 1
+void *memset(void *ptr, int c, size_t n);
+
 ////////////// main
 
 #ifdef EXPORT__START
+
+/* A byte loop, which gcc would turn back into a call to memset: hence the attribute. */
+__attribute__((optimize("no-tree-loop-distribute-patterns"), used))
+void *memset(void *ptr, int c, size_t n)
+{
+    unsigned char *p = (unsigned char *)ptr;
+    while (n--) *p++ = (unsigned char)c;
+    return ptr;
+}
 /*
  * At process entry on Linux/RISC-V:
  *
