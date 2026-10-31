@@ -51,7 +51,7 @@
  * the screen (by the screen's pixel height).  Which size that is depends on the
  * screen, as the sizes are fixed steps, so the line count is only close. */
 #ifndef XTERM_START_LINES
-#define XTERM_START_LINES 30
+#define XTERM_START_LINES 25
 #endif
 
 /* ================================================================== */
@@ -74,4 +74,27 @@
  */
 #ifndef SCROLLBACK_BYTES
 #define SCROLLBACK_BYTES    32768
+#endif
+
+/* ================================================================== */
+/* Keyboard (xterm.c)                                                   */
+/* ================================================================== */
+
+/* CapsLock shifts letters, as on a real keyboard (and as xterm and st do).  Off
+ * by default: the lock state is then ignored and none of the code for it is
+ * compiled in, so the default build is no bigger for it.  -DXTERM_CAPSLOCK=1
+ * turns it on (about 90 bytes). */
+#ifndef XTERM_CAPSLOCK
+#define XTERM_CAPSLOCK 0
+#endif
+
+/* NumLock and the keypad, as xterm has them: with NumLock on and no Shift, the
+ * keypad types its digits, operators and Return; otherwise it is the editing
+ * key of its base column (KP_7 is Home with NumLock off), and Shift makes the
+ * editing key with a modifier (Shift+KP_1 is ESC [ 1 ; 2 F).  Off by default: a
+ * keypad key then always types what it types with NumLock on and no modifier
+ * (KP_1 is "1", KP_Home is "7"), and no NumLock or keypad-editing code is compiled
+ * in.  -DXTERM_NUMLOCK=1 turns the full behaviour on (about 300 bytes). */
+#ifndef XTERM_NUMLOCK
+#define XTERM_NUMLOCK 0
 #endif

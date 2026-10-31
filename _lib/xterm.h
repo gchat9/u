@@ -119,6 +119,12 @@ void xterm_disconnect(void);
  * written (0 if none pending). */
 int xterm_read_key(uint8_t *buf, int cap);
 
+/* Application cursor keys (DECCKM): the program's mode, from its screen.  While
+ * it is set, the unmodified arrows, Home and End send ESC O x, not ESC [ x, as
+ * xterm does; the caller sets it before the keys are read (xterm_wait() is
+ * where they are translated).  Off by default, the normal mode. */
+void xterm_app_cursor(int on);
+
 /* Cursor: full-block fg/bg inversion at (row,col) on the next
  * xterm_render(). No blinking. Pass row<0 to hide it. */
 void xterm_set_cursor(int row, int col);

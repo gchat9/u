@@ -11,6 +11,8 @@ int  x11_backend_columns(void);
 int  x11_backend_wait(int timeout_ms);
 int  x11_backend_fd(void);
 int  x11_backend_read_input(uint8_t *buf, int cap);
+/* DECCKM of the displayed program: the keys are translated by xterm.c, see xterm_app_cursor(). */
+void x11_backend_app_cursor(int on);
 /* Nonzero once the window manager has asked us to close (WM_DELETE_WINDOW),
  * e.g. the user clicked the window's close button. Sticky. */
 int  x11_backend_close_requested(void);

@@ -48,6 +48,7 @@ void xtty_poll(int timeout_ms, xtty_input_fn input, void *ctx)
 {
     const Screen *s = &vt.scr;
     xtty_flush();
+    xterm_app_cursor(s->app_cursor);          /* keys are translated in xterm_wait */
     if (xterm_wait(timeout_ms)) {            /* exposed or resized */
         if (xterm_rows() != s->rows || xterm_columns() != s->cols) {
             vt_resize(&vt, xterm_rows(), xterm_columns());

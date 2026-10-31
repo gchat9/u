@@ -260,6 +260,48 @@ static uint32_t keysym_for(uint8_t keycode, int level)
     return keysym_table[keycode - min_keycode][level];
 }
 
+/* The keypad keysyms: X's range 0xFF80-0xFFBD. */
+static int is_keypad(uint32_t ks) { return ks >= 0xFF80 && ks <= 0xFFBD; }
+
+#if XTERM_CAPSLOCK
+/* A letter that CapsLock changes the case of: ASCII, and the Latin-1 letters
+ * (0xE0-0xFE, without the division sign). */
+static int is_letter(uint32_t ks)
+{
+    return (ks >= 'a' && ks <= 'z') || (ks >= 0xE0 && ks <= 0xFE && ks != 0xF7);
+}
+#endif
+
+/* The keysym a key gives at the level its Shift and AltGr select.  A level the
+ * keymap leaves empty (NoSymbol) takes the level below it, as Xlib does: the
+ * arrows, Return and Escape have nothing in their shifted column, so Shift+Left
+ * is still Left and Shift+Return still Return.  A keypad key types its digit,
+ * point or operator only with NumLock on and Shift off, as xterm does; otherwise
+ * it is the editing key of its base column (KP_7 is Home), and any Shift goes on
+ * as a modifier of that key (see handle_keypress): Shift+KP_1 is ESC [ 1 ; 2 F.
+ * With XTERM_CAPSLOCK, CapsLock reverses Shift for a letter.  0 if the key gives
+ * no symbol. */
+static uint32_t keysym_of(uint8_t keycode, int shift, int altgr, int numlock, int capslock)
+{
+    uint32_t base = keysym_for(keycode, 0);
+    int lvl = (altgr ? 2 : 0) + (shift ? 1 : 0);
+#if XTERM_NUMLOCK
+    if (is_keypad(base)) lvl = (altgr ? 2 : 0) + (numlock && !shift ? 1 : 0);
+#else
+    (void)numlock;
+    if (is_keypad(base)) lvl = 1;   /* as NumLock on, no modifier: see xterm_conf.h */
+#endif
+#if XTERM_CAPSLOCK
+    if (capslock && is_letter(base)) lvl ^= 1;
+#else
+    (void)capslock;
+#endif
+    uint32_t ks = keysym_for(keycode, lvl);
+    if (!ks && (lvl & 1)) ks = keysym_for(keycode, lvl & ~1);   /* shift level empty */
+    if (!ks && (lvl & 2)) ks = keysym_for(keycode, 0);          /* AltGr level empty */
+    return ks;
+}
+
 #define KEY_QUEUE_CAP 256
 static uint8_t key_queue[KEY_QUEUE_CAP];
 static int key_head, key_tail;
@@ -272,17 +314,174 @@ static void key_push(uint8_t b)
     key_tail = next;
 }
 
-static void push_str(const char *s) { while (*s) key_push((uint8_t)*s++); }
+/* xterm's modifier parameter for a key: 1, plus 1 for Shift, 2 for Alt and 4
+ * for Control.  Alt is passed with the Alt meta bit already resolved. */
+static int mod_param(int shift, int alt, int ctrl)
+{
+    return 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
+}
 
-/* Translate one KeyPress event (32 bytes) into 0+ output bytes. Covers
- * printable Latin-1 (ASCII pushed as-is, 0xA0-0xFF UTF-8-encoded since
- * that's what everything downstream expects on the wire), Ctrl-letter
- * control codes, an Alt meta-prefix, and the common control keys/
- * arrows as ANSI/VT sequences. Anything else is silently ignored.
+/* Application cursor keys (DECCKM), as the program sets them: see
+ * xterm_app_cursor() in xterm.h. */
+static uint8_t app_cursor;
+void xterm_app_cursor(int on) { app_cursor = on != 0; }
+
+/* The cursor, editing and function keys, by the code of the sequence each
+ * sends: a letter (the final byte of ESC [ x; F1-F4 end in P-S, and E is
+ * KP_Begin's), or 1000 plus the number of ESC [ n ~ (Insert, Delete, PgUp,
+ * PgDn, F5-F12).  0 for any other keysym. */
+static int nav_code(uint32_t ks)
+{
+    switch (ks) {
+    case 0xFF51: return 'D';            /* Left  */
+    case 0xFF52: return 'A';            /* Up    */
+    case 0xFF53: return 'C';            /* Right */
+    case 0xFF54: return 'B';            /* Down  */
+    case 0xFF50: return 'H';            /* Home  */
+    case 0xFF57: return 'F';            /* End   */
+    case 0xFF9D: return 'E';            /* KP_Begin: the 5 with NumLock off */
+    case 0xFFBE: return 'P';            /* F1  */
+    case 0xFFBF: return 'Q';            /* F2  */
+    case 0xFFC0: return 'R';            /* F3  */
+    case 0xFFC1: return 'S';            /* F4  */
+    case 0xFF63: return 1000 + 2;       /* Insert  */
+    case 0xFFFF: return 1000 + 3;       /* Delete  */
+    case 0xFF55: return 1000 + 5;       /* Page_Up   */
+    case 0xFF56: return 1000 + 6;       /* Page_Down */
+    case 0xFFC2: return 1000 + 15;      /* F5  */
+    case 0xFFC3: return 1000 + 17;      /* F6  */
+    case 0xFFC4: return 1000 + 18;      /* F7  */
+    case 0xFFC5: return 1000 + 19;      /* F8  */
+    case 0xFFC6: return 1000 + 20;      /* F9  */
+    case 0xFFC7: return 1000 + 21;      /* F10 */
+    case 0xFFC8: return 1000 + 23;      /* F11 */
+    case 0xFFC9: return 1000 + 24;      /* F12 */
+    default: return 0;
+    }
+}
+
+#if XTERM_NUMLOCK
+/* The keypad's editing and function keys, as the keys they stand for: KP_Home
+ * is Home, KP_F1 is F1.  (The keypad keysyms are in the order of the keys they
+ * stand for, so this is arithmetic.)  Any other keysym is returned as it is. */
+static uint32_t kp_nav(uint32_t ks)
+{
+    if (ks >= 0xFF95 && ks <= 0xFF9C) return 0xFF50 + (ks - 0xFF95);  /* KP_Home .. KP_End */
+    if (ks >= 0xFF91 && ks <= 0xFF94) return 0xFFBE + (ks - 0xFF91);  /* KP_F1 .. KP_F4    */
+    if (ks == 0xFF9E) return 0xFF63;                                  /* KP_Insert */
+    if (ks == 0xFF9F) return 0xFFFF;                                  /* KP_Delete */
+    return ks;
+}
+#define NAV_KEYSYM(ks) kp_nav(ks)
+#else
+#define NAV_KEYSYM(ks) (ks)
+#endif
+
+/* A cursor, editing or function key, sent as xterm does (code from nav_code).
+ * Unmodified: the letter keys send ESC [ x, or ESC O x for F1-F4 and, with
+ * DECCKM set, for the arrows, Home, End and KP_Begin; the others ESC [ n ~.  Modified:
+ * ESC [ 1 ; m x or ESC [ n ; m ~, with m from mod_param (Shift+Up is
+ * ESC [ 1 ; 2 A, Ctrl+F5 is ESC [ 15 ; 5 ~). */
+static void push_nav(int code, int mod)
+{
+    if (code >= 1000) {
+        int n = code - 1000;
+        key_push(0x1B); key_push('[');
+        if (n >= 10) key_push((uint8_t)('0' + n / 10));
+        key_push((uint8_t)('0' + n % 10));
+        if (mod != 1) { key_push(';'); key_push((uint8_t)('0' + mod)); }
+        key_push('~');
+        return;
+    }
+    int ss3 = (code >= 'P' && code <= 'S') ||
+              (app_cursor && (code == 'A' || code == 'B' || code == 'C' ||
+                              code == 'D' || code == 'E' || code == 'F' || code == 'H'));
+    key_push(0x1B);
+    if (mod == 1) {
+        key_push(ss3 ? 'O' : '[');
+    } else {
+        key_push('['); key_push('1'); key_push(';'); key_push((uint8_t)('0' + mod));
+    }
+    key_push((uint8_t)code);
+}
+
+/* The keypad keys that type something, as the ordinary key they stand for.
+ * (KP_0 .. KP_9 are the digits, which NumLock selects: see keysym_of.) */
+static uint32_t keypad_char(uint32_t ks)
+{
+    if (ks >= 0xFFB0 && ks <= 0xFFB9) return '0' + (ks - 0xFFB0);
+    if (ks >= 0xFFAA && ks <= 0xFFAF) return "*+,-./"[ks - 0xFFAA];
+    switch (ks) {
+    case 0xFF80: return ' ';      /* KP_Space */
+    case 0xFF89: return 0xFF09;   /* KP_Tab: Tab */
+    case 0xFF8D: return 0xFF0D;   /* KP_Enter: Return */
+    case 0xFFBD: return '=';      /* KP_Equal */
+    default: return ks;
+    }
+}
+
+/* The bytes a typed key sends: printable Latin-1 (ASCII as-is, 0xA0-0xFF
+ * UTF-8-encoded), Ctrl-letter control codes and the few control keys.  Built
+ * in a buffer, so that handle_keypress() can decide about an Alt ESC prefix
+ * knowing whether the key sends anything at all (a bare modifier does not). */
+typedef struct { uint8_t b[8]; int n; } KeyOut;
+
+static void key_bytes(KeyOut *o, uint32_t ks, int ctrl)
+{
+    if (ctrl) {
+        /* xterm's control codes: a letter, or one of @ [ \ ] ^ _ ` { | } ~,
+         * is its value & 0x1f; the digits 2 to 8 and ? and / have codes of
+         * their own, and Ctrl+Space is NUL.  Other keys send their character. */
+        uint32_t up = ks;
+        if (up >= 'a' && up <= 'z') up -= 'a' - 'A';
+        if (up >= '@' && up <= '~') { o->b[o->n++] = (uint8_t)(up & 0x1f); return; }
+        if (up >= '2' && up <= '8') {
+            static const char digit_ctrl[] = "\0\x1b\x1c\x1d\x1e\x1f\x7f";
+            o->b[o->n++] = (uint8_t)digit_ctrl[up - '2']; return;
+        }
+        if (up == '/') { o->b[o->n++] = 0x1f; return; }
+        if (up == '?') { o->b[o->n++] = 0x7f; return; }
+        if (up == ' ') { o->b[o->n++] = 0; return; }
+    }
+
+    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) {
+        if (ks <= 0x7F) {
+            o->b[o->n++] = (uint8_t)ks;
+        } else {
+            o->b[o->n++] = (uint8_t)(0xC0 | (ks >> 6));
+            o->b[o->n++] = (uint8_t)(0x80 | (ks & 0x3F));
+        }
+        return;
+    }
+
+    switch (ks) {
+    case 0xFF08: o->b[o->n++] = ctrl ? 0x08 : 0x7f; return;   /* BackSpace; ^H with Ctrl, as xterm */
+    case 0xFF09: o->b[o->n++] = '\t'; return;   /* Tab */
+    case 0xFE20:                                /* Shift+Tab: back-tab, ESC [ Z */
+        o->b[o->n++] = 0x1b; o->b[o->n++] = '['; o->b[o->n++] = 'Z'; return;
+    case 0xFF0D: o->b[o->n++] = '\r'; return;   /* Return */
+    case 0xFF1B: o->b[o->n++] = 0x1b; return;   /* Escape */
+    default: return;
+    }
+}
+
+/* Translate one KeyPress event (32 bytes) into 0+ output bytes.
  *
- * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to
- * their Unicode code points, so ks doubles as the code point here with
- * no translation table needed. */
+ * The keysym comes from keysym_of(), which picks the level the modifiers
+ * select.  Then, in order:
+ *   - the paste keys, which are not typed to the program at all;
+ *   - the Ctrl+font-size keys, which are the multiplexer's own;
+ *   - cursor, editing and function keys (nav_code, kp_nav): their sequences,
+ *     with xterm's modifier parameter when any modifier is held (push_nav);
+ *   - typed keys (key_bytes): printable Latin-1 (ASCII as-is, 0xA0-0xFF
+ *     UTF-8-encoded, as everything downstream expects on the wire), Ctrl-
+ *     letter control codes, and the few control keys.  An Alt ESC prefix
+ *     goes only before a key that sends something.
+ * Anything else is silently ignored.
+ *
+ * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to their
+ * Unicode code points, so ks doubles as the code point with no translation
+ * table needed. */
 /* Paste shortcuts: Shift+Insert, and Ctrl+V with no other modifier (not
  * Shift, Alt, Super...: those reach the program, as plain Ctrl+V if
  * nothing else is bound to them).  They are not typed to the program; the
@@ -311,12 +510,14 @@ static void handle_keypress(const uint8_t *ev)
     int shift = (state & 0x0001) != 0;
     int ctrl  = (state & 0x0004) != 0;
     int alt   = (state & 0x0008) != 0;  /* Mod1: conventional "Alt" binding */
+    int capslock = XTERM_CAPSLOCK && (state & 0x0002) != 0;  /* Lock: see keysym_of */
+    int numlock = (state & 0x0010) != 0;  /* Mod2: NumLock, see keysym_of */
     int altgr = (state & 0x0080) != 0;  /* Mod5: conventional AltGr /
                                           * ISO_Level3_Shift binding, as
                                           * produced by e.g. xkb option
                                           * "lv3:ralt_switch" */
 
-    uint32_t ks = keysym_for(keycode, (altgr ? 2 : 0) + (shift ? 1 : 0));
+    uint32_t ks = keysym_of(keycode, shift, altgr, numlock, capslock);
     /* Insert usually has nothing in its shifted column, so Shift+Insert has
      * to be recognized by the unshifted one. */
     int insert = ks == 0xFF63 ||
@@ -342,6 +543,18 @@ static void handle_keypress(const uint8_t *ev)
 
     if (!ks) return;
 
+    /* The cursor, editing and function keys carry their modifiers in the
+     * sequence, Alt included: ESC is not prefixed to them. */
+    int nav = nav_code(NAV_KEYSYM(ks));
+    if (nav) {
+        push_nav(nav, mod_param(shift, alt && !altgr, ctrl));
+        return;
+    }
+
+    /* A keypad key that types something sends just its character, whatever
+     * the modifiers (xterm: Ctrl+KP_Divide is "/", not ^_). */
+    if (is_keypad(keysym_for(keycode, 0))) { ctrl = 0; alt = 0; }
+
     /* Meta-prefix: makes Alt+key reach the multiplexer's own shortcuts
      * (e.g. Alt+2 -> ESC '2' -> input.c's FSM_ESC -> CMD_SELECT_WINDOW)
      * exactly like a real terminal's metaSendsEscape.
@@ -355,60 +568,10 @@ static void handle_keypress(const uint8_t *ev)
      * silently eat the accented character (see input.c's FSM_ESC,
      * which forwards ESC+one-byte as a pair -- orphaning the second
      * half of what should be a 2-byte UTF-8 sequence). */
-    if (alt && !altgr) key_push(0x1B);
-
-    if (ctrl) {
-        uint32_t up = ks;
-        if (up >= 'a' && up <= 'z') up -= 'a' - 'A';
-        if (up >= '@' && up <= '_') { key_push((uint8_t)(up & 0x1f)); return; }
-        /* Ctrl+Space is NUL, as in xterm.  (Ctrl+@ is the same byte and is
-         * caught above; space is outside that range, so it needs its own.) */
-        if (up == ' ') { key_push(0); return; }
-    }
-
-    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) {
-        if (ks <= 0x7F) {
-            key_push((uint8_t)ks);
-        } else {
-            key_push((uint8_t)(0xC0 | (ks >> 6)));
-            key_push((uint8_t)(0x80 | (ks & 0x3F)));
-        }
-        return;
-    }
-
-    switch (ks) {
-    case 0xFF08: key_push(0x7f); return;   /* BackSpace */
-    case 0xFF09: key_push('\t');  return;   /* Tab */
-    case 0xFF0D: key_push('\r');  return;   /* Return */
-    case 0xFF1B: key_push(0x1b); return;   /* Escape */
-    /* The rest are all ANSI/VT escape sequences -- exactly what the
-     * child's TERM=xterm-256color terminfo (see pty.c) expects, so
-     * readline/ncurses there recognize them the same way a real xterm's
-     * keys would be recognized. */
-    case 0xFF51: push_str("\x1b[D");   return;  /* Left */
-    case 0xFF52: push_str("\x1b[A");   return;  /* Up */
-    case 0xFF53: push_str("\x1b[C");   return;  /* Right */
-    case 0xFF54: push_str("\x1b[B");   return;  /* Down */
-    case 0xFF50: push_str("\x1bOH");   return;  /* Home */
-    case 0xFF57: push_str("\x1bOF");   return;  /* End */
-    case 0xFF55: push_str("\x1b[5~");  return;  /* Page_Up */
-    case 0xFF56: push_str("\x1b[6~");  return;  /* Page_Down */
-    case 0xFF63: push_str("\x1b[2~");  return;  /* Insert */
-    case 0xFFFF: push_str("\x1b[3~");  return;  /* Delete */
-    case 0xFFBE: push_str("\x1bOP");   return;  /* F1  */
-    case 0xFFBF: push_str("\x1bOQ");   return;  /* F2  */
-    case 0xFFC0: push_str("\x1bOR");   return;  /* F3  */
-    case 0xFFC1: push_str("\x1bOS");   return;  /* F4  */
-    case 0xFFC2: push_str("\x1b[15~"); return;  /* F5  */
-    case 0xFFC3: push_str("\x1b[17~"); return;  /* F6  */
-    case 0xFFC4: push_str("\x1b[18~"); return;  /* F7  */
-    case 0xFFC5: push_str("\x1b[19~"); return;  /* F8  */
-    case 0xFFC6: push_str("\x1b[20~"); return;  /* F9  */
-    case 0xFFC7: push_str("\x1b[21~"); return;  /* F10 */
-    case 0xFFC8: push_str("\x1b[23~"); return;  /* F11 */
-    case 0xFFC9: push_str("\x1b[24~"); return;  /* F12 */
-    default: return;
-    }
+    KeyOut o = { {0}, 0 };
+    key_bytes(&o, keypad_char(ks), ctrl);
+    if (alt && !altgr && o.n) key_push(0x1B);   /* only a key that sends something */
+    for (int i = 0; i < o.n; i++) key_push(o.b[i]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════

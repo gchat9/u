@@ -22,6 +22,7 @@ int x11_backend_init(void)
 int x11_backend_rows(void) { return xterm_rows(); }
 int x11_backend_columns(void) { return xterm_columns(); }
 int x11_backend_wait(int timeout_ms) { return xterm_wait(timeout_ms); }
+void x11_backend_app_cursor(int on) { xterm_app_cursor(on); }
 int x11_backend_fd(void) { return xterm_fd(); }
 int x11_backend_read_input(uint8_t *buf, int cap) { return xterm_read_key(buf, cap); }
 int x11_backend_close_requested(void) { return xterm_close_requested(); }

@@ -550,17 +550,24 @@ static void render_scrollback_view(void)
 }
 
 /*
- * Handle one raw byte of stdin while in scrollback mode.
- * Returns true when scrollback mode should exit.
+ * Handle one raw byte of input while in scrollback mode.  Returns true when
+ * the mode should exit.
  *
- * Manages a tiny state machine for multi-byte escape sequences:
- *   ESC alone → exit
- *   ESC [ A   → up 1
- *   ESC [ B   → down 1
- *   ESC [ 5 ~ → PgUp
- *   ESC [ 6 ~ → PgDn
+ * The viewer's keys are cursor movement and paging, read as CSI sequences:
+ * ESC [ <parameters> <final>.  The first parameter and the final byte decide
+ * the action.  Modifiers after a ';' are ignored, so a modified key moves the
+ * view as its plain form does (Shift+PgUp is ESC [ 5 ; 2 ~):
+ *   ESC [ A  or  ESC [ 1 ; m A   → up 1
+ *   ESC [ B  or  ESC [ 1 ; m B   → down 1
+ *   ESC [ 5 ~  or  ESC [ 5 ; m ~  → PgUp
+ *   ESC [ 6 ~  or  ESC [ 6 ; m ~  → PgDn
+ * Any other CSI is read to its final byte and ignored, and a bare ESC closes
+ * the viewer.
  */
-static int  _sb_esc  = 0;   /* 0=ground 1=saw ESC 2=saw ESC[ 3=saw ESC[5 4=saw ESC[6 */
+static int  _sb_esc  = 0;       /* 0=ground 1=saw ESC 2=in a CSI */
+static int  _sb_num  = 0;       /* the CSI's first parameter */
+static bool _sb_semi = false;   /* a ';' has been read: the rest is modifiers */
+
 static bool scrollback_input_byte(uint8_t b)
 {
     int view_rows = child_rows();
@@ -571,23 +578,22 @@ static bool scrollback_input_byte(uint8_t b)
         if (b == '\003' || b == 'q') { _sb_esc = 0; return true; }  /* Ctrl-C, q */
         return false;
     case 1:
-        if (b == '[') { _sb_esc = 2; return false; }
+        if (b == '[') { _sb_esc = 2; _sb_num = 0; _sb_semi = false; return false; }
         _sb_esc = 0;
         return true;   /* bare ESC or unknown → exit */
     case 2:
+        if (b >= '0' && b <= '9') {
+            if (!_sb_semi && _sb_num < 1000) _sb_num = _sb_num * 10 + (b - '0');
+            return false;
+        }
+        if (b == ';') { _sb_semi = true; return false; }
+        if (b == '\033') { _sb_esc = 1; return false; }   /* a new sequence */
         _sb_esc = 0;
-        if (b == 'A') { g_scrollback_offset++;          render_scrollback_view(); }
-        else if (b == 'B') { g_scrollback_offset--;     render_scrollback_view(); }
-        else if (b == '5') { _sb_esc = 3; return false; }
-        else if (b == '6') { _sb_esc = 4; return false; }
-        return false;
-    case 3:  /* ESC[5 → wait for ~ */
-        _sb_esc = 0;
-        if (b == '~') { g_scrollback_offset += view_rows - 1; render_scrollback_view(); }
-        return false;
-    case 4:  /* ESC[6 → wait for ~ */
-        _sb_esc = 0;
-        if (b == '~') { g_scrollback_offset -= view_rows - 1; render_scrollback_view(); }
+        if (b < 0x40 || b > 0x7e) return false;           /* not a final byte: drop */
+        if (b == 'A')                    { g_scrollback_offset++;                     render_scrollback_view(); }
+        else if (b == 'B')               { g_scrollback_offset--;                     render_scrollback_view(); }
+        else if (b == '~' && _sb_num == 5) { g_scrollback_offset += view_rows - 1;    render_scrollback_view(); }
+        else if (b == '~' && _sb_num == 6) { g_scrollback_offset -= view_rows - 1;    render_scrollback_view(); }
         return false;
     }
     return false;
@@ -801,6 +807,63 @@ static void pty_write_all(Window *w, const uint8_t *b, size_t n)
     }
 }
 
+#ifndef X11_BACKEND
+/* DECCKM for the keys of the real terminal: while the program asks for
+ * application cursor keys, its ESC [ A-D becomes ESC O A-D.  (The X keyboard
+ * sends the right form itself: see xterm_app_cursor().)  The input FSM passes
+ * "ESC [" and the byte after it separately, so "ESC [" at the end of a batch
+ * is held for the byte after it, for the ESC timeout (keys_flush).  A lone
+ * ESC is never held: a bare Escape goes at once. */
+static Window *held_w;
+static uint8_t held[2];
+static int     nheld;
+
+static void write_stdin_keys(Window *w, const uint8_t *b, size_t n)
+{
+    int app = w->vt.scr.app_cursor;
+    if (!app && !nheld) { pty_write_all(w, b, n); return; }
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = b[i];
+        if (nheld) {
+            nheld = 0;
+            if (app && c >= 'A' && c <= 'D') {
+                uint8_t out[3] = { 0x1B, 'O', c };
+                pty_write_all(w, out, 3);
+                continue;
+            }
+            pty_write_all(held_w, held, 2);      /* not an arrow: as it was */
+        }
+        if (app && c == 0x1B && i + 1 < n && b[i + 1] == '[') {
+            if (i + 2 == n) {                     /* end of batch: hold it */
+                held_w = w; held[0] = 0x1B; held[1] = '['; nheld = 1; i++;
+                continue;
+            }
+            if (b[i + 2] >= 'A' && b[i + 2] <= 'D') {
+                uint8_t out[3] = { 0x1B, 'O', b[i + 2] };
+                pty_write_all(w, out, 3);
+                i += 2;
+                continue;
+            }
+        }
+        pty_write_all(w, &c, 1);
+    }
+}
+
+/* An "ESC [" held for the byte after it.  It is released by that byte, or
+ * after ESC_TIMEOUT_MS like a lone ESC (keys_flush, from the main loop). */
+static bool keys_held(void) { return nheld != 0; }
+static void keys_flush(void)
+{
+    if (nheld) {
+        nheld = 0;
+        if (held_w->alive && held_w->pty.master >= 0) pty_write_all(held_w, held, 2);
+    }
+}
+#else
+static bool keys_held(void) { return false; }
+#define keys_flush() ((void)0)
+#endif
+
 static void write_to_active(const uint8_t *buf, size_t n)
 {
     Window *w = g_wins[g_cur];
@@ -819,41 +882,11 @@ static void write_to_active(const uint8_t *buf, size_t n)
 
     w->pristine = false;   /* user has typed something */
 
-    /* DECCKM: translate ESC [ A/B/C/D → ESC O A/B/C/D */
-    static uint8_t seq[3];
-    static int     seq_len;
-
-    /* Nothing to translate: all at once (a paste can be long). */
-    if (!w->vt.scr.app_cursor && seq_len == 0) {
-        pty_write_all(w, buf, n);
-        return;
-    }
-
-    for (size_t i = 0; i < n; i++) {
-        uint8_t b = buf[i];
-        if (!w->vt.scr.app_cursor) {
-            pty_write_all(w, &b, 1);
-            seq_len = 0;
-            continue;
-        }
-        seq[seq_len++] = b;
-        if (seq_len == 1 && seq[0] != 0x1B) {
-            pty_write_all(w, seq, 1); seq_len = 0;
-        } else if (seq_len == 2) {
-            if (seq[1] != '[' && seq[1] != 'O') {
-                pty_write_all(w, seq, 2); seq_len = 0;
-            }
-        } else if (seq_len == 3) {
-            if (seq[1]=='[' && (seq[2]=='A'||seq[2]=='B'||
-                                 seq[2]=='C'||seq[2]=='D')) {
-                uint8_t out[3] = { 0x1B, 'O', seq[2] };
-                pty_write_all(w, out, 3);
-            } else {
-                pty_write_all(w, seq, 3);
-            }
-            seq_len = 0;
-        }
-    }
+#ifdef X11_BACKEND
+    pty_write_all(w, buf, n);       /* translated already, by xterm.c */
+#else
+    write_stdin_keys(w, buf, n);
+#endif
 }
 
 #ifdef X11_BACKEND
@@ -863,6 +896,13 @@ static int shown_mouse_mode(void)
 {
     Window *w = g_wins[g_cur];
     return w && w->alive ? w->vt.scr.mouse_mode : 0;
+}
+
+/* DECCKM of the displayed program, for the X keyboard (see xterm_app_cursor). */
+static int shown_app_cursor(void)
+{
+    Window *w = g_wins[g_cur];
+    return w && w->alive && w->vt.scr.app_cursor;
 }
 
 /* How much pointer traffic to ask the X server for: what that program
@@ -1366,13 +1406,14 @@ int main(int argc, char *argv[])
          * as the timeout instead of ESC_TIMEOUT_MS, so bare ESC was delayed
          * by up to a full minute rather than 20ms.
          */
-        if (input_esc_pending() && esc_remaining_ms < 0)
+        if ((input_esc_pending() || keys_held()) && esc_remaining_ms < 0)
             esc_remaining_ms = ESC_TIMEOUT_MS;
 
         /* Flush ESC immediately if already expired (e.g. set to 0 above
          * because ESC_TIMEOUT_MS == 0, or carried over from last iter) */
         if (esc_remaining_ms == 0) {
-            handle_event(input_flush_esc());
+            if (input_esc_pending()) handle_event(input_flush_esc());
+            keys_flush();
             esc_remaining_ms = -1;
             continue;
         }
@@ -1415,8 +1456,9 @@ int main(int argc, char *argv[])
         if (esc_remaining_ms > 0) esc_remaining_ms -= elapsed_ms;
 
         /* Flush ESC if its timer just expired */
-        if (input_esc_pending() && esc_remaining_ms <= 0) {
-            handle_event(input_flush_esc());
+        if ((input_esc_pending() || keys_held()) && esc_remaining_ms <= 0) {
+            if (input_esc_pending()) handle_event(input_flush_esc());
+            keys_flush();
             esc_remaining_ms = -1;
         }
 
@@ -1426,6 +1468,7 @@ int main(int argc, char *argv[])
          * it), a resize (new grid size: tell every window and pty) and/or KeyPress (queued as translated bytes by xterm_wait,
          * fed through the same FSM as real-stdin bytes below). */
         if (x11fd >= 0 && FD_ISSET(x11fd, &rfds)) {
+            x11_backend_app_cursor(shown_app_cursor());
             if (x11_backend_wait(0)) {
                 if (x11_backend_rows() != g_rows ||
                     x11_backend_columns() != g_cols)
@@ -1451,6 +1494,14 @@ int main(int argc, char *argv[])
                 InputEvent ev = input_feed(kbuf[i]);
                 if (!input_esc_pending()) esc_remaining_ms = -1;
                 handle_event(ev);
+            }
+            /* The X keyboard sends each key whole (Alt+x is ESC x in one batch),
+             * so an ESC still pending at the end of the batch is the Escape key
+             * itself: it goes now, not when the next key arrives within the
+             * ESC timeout.  (The timeout is for the real terminal's bytes only.) */
+            if (input_esc_pending()) {
+                handle_event(input_flush_esc());
+                esc_remaining_ms = -1;
             }
 
             /* Pointer events: for the displayed program, as the report it
@@ -1614,7 +1665,7 @@ int main(int argc, char *argv[])
 #endif
                 InputEvent ev = input_feed(buf[i]);
                 /* If ESC resolved (next byte consumed it), cancel the timer */
-                if (!input_esc_pending()) esc_remaining_ms = -1;
+                if (!input_esc_pending() && !keys_held()) esc_remaining_ms = -1;
                 handle_event(ev);
             }
         }
