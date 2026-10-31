@@ -2,8 +2,7 @@
 #include "../tmux/status.h"
 
 #include "../_lib/xterm.h"
-#include "../_font/charset.h"
-#include "../_font/emoji_charset.h"
+#include "../_lib/width.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -157,7 +156,7 @@ static uint32_t next_char(const char **p, const char *end, int *width)
     if (len > end - *p) len = 1, cp = u[0];
     for (int k = 1; k < len; k++) cp = cp << 6 | (u[k] & 0x3F);
     *p += len;
-    *width = (cp >= 0x1100 && (emoji_wide(cp) || charset_wide(cp))) ? 2 : 1;
+    *width = (cp >= 0x1100 && (emoji_wide(cp) || cjk_wide(cp))) ? 2 : 1;
     if (cp == 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F) ||
         (cp >= 0x200B && cp <= 0x200F)) return 0;
     return cp;

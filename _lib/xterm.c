@@ -3,11 +3,12 @@
  *
  *   - Pure libc, zero X11 libraries
  *   - Raw X11 wire protocol over Unix socket
- *   - BFNT bitmap font (produced by _font/mkfont.c)
- *   - File-backed BFNT font mapping; protocol buffers supplied by main's stack frame
+ *   - BFN3 bitmap font (produced by _font/mkfont.c), with the codepoint of
+ *     each glyph in the file: the program needs no table of its own
+ *   - File-backed font mapping; protocol buffers supplied by main's stack frame
  *   - One PutImage per tile of cells (no full-screen framebuffer)
  *
- * The font is loaded from /etc/bfnt/font2 (see BFNT font).  xterm_init() creates the
+ * The font is loaded from /etc/bfnt/font2 (see BFN3 font).  xterm_init() creates the
  * surface; callers update xterm_framebuffer() and call xterm_render().
  *
  * Assumes: little-endian host; supports 16-bit RGB565 and 32-bpp TrueColor.
@@ -575,7 +576,7 @@ static void handle_keypress(const uint8_t *ev)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * BFNT font
+ * BFN3 font
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define GRID_MAX_CELLS (32 * 1024)
@@ -584,19 +585,25 @@ static void handle_keypress(const uint8_t *ev)
 #define TILE_BYTES     (PUT_HDR + 64*64*4)
 
 /* The font comes in FONT_SIZES sizes (see _font/mkfont.c), each in files of
- * its own: /etc/bfnt/font<k> and /etc/bfnt/emoji<k> for size k.  Size k's
- * cell is 2^((k - BASE_SIZE)/4) times the base size's in both directions.
- * The font starts at BASE_SIZE.  The cell size is in the file's header, so
- * the name only says which size the file is. */
+ * its own: /etc/bfnt/font<k> and /etc/bfnt/emoji<k> for size k.  Size k's cell
+ * is 2^((k - BASE_SIZE)/4) times the base size's in both directions.  The font
+ * starts at BASE_SIZE.  The cell size is in the file's header, so the name only
+ * says which size the file is. */
 #define FONT_SIZES     8
 #define BASE_SIZE      2
 #define BFNT_DIR       "/etc/bfnt/"
+#define FONT_HDR       16     /* bytes before the tables: magic, cell, counts */
+/* Narrow glyph slots 0..ASCII_N-1 are U+0020..U+007E in every font (see
+ * _font/charset.h): a character in that range needs no table lookup. */
+#define ASCII_N        95
 
 static uint8_t  *font_data;     /* the font in use, mapped; NULL until one is loaded */
 static size_t    font_len;
-static uint16_t  cell_w, cell_h, baseline, first_cp, num_glyphs, num_wide;
-static uint8_t  *glyph_data;
-static uint8_t  *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
+static uint16_t  cell_w, cell_h, baseline, num_glyphs, num_wide;
+static const uint8_t *ncp_tab;  /* codepoints (u32) of the narrow glyphs past ASCII */
+static const uint8_t *wcp_tab;  /* codepoints (u32) of the wide glyphs */
+static const uint8_t *glyph_data;
+static const uint8_t *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
 static int       WIN_W, WIN_H, cols, rows;
 static int       cfg_w, cfg_h;  /* window size as last reported by the server */
 static int       font_size = BASE_SIZE;  /* the size in use */
@@ -609,8 +616,9 @@ static char      emoji_path[] = BFNT_DIR "emoji2";   /* see font_switch() */
 #define SEEK_END 2
 #endif
 
-/* A 16-bit little-endian field of a BFNT or EMOJ header. */
+/* A 16-bit and a 32-bit little-endian field of a BFN3 or EMO3 file. */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)rd16(p) | (uint32_t)rd16(p+2) << 16; }
 
 /* Map the whole of a file read-only.  Its length comes from lseek, so the
  * mapping is exactly the file: nothing is read past its end, which would be
@@ -627,22 +635,36 @@ static uint8_t *map_file(const char *path, size_t *len)
     return m;
 }
 
+/* Whether m, a mapping of n bytes, is a font that can be drawn: the header is
+ * right, and the glyphs and codepoint tables it counts are all in the file.
+ * A font that passes is one the renderer can use, so nothing is read past the
+ * mapping. */
+static int font_valid(const uint8_t *m, size_t n)
+{
+    if (n < FONT_HDR || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != '3')
+        return 0;
+    size_t w = rd16(m+4), h = rd16(m+6), ng = rd16(m+10), nw = rd16(m+12);
+    if (w == 0 || h == 0) return 0;
+    /* ASCII, then the table's narrow glyphs, all within the 256 slots a byte
+     * can name; the wide ones likewise */
+    if (ng < ASCII_N || ng > 256 || nw > 256) return 0;
+    /* the bitmaps: (n-FONT_HDR) / h / w is the number of cells the file has
+     * room for, with no overflow -- checked before anything multiplies */
+    if ((n - FONT_HDR) / h / w < ng + 2 * nw) return 0;
+    /* the codepoint tables, 4 bytes each, in what is left after the bitmaps */
+    if (4 * (ng - ASCII_N + nw) > n - FONT_HDR - w * h * (ng + 2 * nw)) return 0;
+    /* a cell fits a tile at the widest depth, with the tile's padding (tile_fit) */
+    return (TILE_BYTES - PUT_HDR) / h >= 3 + w * 4;
+}
+
 /* Map and check the font at path, without changing the font in use: the
- * caller commits it with font_commit(), or unmaps it.  The check covers all
- * that the renderer relies on, so a font that passes can be drawn. */
+ * caller commits it with font_commit(), or unmaps it. */
 static uint8_t *font_open(const char *path, size_t *len)
 {
     uint8_t *m = map_file(path, len);
     if (!m) return NULL;
-    size_t n = *len;
-    uint16_t w = n >= 16 ? rd16(m+4) : 0, h = n >= 16 ? rd16(m+6) : 0;
-    if (n < 16 || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != 'T' ||
-        w == 0 || h == 0 ||
-        /* the glyphs are all in the file: (n-16) / (w*h) bitmaps fit in it */
-        (n - 16) / h / w < (size_t)rd16(m+12) + 2 * (size_t)rd16(m+14) ||
-        /* a cell fits a tile at the widest depth, with the tile's padding (tile_fit) */
-        (TILE_BYTES - PUT_HDR) / h < 3 + (size_t)w * 4) {
-        munmap(m, n);
+    if (!font_valid(m, *len)) {
+        munmap(m, *len);
         return NULL;
     }
     return m;
@@ -653,10 +675,33 @@ static void font_commit(uint8_t *m, size_t len)
 {
     if (font_data) munmap(font_data, font_len);
     font_data = m; font_len = len;
-    cell_w = rd16(m+4); cell_h = rd16(m+6); baseline = rd16(m+8); first_cp = rd16(m+10);
-    num_glyphs = rd16(m+12); num_wide = rd16(m+14);     /* 0 in a file without wide glyphs */
-    glyph_data = m + 16;
+    cell_w = rd16(m+4); cell_h = rd16(m+6); baseline = rd16(m+8);
+    num_glyphs = rd16(m+10); num_wide = rd16(m+12);
+    ncp_tab    = m + FONT_HDR;
+    wcp_tab    = ncp_tab + 4 * (size_t)(num_glyphs - ASCII_N);
+    glyph_data = wcp_tab + 4 * (size_t)num_wide;
     wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
+}
+
+/* The glyph lookups.  A character is drawn with the glyph of its codepoint in
+ * the font in use, if the font has one: these say which slot that is (narrow,
+ * wide, or emoji), or -1 if there is none, when the caller draws a placeholder
+ * box instead.  Which codepoints are double-width is not the font's (width.h). */
+int xterm_glyph_slot(uint32_t cp)
+{
+    if (!font_data) return -1;
+    if (cp >= 0x20 && cp <= 0x7E) return (int)(cp - 0x20);
+    for (int i = 0; i < num_glyphs - ASCII_N; i++)
+        if (rd32(ncp_tab + 4 * (size_t)i) == cp) return ASCII_N + i;
+    return -1;
+}
+
+int xterm_wide_slot(uint32_t cp)
+{
+    if (!font_data) return -1;
+    for (int i = 0; i < num_wide; i++)
+        if (rd32(wcp_tab + 4 * (size_t)i) == cp) return i;
+    return -1;
 }
 
 /* emoji<k>.bfnt (see _font/mkemoji.c): optional.  If it is missing, or does
@@ -664,29 +709,48 @@ static void font_commit(uint8_t *m, size_t len)
  * draw_box) rather than killing the terminal.  It replaces the emoji in use
  * whatever happens, so with no good file there are no emoji at all. */
 #define EMOJI_HDR 12
-static const uint8_t *emoji_data;   /* NULL = no emoji available; the mapping's start */
+static const uint8_t *emoji_map;    /* the whole file, NULL = no emoji available */
 static size_t   emoji_len;
 static uint16_t emoji_count;
+static const uint8_t *emoji_cps;    /* the codepoints (u32) of the emoji */
+static const uint8_t *emoji_data;   /* their records, after the codepoints */
 static size_t   emoji_rec;          /* bytes per record: 45 palette + packed 4bpp pixels */
 
 static void emoji_load(const char *path)
 {
-    if (emoji_data) { munmap((void *)emoji_data, emoji_len); emoji_data = NULL; }
+    /* the emoji in use go whatever happens: a file that does not load leaves none,
+     * and nothing may still point into the mapping that is released here */
+    if (emoji_map) munmap((void *)emoji_map, emoji_len);
+    emoji_map = NULL; emoji_count = 0; emoji_cps = NULL; emoji_data = NULL;
     size_t len;
     uint8_t *m = map_file(path, &len);
     if (!m) return;
-    if (len < EMOJI_HDR || m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != 'J' ||
+    if (len < EMOJI_HDR || m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != '3' ||
         rd16(m+4) != cell_w || rd16(m+6) != cell_h) {
         munmap(m, len);
         return;
     }
     size_t rec = 45 + ((size_t)cell_w * 2 * cell_h + 1) / 2;
     size_t count = rd16(m+8);
-    if (count * rec > len - EMOJI_HDR) {          /* the records are all in the file */
+    /* the codepoints and the records are all in the file */
+    if ((len - EMOJI_HDR) / (4 + rec) < count) {
         munmap(m, len);
         return;
     }
-    emoji_data = m; emoji_len = len; emoji_count = (uint16_t)count; emoji_rec = rec;
+    emoji_map = m; emoji_len = len; emoji_count = (uint16_t)count;
+    emoji_cps  = m + EMOJI_HDR;
+    emoji_data = emoji_cps + 4 * count;
+    emoji_rec  = rec;
+}
+
+/* The emoji index of codepoint cp, the record of emoji<k>.bfnt that draws it,
+ * or -1 if this font has no emoji for it. */
+int xterm_emoji_index(uint32_t cp)
+{
+    if (!emoji_map) return -1;
+    for (int i = 0; i < emoji_count; i++)
+        if (rd32(emoji_cps + 4 * (size_t)i) == cp) return i;
+    return -1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -844,8 +908,8 @@ static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
 
 static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
 {
-    if (!emoji_data || k >= emoji_count) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
-    const uint8_t *rec = emoji_data + EMOJI_HDR + (size_t)k * emoji_rec;
+    if (!emoji_map || k >= emoji_count) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
+    const uint8_t *rec = emoji_data + (size_t)k * emoji_rec;
     const uint8_t *pix = rec + 45;
     int gw = cell_w * 2;
     for (int y = 0; y < cell_h; y++)
@@ -884,7 +948,7 @@ static void render_cell(int row, int col, uint8_t depth)
     uint8_t cp = scr[idx];
     /* Anything that isn't an ordinary glyph (emoji, placeholder box) is
      * drawn over a plain background, which is what glyph slot 0 gives:
-     * it is the space, see charset.h, so its coverage is all zero. */
+     * it is the space (slot 0), so its coverage is all zero. */
     const uint8_t *g = glyph_data;
     int sh = 0, stride = cell_w;
     if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) && (rattrs & XTERM_ATTR_WIDE)) {
@@ -894,9 +958,8 @@ static void render_cell(int row, int col, uint8_t depth)
             g = wide_data + (size_t)cp * 2 * cell_w * cell_h + (size_t)half * cell_w;
             stride = 2 * cell_w;
         }
-    } else if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) &&
-        cp >= first_cp && cp < (uint16_t)(first_cp + num_glyphs)) {
-        g += (size_t)(cp-first_cp)*cell_w*cell_h;
+    } else if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) && cp < num_glyphs) {
+        g += (size_t)cp*cell_w*cell_h;
         /* A fullwidth character reuses its narrow twin's glyph, centred
          * across the two cells; this cell shows glyph columns x - sh
          * (left half: shifted right by half a cell; right half: the
@@ -1195,7 +1258,7 @@ int xterm_init(void)
     build_palette();
     size_t flen;
     uint8_t *fm = font_open(font_path, &flen);
-    if (!fm) die("could not load a BFNT font: /etc/bfnt/font2\n");
+    if (!fm) die("could not load a BFN3 font: /etc/bfnt/font2 (make -C _font install)\n");
     font_commit(fm, flen);
     emoji_load(emoji_path);
 

@@ -15,10 +15,10 @@
  * for why this is folded in here rather than being a separate call. */
 void xscr_render(const Screen *screen);
 
-/* Maps a decoded Unicode codepoint to this font's glyph slot (see
- * charset.h): ch==0 (an empty/never-written cell) reads as a blank space.
- * Returns -1 if the charset has no glyph for it.  (Not inline: charset.h's
- * table would be duplicated in every file that used it.) */
+/* Maps a decoded Unicode codepoint to this font's glyph slot: ch==0 (an
+ * empty/never-written cell) reads as a blank space.  Returns -1 if the font
+ * has no glyph for it.  (Not inline: it reads the font's codepoint tables,
+ * see xterm.h.) */
 int xscr_glyph_slot(uint32_t ch);
 
 /* Glyph slot and attribute for one half of a double-width character (what

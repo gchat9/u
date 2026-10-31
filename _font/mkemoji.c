@@ -18,11 +18,11 @@
  * to stay visually close to lossless for this set.
  *
  * Output format (emoji<STEP>.bfnt):
- *   12-byte header: magic "EMOJ", cell_w, cell_h, count, reserved
+ *   12-byte header: magic "EMO3", cell_w, cell_h, count, reserved
  *     (all u16 except the 4-byte magic)
- *   then, per emoji, in emoji_charset[] order (nothing per-record
- *   labels which emoji it is -- exactly like font<STEP>.bfnt's glyph slots,
- *   the shared header is the only mapping):
+ *   count x u32: the codepoint of each emoji, in emoji_charset[] order
+ *     (xterm looks an emoji up by codepoint in this table)
+ *   then, per emoji, in the same order, its record:
  *     45 bytes: 15 RGB triples (palette indices 1-15; index 0 is
  *               always "transparent" and needs no storage)
  *     ceil(2*cell_w*cell_h/2) bytes: packed 4-bit palette indices,
@@ -40,6 +40,7 @@
 #include "stb_image.h"
 
 #include "emoji_charset.h"
+#include "../_lib/width.h"          /* emoji_wide(): the sanity check below */
 
 #define NCOLORS         15
 #define ALPHA_THRESHOLD 128   /* >= this (of 255) counts as opaque */
@@ -174,13 +175,18 @@ int main(int argc, char **argv)
     FILE *out = fopen(argv[2], "wb");
     if (!out) { perror(argv[2]); return 1; }
 
-    uint8_t hdr[12] = { 'E','M','O','J' };
+    uint8_t hdr[12] = { 'E','M','O','3' };
     uint16_t count = (uint16_t)EMOJI_COUNT, rsv = 0;
     memcpy(hdr + 4, &cell_w, 2);
     memcpy(hdr + 6, &cell_h, 2);
     memcpy(hdr + 8, &count, 2);
     memcpy(hdr + 10, &rsv, 2);
     fwrite(hdr, 1, sizeof hdr, out);
+    for (int i = 0; i < EMOJI_COUNT; i++) {        /* the codepoint table */
+        uint32_t cp = emoji_charset[i];
+        uint8_t b[4] = { cp & 0xFF, (cp >> 8) & 0xFF, (cp >> 16) & 0xFF, cp >> 24 };
+        fwrite(b, 1, 4, out);
+    }
 
     uint8_t *rgb    = malloc((size_t)gw * gh * 3);
     uint8_t *alpha  = malloc((size_t)gw * gh);
@@ -189,7 +195,7 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < EMOJI_COUNT; i++) {
         if (!emoji_wide(emoji_charset[i])) {   /* would be drawn one cell wide by vt.c */
-            fprintf(stderr, "U+%X is in emoji_charset[] but not emoji_wide_ranges[]\n", emoji_charset[i]);
+            fprintf(stderr, "U+%X is in emoji_charset[] but not in width.h's emoji_wide_ranges[]\n", emoji_charset[i]);
             return 1;
         }
         char path[64];

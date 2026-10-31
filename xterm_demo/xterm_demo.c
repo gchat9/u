@@ -1,6 +1,5 @@
 #include "../_sys/_main.h"
 #include "../_lib/xterm.h"
-#include "../_font/charset.h"
 
 static void fill_framebuffer(uint32_t shift)
 {
@@ -10,7 +9,7 @@ static void fill_framebuffer(uint32_t shift)
     static uint8_t slots[72];
     static int slots_ready = 0;
     if (!slots_ready) {
-        for (int i = 0; i < 72; i++) slots[i] = (uint8_t)charset_slot(chars[i]);
+        for (int i = 0; i < 72; i++) slots[i] = (uint8_t)xterm_glyph_slot(chars[i]);
         slots_ready = 1;
     }
     uint8_t *fb = xterm_framebuffer();

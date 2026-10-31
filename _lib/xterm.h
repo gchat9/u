@@ -21,7 +21,7 @@ uint8_t *xterm_bg_buffer(void);
  * of vt.h's ATTR_* bit values by design — callers translate. */
 #define XTERM_ATTR_UNDERLINE 0x01
 #define XTERM_ATTR_STRIKE    0x02
-/* Emoji occupy two adjacent cells (see emoji<k>.bfnt / emoji_charset.h).
+/* Emoji occupy two adjacent cells (see emoji<k>.bfnt, and xterm_emoji_index() below).
  * For a cell flagged EMOJI_L or EMOJI_R, the byte in xterm_framebuffer()
  * is the emoji's *index* (not a glyph slot), and the cell draws the left
  * or right half of that emoji's colour bitmap; transparent pixels show
@@ -34,14 +34,26 @@ uint8_t *xterm_bg_buffer(void);
 #define XTERM_ATTR_MISSING   0x10
 /* Like EMOJI_L/R, but the glyph byte is an ordinary glyph slot: a
  * double-width character drawn by centring that one narrow glyph across
- * the two cells (fullwidth punctuation, see charset.h). */
+ * the two cells (fullwidth punctuation, see xterm_screen.c). */
 #define XTERM_ATTR_FW_L      0x20
 #define XTERM_ATTR_FW_R      0x40
 /* Modifier on FW_L/FW_R: the glyph byte is not a narrow glyph slot but
- * an index into the font's wide glyphs (charset.h's wide slots), and the
+ * an index into the font's wide glyphs (xterm_wide_slot() below), and the
  * cell draws the left or right half of that two-cell-wide bitmap rather
  * than a centred narrow glyph. */
 #define XTERM_ATTR_WIDE      0x80
+/* What the font in use draws a codepoint with.  xterm_glyph_slot() is the
+ * glyph slot of a narrow character (0..94 are U+0020..U+007E, the rest are the
+ * font's own table of codepoints), xterm_wide_slot() the wide slot of a
+ * double-width character drawn from its own two-cell bitmap, and
+ * xterm_emoji_index() the record of an emoji in emoji<k>.bfnt.  Each is -1 if
+ * the font has nothing for the codepoint, and the cell is then drawn as a
+ * placeholder box.  The font is the only source of these, so a program that
+ * uses them needs no table of its own (see _font/charset.h). */
+int xterm_glyph_slot(uint32_t cp);
+int xterm_wide_slot(uint32_t cp);
+int xterm_emoji_index(uint32_t cp);
+
 uint8_t *xterm_attr_buffer(void);
 int xterm_columns(void);
 int xterm_rows(void);

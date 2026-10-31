@@ -15,12 +15,17 @@
  * (a .ttc is read at index 0).
  *
  * font<STEP>.bfnt layout, all little-endian:
- *   "BFNT", cell_w, cell_h, baseline, first_cp, num_glyphs, num_wide  (16 bytes)
+ *   "BFN3", cell_w, cell_h, baseline, num_glyphs, num_wide, reserved
+ *                                                        (16 bytes)
+ *   codepoints of narrow glyphs CHARSET_ASCII_COUNT..num_glyphs-1: u32 each
+ *                (the glyphs before those are U+0020..U+007E in order: the
+ *                 ASCII range has no table, see charset.h)
+ *   codepoints of the wide glyphs: num_wide x u32
  *   num_glyphs   narrow glyphs, cell_w x cell_h bytes of alpha each
  *   num_wide     wide glyphs, (2*cell_w) x cell_h bytes of alpha each
- * (num_wide is the header's old "reserved" word, 0 in files without a
- * wide section.)  The header is the only record of the size: the cell dimensions
- * are in it, not in the file name.
+ * The header is the only record of the size: the cell dimensions are in it,
+ * not in the file name. The codepoint tables are what lets a program find a
+ * glyph in a font without including charset.h (see xterm.c, xterm_glyph_slot).
  */
 
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -45,6 +50,11 @@
 static void w16(FILE *f, uint16_t v) {          /* write LE uint16 */
     uint8_t b[2] = { v & 0xFF, v >> 8 };
     fwrite(b, 1, 2, f);
+}
+
+static void w32(FILE *f, uint32_t v) {          /* write LE uint32 */
+    uint8_t b[4] = { v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, v >> 24 };
+    fwrite(b, 1, 4, f);
 }
 
 static uint8_t *load_file(const char *path)
@@ -141,13 +151,19 @@ int main(int argc, char **argv)
     FILE *out = fopen(out_path, "wb");
     if (!out) { perror(out_path); return 1; }
 
-    fwrite("BFNT", 1, 4, out);
+    fwrite("BFN3", 1, 4, out);
     w16(out, cell_w);
     w16(out, cell_h);
     w16(out, baseline);
-    w16(out, 0);              /* first_cp  */
     w16(out, NUM_GLYPHS);
-    w16(out, NUM_WIDE);       /* num_wide  */
+    w16(out, NUM_WIDE);
+    w16(out, 0);              /* reserved */
+
+    /* ── codepoint tables (see the layout above) ───────────────────── */
+    for (int slot = CHARSET_ASCII_COUNT; slot < NUM_GLYPHS; slot++)
+        w32(out, charset_codepoint(slot));
+    for (int slot = 0; slot < NUM_WIDE; slot++)
+        w32(out, charset_wide_codepoint(slot));
 
     /* ── render glyphs ────────────────────────────────────────────── */
     /*
@@ -199,7 +215,8 @@ int main(int argc, char **argv)
 
     free(wcell); free(wttf); free(ttf); fclose(out);
 
-    unsigned total = 16 + NUM_GLYPHS * cell_w * cell_h + NUM_WIDE * ww * cell_h;
+    unsigned total = 16 + 4 * (NUM_GLYPHS - CHARSET_ASCII_COUNT) + 4 * NUM_WIDE
+                   + NUM_GLYPHS * cell_w * cell_h + NUM_WIDE * ww * cell_h;
     fprintf(stderr, "wrote %s  (%d narrow + %d wide glyphs, %u bytes)\n",
             out_path, NUM_GLYPHS, NUM_WIDE, total);
     return 0;

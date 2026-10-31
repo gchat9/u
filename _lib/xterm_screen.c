@@ -11,8 +11,6 @@
 #include <string.h>
 
 #include "xterm_screen.h"
-#include "../_font/charset.h"
-#include "../_font/emoji_charset.h"
 
 /* Resolve a Cell's colour down to two xterm-256-palette index bytes,
  * plus a small structural-attr bitmask (drawn as extra pixels, not a
@@ -41,17 +39,33 @@ static void resolve_colors(const Cell *cell, uint8_t *out_fg, uint8_t *out_bg,
     *out_attr = attr;
 }
 
-/* Maps a decoded Unicode codepoint to this font's glyph slot (see
- * charset.h): ch==0 (an empty/never-written cell) reads as a blank
- * space. Returns -1 if the charset has no glyph for it, in which case
- * the caller stores slot 0 and sets XTERM_ATTR_MISSING on the cell, and
- * xterm draws a placeholder box (rather than substituting some
- * other glyph, which would silently change what's on screen). Slot 0
- * is a valid slot number for a real space, so it's only ever meaningful
- * alongside that flag. */
+/* A fullwidth punctuation mark (U+FF01..U+FF5E) is drawn with its ASCII
+ * twin's glyph, centred across the two cells (xscr_wide_glyph). Returns that
+ * ASCII code, or 0 for a character not drawn that way: the fullwidth letters
+ * and digits, which draw as a placeholder box, and U+FF5F/FF60. */
+static uint32_t fullwidth_alias(uint32_t cp)
+{
+    if (cp < 0xFF01 || cp > 0xFF5E) return 0;
+    uint32_t a = cp - 0xFEE0, l = a | 0x20;
+    return (a >= '0' && a <= '9') || (l >= 'a' && l <= 'z') ? 0 : a;
+}
+
+/* Maps a decoded Unicode codepoint to this font's glyph slot: ch==0 (an
+ * empty/never-written cell) reads as a blank space. Returns -1 if the font has
+ * no glyph for it, in which case the caller stores slot 0 and sets
+ * XTERM_ATTR_MISSING on the cell, and xterm draws a placeholder box (rather
+ * than substituting some other glyph, which would silently change what's on
+ * screen). Slot 0 is a valid slot number for a real space, so it's only ever
+ * meaningful alongside that flag. Two characters are drawn with another's
+ * glyph: the hyphens with the ASCII hyphen-minus (man(1) breaks words with
+ * U+2010, copy and paste still see the original character), and the big
+ * solidus with the slash. */
 int xscr_glyph_slot(uint32_t ch)
 {
-    return charset_slot(ch ? ch : ' ');
+    if (!ch) ch = ' ';
+    if (ch == 0x2010 || ch == 0x2011) ch = '-';
+    if (ch == 0x29F8) ch = '/';
+    return xterm_glyph_slot(ch);
 }
 
 /* Glyph slot and attribute for one half of a double-width character:
@@ -61,17 +75,17 @@ int xscr_glyph_slot(uint32_t ch)
  * no bitmap for it).  `right` selects the right-hand cell. */
 int xscr_wide_glyph(uint32_t wch, int right, uint8_t *attr)
 {
-    int ws = charset_wide_slot(wch);
+    int ws = xterm_wide_slot(wch);
     if (ws >= 0) {
         *attr = (right ? XTERM_ATTR_FW_R : XTERM_ATTR_FW_L) | XTERM_ATTR_WIDE;
         return ws;
     }
-    uint32_t twin = charset_fullwidth_alias(wch);
+    uint32_t twin = fullwidth_alias(wch);
     if (twin) {
         *attr = right ? XTERM_ATTR_FW_R : XTERM_ATTR_FW_L;
         return xscr_glyph_slot(twin);
     }
-    int g = emoji_index(wch); if (g < 0) g = 255;
+    int g = xterm_emoji_index(wch); if (g < 0) g = 255;
     *attr = right ? XTERM_ATTR_EMOJI_R : XTERM_ATTR_EMOJI_L;
     return g;
 }

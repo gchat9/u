@@ -148,7 +148,7 @@ try:
             open("/etc/bfnt/font2", "wb").write(data)
             q = subprocess.run([BIN, "-o", "UserKnownHostsFile=" + os.path.join(T, "known_hosts"), "-i", os.path.join(T, "key"),
                                 "-p", PORT, "root@127.0.0.1", "true"], capture_output=True, timeout=30)
-            check(name, q.returncode == 1 and b"BFNT" in q.stderr, (q.returncode, q.stderr[-200:]))
+            check(name, q.returncode == 1 and b"BFN3" in q.stderr, (q.returncode, q.stderr[-200:]))
         finally:
             open("/etc/bfnt/font2", "wb").write(good_font)
     font_refused(good_font[:1000], "a truncated font is refused with a message, not a crash")

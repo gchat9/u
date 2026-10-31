@@ -1,6 +1,5 @@
 #include "vt.h"
-#include "../_font/emoji_charset.h"
-#include "../_font/charset.h"
+#include "width.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -471,7 +470,7 @@ static int cp_width(uint32_t ch)
 {
     if (ch == 0x200D || (ch >= 0xFE00 && ch <= 0xFE0F) || (ch >= 0x200B && ch <= 0x200F))
         return 0;
-    return (ch >= 0x1100 && (emoji_wide(ch) || charset_wide(ch))) ? 2 : 1;
+    return (ch >= 0x1100 && (emoji_wide(ch) || cjk_wide(ch))) ? 2 : 1;
 }
 
 static void put_char(VTParser *p, uint32_t ch)
@@ -483,8 +482,8 @@ static void put_char(VTParser *p, uint32_t ch)
      * discarding the character right here) for anything outside ASCII
      * whenever no UTF-8 locale is configured -- confirmed to misbehave
      * that way in practice, and not a safe assumption for a minimal
-     * target system. The emoji blocks (see emoji_charset.h) and the
-     * fullwidth forms and CJK (see charset.h) are double-width whether or
+     * target system. The emoji blocks and the
+     * fullwidth forms and CJK (see width.h) are double-width whether or
      * not we can draw that particular one; everything else is 1. Whether
      * a codepoint can actually be drawn is decided separately, at render
      * time. The >= 0x1100 guard keeps the table scans off the hot path

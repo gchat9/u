@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Prints the emoji_wide_ranges[] table for emoji_charset.h.
+# Prints the emoji_wide_ranges[] table for _lib/width.h.
 #
 # Rule: every code point in every emitted range is either East Asian Width
 # "W" (double-width, which is what wcwidth() -- and therefore readline --
@@ -33,9 +33,9 @@ for s, e in bmp + [(s - 0x10000, e - 0x10000) for s, e in astral]:
     if len(row) == 6: print("    " + ", ".join(row) + ","); row = []
 if row: print("    " + ", ".join(row) + ",")
 
-# ---- the second table, for charset.h's charset_cjk_ranges[] ----
+# ---- the second table, for _lib/width.h's cjk_ranges[] ----
 # What wcwidth() reports as double-width outside the emoji blocks above and
-# outside the fullwidth forms U+FF01..FF60 (charset_fullwidth() handles
+# outside the fullwidth forms U+FF01..FF60 (fullwidth() handles
 # those itself). libc takes the CJK blocks whole -- unassigned and East
 # Asian "Ambiguous" code points included -- except combining marks, which
 # are width 0; so: those blocks minus the marks, plus the astral runs that

@@ -55,7 +55,7 @@ emoji%.bfnt: mkemoji font%.bfnt $(wildcard emoji_src/*.png)
 mkfont: mkfont.c charset.h stb_truetype.h
 	$(HOSTCC) $(CFLAGS) -o $@ mkfont.c -lm
 
-mkemoji: mkemoji.c emoji_charset.h stb_image.h
+mkemoji: mkemoji.c emoji_charset.h ../_lib/width.h stb_image.h
 	$(HOSTCC) $(CFLAGS) -o $@ mkemoji.c -lm
 
 $(STB):

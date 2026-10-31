@@ -1,23 +1,18 @@
 /*
- * charset.h — the font's glyph slots, and nothing more.
+ * charset.h — the font's glyph set, as mkfont.c bakes it in: the one place
+ * that says which codepoint each glyph of a font is.
  *
- * The font is a flat array of fixed-size bitmaps; a glyph "slot" is
- * just an index into it (a uint8_t in the framebuffer, so at most 256),
- * with no inherent meaning of its own. This file is the single place
- * that assigns a Unicode codepoint to each slot, in both directions:
+ * This is build input only. Each font file (font<STEP>.bfnt) records, in its
+ * own tables, the codepoint of every glyph in it (see the layout in mkfont.c),
+ * and xterm reads that, so the programs that draw text do not include this
+ * file: the glyph set can change by rebuilding the fonts, with no program
+ * rebuilt. What the glyph set is, and that it is what the programs assume, is
+ * all that this file has to keep right.
  *
- *   charset_codepoint(slot) -> codepoint   used by mkfont.c to decide
- *                                          what to rasterize into slot
- *   charset_slot(codepoint) -> slot        used by the renderer to map
- *                                          a decoded character to a
- *                                          glyph it can actually draw
- *
- * Layout: ASCII (0x20-0x7E) first, as a plain arithmetic offset -- no
- * table, no lookup, just a range check and a subtraction. That's 95
- * slots. Everything else is in charset_extra[], looked up by linear
- * scan since a binary search would be more code for no measurable
- * benefit at this size, and it is only scanned for characters outside
- * ASCII. The table holds, in order:
+ * The narrow glyphs are slots 0..CHARSET_COUNT-1 of the font: the printable
+ * ASCII, U+0020..U+007E, in slots 0..94 (the ASCII range below, a plain
+ * offset and no table: the programs rely on this), then the codepoints of
+ * charset_extra[], in order, in slots 95 on. The table holds, in order:
  *
  *   - a small set of accented Latin letters (Western European, minus
  *     the ones left out on purpose; no other Latin-1 letters), plus the
@@ -27,20 +22,22 @@
  *     actually draw), square corners only;
  *   - a few block/shade glyphs, four arrows, and three punctuation/
  *     dingbat marks (check marks, em dash), the degree sign, the French
- *     guillemets, and the horizontal ellipsis.  The big solidus U+29F8
- *     has no glyph of its own: see charset_slot().
+ *     guillemets, and the horizontal ellipsis.
  *
- * Double-width glyphs are a second, separate array of the same kind: a
- * "wide slot" indexes charset_wide_extra[] and a wide bitmap in
- * font<STEP>.bfnt that is two cells wide (see charset_wide_slot() below).
+ * Which character is drawn with which glyph, where one character is drawn with
+ * another's glyph (the hyphens, the big solidus, the fullwidth forms), is the
+ * renderer's and lives with it (xterm_screen.c). Whether a character is
+ * double-width is not this file's either (width.h).
  *
- * The font file only holds CHARSET_COUNT narrow and CHARSET_WIDE_COUNT
- * wide glyphs (mkfont writes exactly that many; the renderer takes the
- * counts from the file header), so every glyph dropped here is also
- * dropped from font<STEP>.bfnt. Extending the charset later means appending
- * to charset_extra[] or charset_wide_extra[] (order doesn't matter);
- * the _Static_asserts below keep CHARSET_RESERVE slots of each kind
- * free, to be spent on purpose by lowering that number.
+ * Double-width glyphs are a second array of the same kind: charset_wide_extra[]
+ * holds the codepoints of the wide glyphs, which mkfont bakes as two-cell
+ * bitmaps (wide slot i is the i-th entry), after the narrow ones.
+ *
+ * The font file holds CHARSET_COUNT narrow and CHARSET_WIDE_COUNT wide glyphs,
+ * so every glyph dropped here is also dropped from the fonts. Extending the
+ * charset later means appending to charset_extra[] or charset_wide_extra[]
+ * (order doesn't matter); the _Static_asserts below keep CHARSET_RESERVE slots
+ * of each kind free, to be spent on purpose by lowering that number.
  */
 #pragma once
 
@@ -53,6 +50,13 @@
 
 #define CHARSET_EXTRA_BASE   (CHARSET_ASCII_BASE + CHARSET_ASCII_COUNT)    /* 95 */
 #define CHARSET_EXTRA_MAX    (256 - CHARSET_EXTRA_BASE)                    /* 161 */
+
+/* xterm_glyph_slot() in _lib/xterm.c relies on the ASCII range being exactly
+ * slots 0..94, U+0020..U+007E; this keeps that true if anyone edits it. */
+_Static_assert(CHARSET_ASCII_BASE == 0 && CHARSET_ASCII_LO == 0x20 &&
+               CHARSET_ASCII_HI == 0x7E && CHARSET_ASCII_COUNT == 95,
+              "the ASCII convention is part of the font format (xterm.c)");
+
 
 static const uint16_t charset_extra[] = {
     0x00C0, 0x00E0, 0x00E1, 0x00C2, 0x00E2, 0x00C4, 0x00E4,   /* À à á Â â Ä ä */
@@ -102,51 +106,12 @@ static inline uint32_t charset_codepoint(int slot)
     return 0;
 }
 
-/* codepoint -> slot. Returns -1 if this charset has no glyph for it
- * (the caller marks the cell XTERM_ATTR_MISSING; see x11_backend.c). */
-static inline int charset_slot(uint32_t cp)
-{
-    /* Hyphen (U+2010) and non-breaking hyphen (U+2011) are drawn with the
-     * ASCII hyphen-minus glyph: no slot of their own (man(1) breaks words
-     * with U+2010). Copy and paste still see the original character.
-     * The big solidus (U+29F8) is likewise drawn with the ASCII slash. */
-    if (cp == 0x2010 || cp == 0x2011) cp = '-';
-    if (cp == 0x29F8) cp = '/';
-    if (cp >= CHARSET_ASCII_LO && cp <= CHARSET_ASCII_HI)
-        return CHARSET_ASCII_BASE + (int)(cp - CHARSET_ASCII_LO);
-    for (int i = 0; i < CHARSET_EXTRA_COUNT; i++)
-        if (charset_extra[i] == cp) return CHARSET_EXTRA_BASE + i;
-    return -1;
-}
-
-/* Fullwidth forms, U+FF01..U+FF60: CJK-era duplicates of ASCII, all
- * double-width. Programs (readline, ncurses, ...) size lines by that, so
- * every one of them must take two cells whether or not we can draw it. */
-static inline int charset_fullwidth(uint32_t cp)
-{
-    return cp >= 0xFF01 && cp <= 0xFF60;
-}
-
-/* What we can draw of them: U+FF01..U+FF5E are exactly ASCII 0x21..0x7E
- * at a fixed offset of 0xFEE0, so a fullwidth punctuation mark is drawn
- * with its ASCII twin's existing glyph, centred in the two-cell area --
- * no new font data at all. Returns that ASCII code, or 0 for anything
- * not drawn this way: the fullwidth letters and digits (which draw as a
- * placeholder box) and U+FF5F/FF60. */
-static inline uint32_t charset_fullwidth_alias(uint32_t cp)
-{
-    if (cp < 0xFF01 || cp > 0xFF5E) return 0;
-    uint32_t a = cp - 0xFEE0, l = a | 0x20;
-    return (a >= '0' && a <= '9') || (l >= 'a' && l <= 'z') ? 0 : a;
-}
-
 /* ── Double-width glyphs ────────────────────────────────────────────
  *
  * Characters drawn from their own two-cell bitmap, rather than by
- * centring a narrow twin (above) or as an emoji. They live in a second
- * array of glyphs, with its own slot numbering (0..CHARSET_WIDE_COUNT-1),
- * stored after the narrow glyphs in font<STEP>.bfnt; a cell holding one is
- * flagged XTERM_ATTR_WIDE (see xterm.h). Add to the end, as above.
+ * centring a narrow twin or as an emoji. They have their own slot
+ * numbering (0..CHARSET_WIDE_COUNT-1), stored after the narrow glyphs
+ * in font<STEP>.bfnt. Add to the end, as above.
  */
 static const uint16_t charset_wide_extra[] = {
     0x30C4,                                            /* ツ */
@@ -160,39 +125,4 @@ _Static_assert(CHARSET_WIDE_COUNT + CHARSET_RESERVE <= 256,
 static inline uint32_t charset_wide_codepoint(int slot)
 {
     return slot >= 0 && slot < CHARSET_WIDE_COUNT ? charset_wide_extra[slot] : 0;
-}
-
-/* codepoint -> wide slot, or -1 if we have no two-cell bitmap for it */
-static inline int charset_wide_slot(uint32_t cp)
-{
-    for (int i = 0; i < CHARSET_WIDE_COUNT; i++)
-        if (charset_wide_extra[i] == cp) return i;
-    return -1;
-}
-
-/* CJK and other East Asian wide characters outside the emoji blocks, as
- * [lo,hi] runs; generated by gen_wide_ranges.py (`./gen_wide_ranges.py
- * cjk`, second table of its output). Like libc's wcwidth() it takes the
- * CJK blocks whole -- unassigned and "ambiguous" code points included --
- * but not combining marks (width 0), so a run counts as wide whether or
- * not we can draw a given character in it, and cell width agrees with
- * wcwidth(). Includes the fullwidth signs at U+FFE0..FFE6; the fullwidth
- * forms U+FF01..FF60 are charset_fullwidth(). */
-static const uint32_t charset_cjk_ranges[][2] = {
-    {0x1100,0x115F}, {0x2329,0x232A}, {0x2E80,0x3029}, {0x302E,0x303E}, {0x3041,0x3098},
-    {0x309B,0xA4CF}, {0xA960,0xA97F}, {0xAC00,0xD7A3}, {0xF900,0xFAFF}, {0xFE10,0xFE19},
-    {0xFE30,0xFE6F}, {0xFFE0,0xFFE6}, {0x16FE0,0x1B2FB}, {0x20000,0x3FFFD},
-};
-#define CHARSET_CJK_RANGES ((int)(sizeof(charset_cjk_ranges) / sizeof(charset_cjk_ranges[0])))
-
-/* Is cp double-width because it is a CJK / fullwidth character? (Emoji
- * are emoji_wide(), in emoji_charset.h.) The >= 0x1100 test keeps the
- * scan off the hot path for ordinary text. */
-static inline int charset_wide(uint32_t cp)
-{
-    if (cp < 0x1100) return 0;
-    if (charset_fullwidth(cp)) return 1;
-    for (int i = 0; i < CHARSET_CJK_RANGES; i++)
-        if (cp >= charset_cjk_ranges[i][0] && cp <= charset_cjk_ranges[i][1]) return 1;
-    return 0;
 }
