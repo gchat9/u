@@ -1,8 +1,8 @@
 # Font and charset generation: builds the data files _lib/xterm.c loads
 # from /etc at runtime, one pair for each font size --
 #
-#   font<STEP>.bfnt    monochrome glyphs, laid out as defined in charset.h
-#   emoji<STEP>.bfnt   colour emoji, as listed in emoji_charset.h
+#   font<STEP>.bfnt    the glyphs, laid out as defined in charset.h, and the
+#                      colour emoji listed in emoji_charset.h
 #
 # STEP is 0..7 (SIZES below). Each size's cell is 2^((STEP-2)/4) times the
 # size of STEP 2 in both directions: STEP 2 is the size the font has always
@@ -16,7 +16,8 @@
 #
 #   make             build all the files (fetching stb_*.h first if needed)
 #   make install     copy them to $(DESTDIR)$(FONTDIR), default /etc/bfnt,
-#                    created if need be, as font0 .. font7 and emoji0 .. emoji7
+#                    created if need be, as font0 .. font7; the emoji<k> files
+#                    of the two-file layout are removed
 #   make clean       remove the generator binaries
 #   make distclean   clean, plus the downloaded stb_*.h and generated *.bfnt
 #
@@ -40,17 +41,16 @@ STB     := stb_image.h stb_truetype.h
 
 SIZES  := 0 1 2 3 4 5 6 7           # keep equal to FONT_SIZES in mkfont.c and xterm.c
 FONTS  := $(SIZES:%=font%.bfnt)
-EMOJIS := $(SIZES:%=emoji%.bfnt)
 
-all: $(FONTS) $(EMOJIS)
+all: $(FONTS)
 
-# mkfont writes the font of one size (STEP is the file name's number).
-# mkemoji reads the same size's font for the cell size, hence that dependency.
-font%.bfnt: mkfont $(TTF) $(WTTF)
-	./mkfont $* $@ $(TTF) $(WTTF)
-
-emoji%.bfnt: mkemoji font%.bfnt $(wildcard emoji_src/*.png)
-	./mkemoji font$*.bfnt $@
+# mkfont writes the glyphs of one size (STEP is the file name's number) to a
+# .base file; mkemoji appends that size's emoji to it. mkemoji takes its cell
+# size from the .base file, hence the order.
+font%.bfnt: mkfont mkemoji $(TTF) $(WTTF) $(wildcard emoji_src/*.png)
+	./mkfont $* $@.base $(TTF) $(WTTF)
+	./mkemoji $@.base $@
+	rm -f $@.base
 
 mkfont: mkfont.c charset.h stb_truetype.h
 	$(HOSTCC) $(CFLAGS) -o $@ mkfont.c -lm
@@ -70,15 +70,15 @@ $(WTTF):
 install: all
 	install -d $(DESTDIR)$(FONTDIR)
 	for k in $(SIZES); do \
-		install -m 644 font$$k.bfnt $(DESTDIR)$(FONTDIR)/font$$k && \
-		install -m 644 emoji$$k.bfnt $(DESTDIR)$(FONTDIR)/emoji$$k || exit 1; \
+		install -m 644 font$$k.bfnt $(DESTDIR)$(FONTDIR)/font$$k || exit 1; \
+		rm -f $(DESTDIR)$(FONTDIR)/emoji$$k; \
 	done
 
 clean:
 	rm -f mkfont mkemoji
 
 distclean: clean
-	rm -f $(STB) *.bfnt
+	rm -f $(STB) *.bfnt *.base
 
 # A failed or interrupted curl must not leave a truncated stb_*.h behind
 # for the next run to treat as a valid cached copy.

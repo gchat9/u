@@ -15,7 +15,7 @@
  * (a .ttc is read at index 0).
  *
  * font<STEP>.bfnt layout, all little-endian:
- *   "BFN3", cell_w, cell_h, baseline, num_glyphs, num_wide, reserved
+ *   "BFN3", cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji
  *                                                        (16 bytes)
  *   codepoints of narrow glyphs CHARSET_ASCII_COUNT..num_glyphs-1: u32 each
  *                (the glyphs before those are U+0020..U+007E in order: the
@@ -23,9 +23,14 @@
  *   codepoints of the wide glyphs: num_wide x u32
  *   num_glyphs   narrow glyphs, cell_w x cell_h bytes of alpha each
  *   num_wide     wide glyphs, (2*cell_w) x cell_h bytes of alpha each
+ *   the emoji section, appended by mkemoji (see mkemoji.c); num_emoji is 0
+ *   in what mkfont writes:
+ *     num_emoji x u32   the codepoint of each emoji
+ *     num_emoji records of 45 + cell_w*cell_h bytes each (mkemoji.c)
  * The header is the only record of the size: the cell dimensions are in it,
  * not in the file name. The codepoint tables are what lets a program find a
  * glyph in a font without including charset.h (see xterm.c, xterm_glyph_slot).
+ * The file is complete once mkemoji has run on it.
  */
 
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -157,7 +162,7 @@ int main(int argc, char **argv)
     w16(out, baseline);
     w16(out, NUM_GLYPHS);
     w16(out, NUM_WIDE);
-    w16(out, 0);              /* reserved */
+    w16(out, 0);              /* num_emoji: mkemoji fills it in and appends them */
 
     /* ── codepoint tables (see the layout above) ───────────────────── */
     for (int slot = CHARSET_ASCII_COUNT; slot < NUM_GLYPHS; slot++)

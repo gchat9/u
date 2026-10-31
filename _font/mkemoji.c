@@ -1,7 +1,7 @@
 /*
- * mkemoji.c — builds emoji<STEP>.bfnt from Twemoji PNG source art.
+ * mkemoji.c — adds the colour emoji to font<STEP>.bfnt, from Twemoji PNG source art.
  *
- *   ./mkemoji font<STEP>.bfnt emoji<STEP>.bfnt
+ *   ./mkemoji font<STEP>.base font<STEP>.bfnt
  *
  * Needs the font of the same size to already exist, to read its cell_w/cell_h
  * from (see below); the Makefile builds it first. Expects emoji_src/<hex
@@ -17,9 +17,8 @@
  * shaded with few distinct colours per glyph already, so 15 is enough
  * to stay visually close to lossless for this set.
  *
- * Output format (emoji<STEP>.bfnt):
- *   12-byte header: magic "EMO3", cell_w, cell_h, count, reserved
- *     (all u16 except the 4-byte magic)
+ * Output: the font mkfont wrote (its header with num_emoji set here, its
+ * glyph and codepoint tables unchanged), then the emoji section at its end:
  *   count x u32: the codepoint of each emoji, in emoji_charset[] order
  *     (xterm looks an emoji up by codepoint in this table)
  *   then, per emoji, in the same order, its record:
@@ -28,6 +27,7 @@
  *     ceil(2*cell_w*cell_h/2) bytes: packed 4-bit palette indices,
  *               row-major, two pixels per byte (first pixel in the
  *               high nibble)
+ * The input's emoji section, if it has one, is not copied.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +41,8 @@
 
 #include "emoji_charset.h"
 #include "../_lib/width.h"          /* emoji_wide(): the sanity check below */
+
+#define FONT_HDR 16                 /* the header of mkfont.c's font */
 
 #define NCOLORS         15
 #define ALPHA_THRESHOLD 128   /* >= this (of 255) counts as opaque */
@@ -156,33 +158,45 @@ static int nearest(RGB8 c, const RGB8 *pal, int npal)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) { fprintf(stderr, "usage: mkemoji font<STEP>.bfnt emoji<STEP>.bfnt\n"); return 2; }
-    /* Read cell_w/cell_h from the font's own header rather than
-     * hardcoding them here -- they're computed from the TTF at mkfont
-     * build time, not fixed constants, so this is the only way
-     * the emoji is guaranteed to match whatever font was actually
-     * built, with nothing to keep manually in sync. */
+    if (argc != 3) { fprintf(stderr, "usage: mkemoji font<STEP>.base font<STEP>.bfnt\n"); return 2; }
+    /* Read the whole font mkfont wrote. Its cell size is in its own header, not
+     * hardcoded here: the emoji are guaranteed to match whatever font was built,
+     * with nothing to keep manually in sync. */
     FILE *fin = fopen(argv[1], "rb");
-    if (!fin) { fprintf(stderr, "%s not found -- run ./mkfont first\n", argv[1]); return 1; }
-    uint8_t fhdr[16];
-    if (fread(fhdr, 1, sizeof fhdr, fin) != sizeof fhdr) { fprintf(stderr, "%s too short\n", argv[1]); return 1; }
+    if (!fin) { perror(argv[1]); return 1; }
+    fseek(fin, 0, SEEK_END);
+    long fn = ftell(fin);
+    rewind(fin);
+    uint8_t *font = malloc(fn > 0 ? (size_t)fn : 1);
+    if (!font || fn < FONT_HDR || fread(font, 1, (size_t)fn, fin) != (size_t)fn) {
+        fprintf(stderr, "%s: not a font (too short)\n", argv[1]); return 1;
+    }
     fclose(fin);
-    uint16_t cell_w, cell_h;
-    memcpy(&cell_w, fhdr + 4, 2);
-    memcpy(&cell_h, fhdr + 6, 2);
+    if (memcmp(font, "BFN3", 4) != 0) { fprintf(stderr, "%s: not a BFN3 font (mkfont.c)\n", argv[1]); return 1; }
+    uint16_t cell_w, cell_h, num_glyphs, num_wide;
+    memcpy(&cell_w, font + 4, 2);
+    memcpy(&cell_h, font + 6, 2);
+    memcpy(&num_glyphs, font + 10, 2);
+    memcpy(&num_wide, font + 12, 2);
     int gw = cell_w * 2, gh = cell_h;
+    /* the end of the glyph tables and bitmaps: what the emoji section follows */
+    size_t body_end = FONT_HDR + 4 * ((size_t)num_glyphs - 95 + num_wide)
+                    + (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
+    if (body_end > (size_t)fn) { fprintf(stderr, "%s: truncated\n", argv[1]); return 1; }
 
     FILE *out = fopen(argv[2], "wb");
     if (!out) { perror(argv[2]); return 1; }
 
-    uint8_t hdr[12] = { 'E','M','O','3' };
-    uint16_t count = (uint16_t)EMOJI_COUNT, rsv = 0;
-    memcpy(hdr + 4, &cell_w, 2);
-    memcpy(hdr + 6, &cell_h, 2);
-    memcpy(hdr + 8, &count, 2);
-    memcpy(hdr + 10, &rsv, 2);
+    /* the header, with the emoji count set; then the tables and glyphs, unchanged */
+    uint8_t hdr[FONT_HDR];
+    memcpy(hdr, font, FONT_HDR);
+    uint16_t count = (uint16_t)EMOJI_COUNT;
+    memcpy(hdr + 14, &count, 2);
     fwrite(hdr, 1, sizeof hdr, out);
-    for (int i = 0; i < EMOJI_COUNT; i++) {        /* the codepoint table */
+    fwrite(font + FONT_HDR, 1, body_end - FONT_HDR, out);
+    free(font);
+
+    for (int i = 0; i < EMOJI_COUNT; i++) {        /* the emoji section's codepoint table */
         uint32_t cp = emoji_charset[i];
         uint8_t b[4] = { cp & 0xFF, (cp >> 8) & 0xFF, (cp >> 16) & 0xFF, cp >> 24 };
         fwrite(b, 1, 4, out);

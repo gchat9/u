@@ -35,7 +35,7 @@ From the repo root:
 - `make x86_64` / `i386` / `aarch64` / `armhf` / `riscv64` cross-builds every tool for that architecture, `sstrip`s the result, and collects it under `_release/<arch>/`; `make release-all` does all five;
 - `make release ARCH=<name> [CC=<compiler>]` does the same for an architecture not in that built-in list;
 - `make clean` / `make distclean` clean per-tool build output, `distclean` also removes `_release/`;
-- `make -C _font` builds `font0.bfnt`..`font7.bfnt` and `emoji0.bfnt`..`emoji7.bfnt` in `_font/`, eight sizes each 2^(1/4) larger than the last (separate from `make` because it needs a monospace TTF, a TTF/TTC with the double-width glyphs (Noto Sans CJK by default) and, on first use, network access for the pinned `stb_*.h`); `make -C _font install` copies them to `/etc/bfnt`, where `xterm` looks. `distclean` removes the downloaded headers and generated fonts.
+- `make -C _font` builds `font0.bfnt`..`font7.bfnt` in `_font/` (each holds the glyphs and the colour emoji of its size), eight sizes each 2^(1/4) larger than the last (separate from `make` because it needs a monospace TTF, a TTF/TTC with the double-width glyphs (Noto Sans CJK by default) and, on first use, network access for the pinned `stb_*.h`); `make -C _font install` copies them to `/etc/bfnt`, where `xterm` looks. `distclean` removes the downloaded headers and generated fonts.
 
 ## LLM/AI usage
 

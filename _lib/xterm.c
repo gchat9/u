@@ -3,8 +3,8 @@
  *
  *   - Pure libc, zero X11 libraries
  *   - Raw X11 wire protocol over Unix socket
- *   - BFN3 bitmap font (produced by _font/mkfont.c), with the codepoint of
- *     each glyph in the file: the program needs no table of its own
+ *   - BFN3 bitmap font, one file per size: the glyphs and the colour emoji,
+ *     with the codepoint of each in the file (produced by _font/)
  *   - File-backed font mapping; protocol buffers supplied by main's stack frame
  *   - One PutImage per tile of cells (no full-screen framebuffer)
  *
@@ -584,11 +584,11 @@ static void handle_keypress(const uint8_t *ev)
 /* The bytes of one tile of cells, see cell_storage and render_all(). */
 #define TILE_BYTES     (PUT_HDR + 64*64*4)
 
-/* The font comes in FONT_SIZES sizes (see _font/mkfont.c), each in files of
- * its own: /etc/bfnt/font<k> and /etc/bfnt/emoji<k> for size k.  Size k's cell
- * is 2^((k - BASE_SIZE)/4) times the base size's in both directions.  The font
- * starts at BASE_SIZE.  The cell size is in the file's header, so the name only
- * says which size the file is. */
+/* The font comes in FONT_SIZES sizes (see _font/mkfont.c), one file for each:
+ * /etc/bfnt/font<k> for size k, holding its glyphs and its colour emoji.  Size
+ * k's cell is 2^((k - BASE_SIZE)/4) times the base size's in both directions.
+ * The font starts at BASE_SIZE.  The cell size is in the file's header, so the
+ * name only says which size the file is. */
 #define FONT_SIZES     8
 #define BASE_SIZE      2
 #define BFNT_DIR       "/etc/bfnt/"
@@ -599,24 +599,25 @@ static void handle_keypress(const uint8_t *ev)
 
 static uint8_t  *font_data;     /* the font in use, mapped; NULL until one is loaded */
 static size_t    font_len;
-static uint16_t  cell_w, cell_h, baseline, num_glyphs, num_wide;
+static uint16_t  cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji;
 static const uint8_t *ncp_tab;  /* codepoints (u32) of the narrow glyphs past ASCII */
 static const uint8_t *wcp_tab;  /* codepoints (u32) of the wide glyphs */
+static const uint8_t *emoji_cps;   /* codepoints (u32) of the emoji */
 static const uint8_t *glyph_data;
-static const uint8_t *wide_data;     /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
+static const uint8_t *wide_data;   /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
+static const uint8_t *emoji_data;  /* num_emoji records, after the emoji's codepoints (see draw_emoji) */
+static size_t    emoji_rec;     /* bytes per record: 45 palette + packed 4bpp pixels */
 static int       WIN_W, WIN_H, cols, rows;
 static int       cfg_w, cfg_h;  /* window size as last reported by the server */
 static int       font_size = BASE_SIZE;  /* the size in use */
 static char      font_path[]  = BFNT_DIR "font2";     /* the digit is the size: */
-static char      emoji_path[] = BFNT_DIR "emoji2";   /* see font_switch() */
-#define FONT_DIGIT  (sizeof BFNT_DIR "font" - 1)
-#define EMOJI_DIGIT (sizeof BFNT_DIR "emoji" - 1)
+#define FONT_DIGIT  (sizeof BFNT_DIR "font" - 1)     /* see font_switch() */
 
 #ifndef SEEK_END
 #define SEEK_END 2
 #endif
 
-/* A 16-bit and a 32-bit little-endian field of a BFN3 or EMO3 file. */
+/* A 16-bit and a 32-bit little-endian field of a BFN3 file. */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)rd16(p) | (uint32_t)rd16(p+2) << 16; }
 
@@ -636,23 +637,28 @@ static uint8_t *map_file(const char *path, size_t *len)
 }
 
 /* Whether m, a mapping of n bytes, is a font that can be drawn: the header is
- * right, and the glyphs and codepoint tables it counts are all in the file.
- * A font that passes is one the renderer can use, so nothing is read past the
- * mapping. */
+ * right, and everything it counts is in the file -- the codepoint tables, the
+ * glyphs, and the emoji section.  A font that passes is one the renderer can
+ * use, so nothing is read past the mapping. */
 static int font_valid(const uint8_t *m, size_t n)
 {
     if (n < FONT_HDR || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != '3')
         return 0;
-    size_t w = rd16(m+4), h = rd16(m+6), ng = rd16(m+10), nw = rd16(m+12);
+    size_t w = rd16(m+4), h = rd16(m+6);
+    size_t ng = rd16(m+10), nw = rd16(m+12), ne = rd16(m+14);
     if (w == 0 || h == 0) return 0;
     /* ASCII, then the table's narrow glyphs, all within the 256 slots a byte
-     * can name; the wide ones likewise */
-    if (ng < ASCII_N || ng > 256 || nw > 256) return 0;
+     * can name; the wide ones likewise; the emoji too (255 is the "none" index) */
+    if (ng < ASCII_N || ng > 256 || nw > 256 || ne > 255) return 0;
     /* the bitmaps: (n-FONT_HDR) / h / w is the number of cells the file has
      * room for, with no overflow -- checked before anything multiplies */
     if ((n - FONT_HDR) / h / w < ng + 2 * nw) return 0;
-    /* the codepoint tables, 4 bytes each, in what is left after the bitmaps */
+    /* the codepoint tables of the narrow and wide glyphs, 4 bytes each */
     if (4 * (ng - ASCII_N + nw) > n - FONT_HDR - w * h * (ng + 2 * nw)) return 0;
+    size_t rest = n - FONT_HDR - w * h * (ng + 2 * nw) - 4 * (ng - ASCII_N + nw);
+    /* the emoji: a codepoint (4 bytes) and a record of 45 bytes of palette and
+     * the w*h bytes of 4bpp pixels (two cells wide) each */
+    if (ne > rest / (49 + w * h)) return 0;
     /* a cell fits a tile at the widest depth, with the tile's padding (tile_fit) */
     return (TILE_BYTES - PUT_HDR) / h >= 3 + w * 4;
 }
@@ -676,11 +682,14 @@ static void font_commit(uint8_t *m, size_t len)
     if (font_data) munmap(font_data, font_len);
     font_data = m; font_len = len;
     cell_w = rd16(m+4); cell_h = rd16(m+6); baseline = rd16(m+8);
-    num_glyphs = rd16(m+10); num_wide = rd16(m+12);
+    num_glyphs = rd16(m+10); num_wide = rd16(m+12); num_emoji = rd16(m+14);
     ncp_tab    = m + FONT_HDR;
     wcp_tab    = ncp_tab + 4 * (size_t)(num_glyphs - ASCII_N);
     glyph_data = wcp_tab + 4 * (size_t)num_wide;
     wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
+    emoji_cps  = wide_data + (size_t)cell_w * 2 * cell_h * num_wide;
+    emoji_data = emoji_cps + 4 * (size_t)num_emoji;
+    emoji_rec  = 45 + ((size_t)cell_w * 2 * cell_h + 1) / 2;
 }
 
 /* The glyph lookups.  A character is drawn with the glyph of its codepoint in
@@ -704,51 +713,14 @@ int xterm_wide_slot(uint32_t cp)
     return -1;
 }
 
-/* emoji<k>.bfnt (see _font/mkemoji.c): optional.  If it is missing, or does
- * not match the font's cell size, every emoji draws as a placeholder box (see
- * draw_box) rather than killing the terminal.  It replaces the emoji in use
- * whatever happens, so with no good file there are no emoji at all. */
-#define EMOJI_HDR 12
-static const uint8_t *emoji_map;    /* the whole file, NULL = no emoji available */
-static size_t   emoji_len;
-static uint16_t emoji_count;
-static const uint8_t *emoji_cps;    /* the codepoints (u32) of the emoji */
-static const uint8_t *emoji_data;   /* their records, after the codepoints */
-static size_t   emoji_rec;          /* bytes per record: 45 palette + packed 4bpp pixels */
-
-static void emoji_load(const char *path)
-{
-    /* the emoji in use go whatever happens: a file that does not load leaves none,
-     * and nothing may still point into the mapping that is released here */
-    if (emoji_map) munmap((void *)emoji_map, emoji_len);
-    emoji_map = NULL; emoji_count = 0; emoji_cps = NULL; emoji_data = NULL;
-    size_t len;
-    uint8_t *m = map_file(path, &len);
-    if (!m) return;
-    if (len < EMOJI_HDR || m[0] != 'E' || m[1] != 'M' || m[2] != 'O' || m[3] != '3' ||
-        rd16(m+4) != cell_w || rd16(m+6) != cell_h) {
-        munmap(m, len);
-        return;
-    }
-    size_t rec = 45 + ((size_t)cell_w * 2 * cell_h + 1) / 2;
-    size_t count = rd16(m+8);
-    /* the codepoints and the records are all in the file */
-    if ((len - EMOJI_HDR) / (4 + rec) < count) {
-        munmap(m, len);
-        return;
-    }
-    emoji_map = m; emoji_len = len; emoji_count = (uint16_t)count;
-    emoji_cps  = m + EMOJI_HDR;
-    emoji_data = emoji_cps + 4 * count;
-    emoji_rec  = rec;
-}
-
-/* The emoji index of codepoint cp, the record of emoji<k>.bfnt that draws it,
- * or -1 if this font has no emoji for it. */
+/* The emoji index of codepoint cp, the record of the font's emoji section that
+ * draws it, or -1 if this font has no emoji for it.  A font without emoji (or
+ * whose emoji section did not load, which rejects the font) draws them as
+ * placeholder boxes (see draw_box). */
 int xterm_emoji_index(uint32_t cp)
 {
-    if (!emoji_map) return -1;
-    for (int i = 0; i < emoji_count; i++)
+    if (!font_data) return -1;
+    for (int i = 0; i < num_emoji; i++)
         if (rd32(emoji_cps + 4 * (size_t)i) == cp) return i;
     return -1;
 }
@@ -908,7 +880,7 @@ static void draw_box(int off, int w, uint32_t fg, uint8_t depth)
 
 static void draw_emoji(int k, int half, uint32_t fg, uint8_t depth)
 {
-    if (!emoji_map || k >= emoji_count) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
+    if (k >= num_emoji) { draw_box(half * cell_w, cell_w * 2, fg, depth); return; }
     const uint8_t *rec = emoji_data + (size_t)k * emoji_rec;
     const uint8_t *pix = rec + 45;
     int gw = cell_w * 2;
@@ -1191,21 +1163,20 @@ static int grid_fits(int cw, int ch, int win_w, int win_h)
 
 /* Make size k the one in use, if its font loads and its grid fits the grid
  * buffer in a win_w x win_h window.  Otherwise the size stays as it was, and 0 is
- * returned.  The emoji follow the font (no good file: they draw as boxes).  The
+ * returned.  The emoji are in the font, so they change size with it.  The
  * caller re-derives the grid from the window. */
 static int font_switch(int k, int win_w, int win_h)
 {
     if (k == font_size) return 0;
-    font_path[FONT_DIGIT] = emoji_path[EMOJI_DIGIT] = (char)('0' + k);
+    font_path[FONT_DIGIT] = (char)('0' + k);
     size_t len;
     uint8_t *m = font_open(font_path, &len);
     if (m && !grid_fits(rd16(m+4), rd16(m+6), win_w, win_h)) { munmap(m, len); m = NULL; }
     if (!m) {
-        font_path[FONT_DIGIT] = emoji_path[EMOJI_DIGIT] = (char)('0' + font_size);
+        font_path[FONT_DIGIT] = (char)('0' + font_size);
         return 0;
     }
     font_commit(m, len);
-    emoji_load(emoji_path);
     font_size = k;
     tile_fit();
     return 1;
@@ -1260,7 +1231,6 @@ int xterm_init(void)
     uint8_t *fm = font_open(font_path, &flen);
     if (!fm) die("could not load a BFN3 font: /etc/bfnt/font2 (make -C _font install)\n");
     font_commit(fm, flen);
-    emoji_load(emoji_path);
 
     /* Close-on-exec (SOCK_CLOEXEC has O_CLOEXEC's value): the shells and
      * programs we start must not inherit the connection.  They would keep

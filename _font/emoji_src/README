@@ -5,7 +5,7 @@ licensed under CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
 https://raw.githubusercontent.com/jdecked/twemoji/refs/heads/main/assets/72x72/<codepoint>.png
 
 These PNGs are build inputs only: mkemoji.c downsamples and palette-quantizes
-them into emoji0.bfnt .. emoji7.bfnt, which is a modified (derived) form of that artwork.
-Anything distributing emoji*.bfnt or binaries using it should carry this credit.
+them into the emoji of font0.bfnt .. font7.bfnt, which are a modified (derived) form of that artwork.
+Anything distributing font*.bfnt or binaries using it should carry this credit.
 
 Regenerate:  make -C _font install     (builds the fonts first; mkemoji reads the cell size of its size)

@@ -8,7 +8,7 @@ imagemagick   # or graphicsmagick-imagemagick-compat, to covert xwd's output to 
 # internal dependencies
 
 make -C ../xtmux              # binary for this testsuite to drive
-make -C ../../_font install   # /etc/bfnt/font0..font7 and emoji0..emoji7
+make -C ../../_font install   # /etc/bfnt/font0..font7
 
 The harnesses run on a 1000x780 screen, not 800x600: xtmux starts at the font size nearest 30
 lines on the screen, and 780/26 = 30 is the base size (13x26 cells), which the tests count in.
