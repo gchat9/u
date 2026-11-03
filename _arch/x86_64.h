@@ -136,6 +136,10 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
                             struct sockaddr *src_addr, int *addrlen)
     { _syscall6(45, sockfd, buf, len, flags, src_addr, addrlen); }
 
+static inline long clone(unsigned long flags, void *stack, int *ptid,
+                       int *ctid, unsigned long tls)
+    { _syscall5(56, flags, stack, ptid, ctid, tls); }
+
 /* recv does not exist as separate syscall here; express via recvfrom */
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
@@ -143,8 +147,14 @@ static inline int execve(const char *pathname,
                           char *const argv[], char *const envp[])
     { _syscall3(59, pathname, argv, envp); }
 
+static inline long wait4(int pid, int *status, int options, void *rusage)
+    { _syscall4(61, pid, status, options, rusage); }
+
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(79, buf, size); }
+
+static inline long chdir(const char *path)
+    { _syscall1(80, path); }
 
 static inline long readlink(const char *pathname, char *buf, size_t bufsize)
     { _syscall3(89, pathname, buf, bufsize); }
@@ -152,14 +162,27 @@ static inline long readlink(const char *pathname, char *buf, size_t bufsize)
 static inline long sysinfo(struct sysinfo *buf)
     { _syscall1(99, buf); }
 
+static inline long getuid(void)
+    { _syscall0(102); }
+
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(137, path, buf); }
+
+static inline long getdents64(int fd, void *dirp, size_t count)
+    { _syscall3(217, fd, dirp, count); }
 
 static inline long clock_gettime(clockid_t clk_id, struct timespec *ts)
     { _syscall2(228, clk_id, ts); }
 
+static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
+    { _syscall4(267, dirfd, pathname, buf, bufsize); }
+
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(318, buf, buflen, flags); }
+
+static inline long statx(int dirfd, const char *pathname, int flags,
+                         unsigned int mask, struct statx *statxbuf)
+    { _syscall5(332, dirfd, pathname, flags, mask, statxbuf); }
 
 #ifdef EXPORT__START
 // prototype for main

@@ -75,6 +75,36 @@ typedef uint32_t clock_t;     /* Used for system times in
     typedef uint16_t uid_t;
 #endif
 
+///// directories and stat
+
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+
+struct statx_timestamp {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    int32_t  __reserved;
+};
+
+/* Linux statx(2) result layout: identical on every supported architecture. */
+struct statx {
+    uint32_t stx_mask, stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink, stx_uid, stx_gid;
+    uint16_t stx_mode, __spare0;
+    uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
+    struct statx_timestamp stx_atime, stx_btime, stx_ctime, stx_mtime;
+    uint32_t stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+    uint64_t __spare2[14];
+};
+
+#define STATX_BASIC_STATS 0x000007ffU
+
 ///// poll
 
 struct pollfd {

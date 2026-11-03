@@ -1,3 +1,9 @@
+/* open(2) flags whose asm-generic values differ from the x86 ones in _sys/_.h */
+#undef  O_DIRECTORY
+#define O_DIRECTORY 040000
+#undef  O_NOFOLLOW
+#define O_NOFOLLOW  0100000
+
 ////////////// macros
 
 #define _sa0(n)                 register long x8 asm("x8") = (long)(n);
@@ -58,8 +64,14 @@
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(17, buf, size); }
 
+static inline int ioctl(int fd, unsigned long request, void *arg)
+    { _syscall3(29, fd, request, arg); }
+
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(43, path, buf); }
+
+static inline long chdir(const char *path)
+    { _syscall1(49, path); }
 
 static inline long openat(int dirfd, const char *pathname, int flags, int mode)
     { _syscall4(56, dirfd, pathname, flags, mode); }
@@ -69,6 +81,9 @@ static inline long openat(int dirfd, const char *pathname, int flags, int mode)
 
 static inline long close(int fd)
     { _syscall1(57, fd); }
+
+static inline long getdents64(int fd, void *dirp, size_t count)
+    { _syscall3(61, fd, dirp, count); }
 
 static inline long lseek(int fd, long offset, int whence)
     { _syscall3(62, fd, offset, whence); }
@@ -98,6 +113,9 @@ poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
 static inline long readlink(const char *pathname, char *buf, size_t bufsize)
     { _syscall2(78, pathname, buf); }
 
+static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
+    { _syscall4(78, dirfd, pathname, buf, bufsize); }
+
 static inline void exit(int code) {
     _sa1(93, code);
     asm volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
@@ -116,6 +134,9 @@ static inline long rt_sigaction(int sig, const struct sigaction *act,
 
 static inline long getpid(void)
     { _syscall0(172); }
+
+static inline long getuid(void)
+    { _syscall0(174); }
 
 static inline long sysinfo(struct sysinfo *buf)
     { _syscall1(179, buf); }
@@ -144,6 +165,10 @@ static inline long mremap_raw(void *old_address, size_t old_size,
                               size_t new_size, int flags)
     { _syscall4(216, old_address, old_size, new_size, flags); }
 
+static inline long clone(unsigned long flags, void *stack, int *ptid,
+                       unsigned long tls, int *ctid)
+    { _syscall5(220, flags, stack, ptid, tls, ctid); }
+
 static inline void *mremap(void *old_address, size_t old_size,
                            size_t new_size, int flags)
     { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
@@ -156,12 +181,19 @@ static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
                             int fd, long offset)
     { _syscall6(222, addr, length, prot, flags, fd, offset); }
 
+static inline long wait4(int pid, int *status, int options, void *rusage)
+    { _syscall4(260, pid, status, options, rusage); }
+
 static inline void *mmap(void *addr, size_t length, int prot, int flags,
                          int fd, long offset)
     { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(278, buf, buflen, flags); }
+
+static inline long statx(int dirfd, const char *pathname, int flags,
+                         unsigned int mask, struct statx *statxbuf)
+    { _syscall5(291, dirfd, pathname, flags, mask, statxbuf); }
 
 ////////////// main
 

@@ -473,6 +473,14 @@ static int cp_width(uint32_t ch)
     return (ch >= 0x1100 && (emoji_wide(ch) || cjk_wide(ch))) ? 2 : 1;
 }
 
+/* DEC special graphics, 0x60..0x7e, as Unicode. */
+static const uint16_t dec_graphics[31] = {
+    0x25c6, 0x2592, 0x2409, 0x240c, 0x240d, 0x240a, 0x00b0, 0x00b1, 0x2424, 0x240b,
+    0x2518, 0x2510, 0x250c, 0x2514, 0x253c, 0x23ba, 0x23bb, 0x2500, 0x23bc, 0x23bd,
+    0x251c, 0x2524, 0x2534, 0x252c, 0x2502, 0x2264, 0x2265, 0x03c0, 0x2260, 0x00a3,
+    0x00b7
+};
+
 static void put_char(VTParser *p, uint32_t ch)
 {
     Screen *s = &p->scr;
@@ -1058,7 +1066,8 @@ static void dispatch_esc(VTParser *p, char final)
     case 'M': /* RI – reverse index */
         do_ri(s);
         break;
-    case 'c': /* RIS – full reset */
+    case 'c': /* RIS – full reset (and back to ASCII) */
+        p->g0_dec = false;
         scr_free(s);
         scr_init(s, s->rows, s->cols, true);
         tabs_reset(p);
@@ -1596,6 +1605,7 @@ typedef struct __attribute__((packed)) {
     int32_t  utf8_want;
     uint8_t  tabstops[VT_MAX_COLS / 8 + 1];
     uint8_t  cpr_requested;
+    uint8_t  g0_dec, esc_inter;   /* the character set, and an escape in progress */
 } VTWire;
 
 typedef struct __attribute__((packed)) {
@@ -1630,6 +1640,8 @@ int vt_serialize(const VTParser *p, int fd)
     vw.utf8_len   = (int32_t)p->utf8_len;
     vw.utf8_want  = (int32_t)p->utf8_want;
     vw.cpr_requested = p->cpr_requested ? 1 : 0;
+    vw.g0_dec     = p->g0_dec ? 1 : 0;
+    vw.esc_inter  = p->esc_inter;
     for (int i = 0; i < VT_MAX_PARAMS; i++) vw.params[i] = (int32_t)p->params[i];
     memcpy(vw.inter,    p->inter,    VT_MAX_INTER);
     memcpy(vw.utf8_buf, p->utf8_buf, 4);
@@ -1721,6 +1733,8 @@ int vt_deserialize(VTParser *p, int fd)
     p->utf8_len      = (int)vw.utf8_len;
     p->utf8_want     = (int)vw.utf8_want;
     p->cpr_requested = vw.cpr_requested;
+    p->g0_dec        = vw.g0_dec != 0;
+    p->esc_inter     = vw.esc_inter;
     for (int i = 0; i < VT_MAX_PARAMS; i++) p->params[i] = (int)vw.params[i];
     memcpy(p->inter,    vw.inter,    VT_MAX_INTER);
     memcpy(p->utf8_buf, vw.utf8_buf, 4);
@@ -1821,7 +1835,10 @@ void vt_feed(VTParser *p, const uint8_t *data, size_t len)
             } else {
                 uint32_t cp;
                 int r = utf8_feed(p, c, &cp);
-                if (r == 1)  put_char(p, cp);
+                if (r == 1) {
+                    if (p->g0_dec && cp >= 0x60 && cp <= 0x7e) cp = dec_graphics[cp - 0x60];
+                    put_char(p, cp);
+                }
                 /* r == 0: partial multibyte, state held in p->utf8_* */
                 /* r == -1: invalid byte, skip */
             }
@@ -1841,6 +1858,7 @@ void vt_feed(VTParser *p, const uint8_t *data, size_t len)
                 p->state = ST_DCS;
             } else if (c >= 0x20 && c <= 0x2F) {
                 /* ESC intermediate byte (e.g. charset: ESC ( B) */
+                p->esc_inter = c;
                 p->state = ST_ESC_INTER;
             } else if (c >= 0x30 && c <= 0x7E) {
                 dispatch_esc(p, (char)c);
@@ -1853,8 +1871,11 @@ void vt_feed(VTParser *p, const uint8_t *data, size_t len)
         /* ---- ESC + intermediate byte(s) ---- */
         case ST_ESC_INTER:
             /* Consume exactly one final byte and return to ground */
-            if (c >= 0x30 && c <= 0x7E)
+            if (c >= 0x30 && c <= 0x7E) {
+                if (p->esc_inter == '(' && (c == '0' || c == 'B'))
+                    p->g0_dec = (c == '0');
                 p->state = ST_GROUND;
+            }
             /* else stay: accumulate more intermediates (rare) */
             break;
 

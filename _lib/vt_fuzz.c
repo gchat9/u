@@ -2,6 +2,7 @@
  * vt_fuzz.c -- drives vt_feed() with the traffic a hostile server can send, for
  * vt_test.py (built with ASan/UBSan).  Usage:
  *   vt_fuzz repro            the screen shrink that left the saved cursor out of range
+ *   vt_fuzz dec              DEC special graphics (ESC ( 0) and its reset (ESC ( B, RIS)
  *   vt_fuzz SEED ITERATIONS  random escape-heavy traffic, split at random points,
  *                            with resizes; exit status 0 if nothing went wrong
  */
@@ -68,9 +69,26 @@ static int fuzz(unsigned seed, long iters) {
     return 0;
 }
 
+/* DEC special graphics: ESC ( 0 maps the line drawing letters, ESC ( B and a
+ * full reset (RIS) take the characters back to ASCII. */
+static int dec(void) {
+    VTParser *p = calloc(1, sizeof *p);
+    vt_init(p, 4, 20);
+    const char *a = "\x1b(0lqqk\x1b(Bxq";
+    vt_feed(p, (const uint8_t *)a, strlen(a));
+    printf("dec: %u %u %u %u %u %u", p->scr.cells[0][0].ch, p->scr.cells[0][1].ch,
+           p->scr.cells[0][2].ch, p->scr.cells[0][3].ch, p->scr.cells[0][4].ch, p->scr.cells[0][5].ch);
+    const char *b = "\x1b(0q\x1b" "cq";
+    vt_feed(p, (const uint8_t *)b, strlen(b));
+    printf(" ris: %u\n", p->scr.cells[0][0].ch);
+    vt_free(p); free(p);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "repro")) return repro();
+    if (argc == 2 && !strcmp(argv[1], "dec")) return dec();
     if (argc == 3) return fuzz((unsigned)atoi(argv[1]), atol(argv[2]));
-    fprintf(stderr, "usage: vt_fuzz repro | vt_fuzz SEED ITERATIONS\n");
+    fprintf(stderr, "usage: vt_fuzz repro | dec | vt_fuzz SEED ITERATIONS\n");
     return 2;
 }

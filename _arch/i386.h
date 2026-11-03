@@ -77,6 +77,9 @@ static inline long close(int fd)
 static inline int execve(const char *pathname, char *const argv[], char *const envp[])
     { _syscall3(11, pathname, argv, envp); }
 
+static inline long chdir(const char *path)
+    { _syscall1(12, path); }
+
 static inline long lseek(int fd, long offset, int whence)
     { _syscall3(19, fd, offset, whence); }
 
@@ -101,8 +104,15 @@ static inline long munmap(void *addr, size_t length)
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(99, path, buf); }
 
+static inline long wait4(int pid, int *status, int options, void *rusage)
+    { _syscall4(114, pid, status, options, rusage); }
+
 static inline long sysinfo(struct sysinfo *buf)
     { _syscall1(116, buf); }
+
+static inline long clone(unsigned long flags, void *stack, int *ptid,
+                       unsigned long tls, int *ctid)
+    { _syscall5(120, flags, stack, ptid, tls, ctid); }
 
 static inline long nanosleep(const struct timespec *request,
                                        struct timespec *remain)
@@ -131,12 +141,21 @@ static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
                             int fd, long offset)
     { _syscall6(192, addr, length, prot, flags, fd, offset); }
 
+static inline long getuid(void)
+    { _syscall0(199); }
+
+static inline long getdents64(int fd, void *dirp, size_t count)
+    { _syscall3(220, fd, dirp, count); }
+
 static inline void *mmap(void *addr, size_t length, int prot, int flags,
                          int fd, long offset)
     { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
 
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(265, clk_id, tp); }
+
+static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
+    { _syscall4(305, dirfd, pathname, buf, bufsize); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(355, buf, buflen, flags); }
@@ -156,6 +175,10 @@ static inline long sendto(int sockfd,
 static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
                             struct sockaddr *src_addr, int *addrlen)
     { _syscall6(371, sockfd, buf, len, flags, src_addr, addrlen); }
+
+static inline long statx(int dirfd, const char *pathname, int flags,
+                         unsigned int mask, struct statx *statxbuf)
+    { _syscall5(383, dirfd, pathname, flags, mask, statxbuf); }
 
 /* No dedicated recv syscall on x86-32; recvfrom with NULL addr/addrlen. */
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)

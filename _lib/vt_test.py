@@ -26,6 +26,8 @@ def check(name, args, want_out):
         and "AddressSanitizer" not in p.stderr
     ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
     print("  %s %s" % ("PASS" if good else "FAIL", name) + ("" if good else "\n" + (p.stdout + p.stderr)[-800:]))
+print("## DEC special graphics (line drawing) and its reset")
+check("ESC ( 0 maps lines, ESC ( B and RIS restore ASCII", ["dec"], "dec: 9484 9472 9472 9488 120 113 ris: 113")
 print("## saved cursor after a screen shrink")
 check("restore after shrink stays on screen", ["repro"], "inside the 16-row screen: yes")
 print("## random escape-heavy traffic with resizes")

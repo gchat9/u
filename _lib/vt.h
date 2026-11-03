@@ -161,6 +161,12 @@ typedef struct {
      * 0 until something has been printed. */
     uint32_t last_graphic;
 
+    /* Character set: ESC ( 0 selects DEC special graphics for G0 (the line
+     * drawing characters), ESC ( B selects ASCII again. esc_inter is the first
+     * intermediate byte of the escape being read. */
+    bool     g0_dec;
+    uint8_t  esc_inter;
+
     /* The virtual screen */
     Screen   scr;
 } VTParser;
