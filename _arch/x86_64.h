@@ -174,6 +174,9 @@ static inline long getdents64(int fd, void *dirp, size_t count)
 static inline long clock_gettime(clockid_t clk_id, struct timespec *ts)
     { _syscall2(228, clk_id, ts); }
 
+static inline long unlinkat(int dirfd, const char *pathname, int flags)
+    { _syscall3(263, dirfd, pathname, flags); }
+
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(267, dirfd, pathname, buf, bufsize); }
 

@@ -154,6 +154,9 @@ static inline void *mmap(void *addr, size_t length, int prot, int flags,
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(265, clk_id, tp); }
 
+static inline long unlinkat(int dirfd, const char *pathname, int flags)
+    { _syscall3(301, dirfd, pathname, flags); }
+
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(305, dirfd, pathname, buf, bufsize); }
 

@@ -175,6 +175,9 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
          struct sockaddr *src_addr, int *addrlen)
     { _syscall6(292, sockfd, buf, len, flags, src_addr, addrlen); }
 
+static inline long unlinkat(int dirfd, const char *pathname, int flags)
+    { _syscall3(328, dirfd, pathname, flags); }
+
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(332, dirfd, pathname, buf, bufsize); }
 

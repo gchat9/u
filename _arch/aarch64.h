@@ -64,8 +64,16 @@
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(17, buf, size); }
 
+/* dup2 does not exist on aarch64/riscv64; dup3 with no flags, which
+ * differs from dup2 only when oldfd == newfd (not used here).  */
+static inline long dup2(int oldfd, int newfd)
+    { _syscall3(24, oldfd, newfd, 0); }
+
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(29, fd, request, arg); }
+
+static inline long unlinkat(int dirfd, const char *pathname, int flags)
+    { _syscall3(35, dirfd, pathname, flags); }
 
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(43, path, buf); }
@@ -131,6 +139,9 @@ static inline long clock_gettime(int clk_id, struct timespec *tp)
 static inline long rt_sigaction(int sig, const struct sigaction *act,
                                 struct sigaction *oact, size_t sigsetsize)
     { _syscall4(134, sig, act, oact, sigsetsize); }
+
+static inline pid_t setsid(void)
+    { _syscall0(157); }
 
 static inline long getpid(void)
     { _syscall0(172); }
