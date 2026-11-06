@@ -3,6 +3,11 @@
 //can't include sys/types.h - this redefines timespec
 //#include <sys/types.h>
 #include "types.h"
+#include "errno.h"
+#include "signal.h"
+#include "poll.h"
+#include "stat.h"
+#include "termios.h"
 
 /* The architecture syscall prototypes only need this forward declaration. */
 struct sockaddr;
@@ -25,6 +30,16 @@ struct sockaddr;
 #define O_SYNC          (O_DSYNC|04000000)
 #define O_PATH          010000000
 #define O_TMPFILE       020000000
+
+#define AT_FDCWD            -100
+#define AT_REMOVEDIR        0x200   /* unlinkat: remove a directory */
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_EMPTY_PATH       0x1000  /* statx: the file is the descriptor given */
+
+// unistd.h - lseek()
+#define SEEK_SET            0
+#define SEEK_CUR            1
+#define SEEK_END            2
 
 #define GRND_NONBLOCK       0x0001
 

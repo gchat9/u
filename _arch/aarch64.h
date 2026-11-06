@@ -99,6 +99,9 @@ static inline long openat(int dirfd, const char *pathname, int flags, int mode)
 static inline long close(int fd)
     { _syscall1(57, fd); }
 
+static inline long pipe2(int pipefd[2], int flags)
+    { _syscall2(59, pipefd, flags); }
+
 static inline long getdents64(int fd, void *dirp, size_t count)
     { _syscall3(61, fd, dirp, count); }
 

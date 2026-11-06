@@ -189,6 +189,9 @@ static inline long symlinkat(const char *target, int newdirfd, const char *linkp
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(267, dirfd, pathname, buf, bufsize); }
 
+static inline long pipe2(int pipefd[2], int flags)
+    { _syscall2(293, pipefd, flags); }
+
 static inline long renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
     { _syscall5(316, olddirfd, oldpath, newdirfd, newpath, flags); }
 

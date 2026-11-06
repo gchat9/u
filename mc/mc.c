@@ -20,8 +20,16 @@
  *     Enter            a directory or "..": go into it; an executable file:
  *                      run it, and show the panels again when it exits.
  *                      With something on the command line: run that with
- *                      $SHELL -c instead.
- *     F3, ESC 3        mcview on the highlighted file (or enter a directory)
+ *                      $SHELL -c instead. An archive (.zip, .tar, .tgz,
+ *                      .tar.gz, .txz, .tar.xz, .tar.zst, .tar.zstd) is entered
+ *                      as a directory, with a title such as archive.zip/utar://
+ *                      or archive.zip/uzip://; in it, ".." goes up, and at its
+ *                      top, out of the archive. A file in an archive is only
+ *                      read out, see vfs_view(): a copy of it is made under
+ *                      TMPDIR, for copying or for mcview, and removed after.
+ *     F3, ESC 3        mcview on the highlighted file (or enter a directory).
+ *                      In an archive, on a copy of the file, made under TMPDIR
+ *                      for mcview and removed when it exits.
  *     F5, ESC 5        copy the marked items, or else the highlighted one.
  *                      A question asks for the destination, which starts as the
  *                      other panel's directory; a directory there takes the items
@@ -30,17 +38,22 @@
  *                      is asked about: Yes, No, Append, or All, Older, None,
  *                      Smaller, Size differs for the rest of the job. A progress
  *                      box follows; Esc (or A) stops the copy, and removes what
- *                      was being written.
+ *                      was being written. From an archive, the items are read
+ *                      out in one pass over it, into a directory under TMPDIR,
+ *                      and copied from there. An archive is read-only: a copy
+ *                      into one is refused.
  *     F6, ESC 6        move (rename) the same way. Across file systems, a copy
- *                      and then the removal of the source.
+ *                      and then the removal of the source. Refused in an archive.
  *     F8, ESC 8        delete the marked items, or else the highlighted one, after
  *                      asking. A non-empty directory is asked about again, once
  *                      for each directory of the selection: Yes, No, All (the
- *                      rest), None (the rest), or Abort.
+ *                      rest), None (the rest), or Abort. Refused in an archive.
  *     Insert           mark the highlighted item (or unmark it), and move down;
  *     Shift+Down/Up    the same, Shift+Up moving up. ".." is never marked.
  *     Ctrl+R           read the active panel's directory again
  *     Alt+C            quick cd: type a directory, Enter changes to it
+ *     Alt+Enter        the highlighted name goes on the command line, at the
+ *                      cursor, quoted for the shell, and a space after it
  *     Left/Right, Ctrl+Left/Right, Alt+Backspace, Backspace, Delete
  *                      edit the command line, and the quick cd box
  *     ESC 0, F10       exit (in the panels)
@@ -66,8 +79,7 @@
  *
  * ESC and a following key count as one key if the key comes within a second.
  *
- * Build with DIR_BOLD=1 (make DIR_BOLD=1, after make clean) to draw
- * directories in bold white; by default they are bright white, not bold.
+ * The sizes, the colours and the file classes are in config.h.
  *
  * Every frame is repainted in full. The terminal size is re-read when
  * SIGWINCH interrupts the wait for a key, so a resize repaints at once.
@@ -75,62 +87,11 @@
 #include "../_sys/_main.h"
 #include "../_lib/width.h"
 
-#define MAXE   4096          /* entries per directory; extras are dropped */
-#define NPOOL  131072        /* bytes of names per panel; extras are dropped */
-#define MAXW   1024          /* widest terminal we draw */
-#define TZMAX  8192          /* room for /etc/localtime */
-#define EINTR  4             /* interrupted system call */
-#define EIO    5             /* input/output error */
-#define EEXIST 17            /* file exists */
-#define EXDEV  18            /* rename across file systems */
-#define EINVAL 22            /* invalid argument */
-#define ENOTDIR 20           /* not a directory */
-#define ECANCELED 125        /* a copy stopped by Esc */
 #define ESAME 1000           /* not an errno: source and destination are one file */
 #define ESUB 1002            /* not an errno: a directory into itself */
-#define ENOENT 2             /* no such file or directory */
-#define ENOTEMPTY 39         /* directory not empty */
-#define ENAMETOOLONG 36      /* file name too long */
-#define AT_REMOVEDIR 0x200   /* unlinkat: remove a directory */
-#define SIGINT 2
-#define SIGQUIT 3
-#define SIGCHLD 17
-#define POLLIN 1
-#define SIGWINCH 28          /* terminal size changed */
-#define SA_RESTORER 0x04000000UL
-#define AT_FDCWD   -100
 
-/* Kernel termios ABI (generic layout: x86, arm, aarch64, riscv). */
-struct ktermios {
-    uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
-    uint8_t  c_line;
-    uint8_t  c_cc[19];
-};
-struct winsz { uint16_t row, col, xpix, ypix; };
 
-#define TCGETS      0x5401
-#define TCSETS      0x5402
-#define TIOCGWINSZ  0x5413
-#define TIOCSWINSZ  0x5414
-#define TIOCSCTTY   0x540e
-#define TIOCGPTN    0x80045430
-#define TIOCGPGRP   0x540f
-#define TIOCSPTLCK  0x40045431
-#define OPOST       0x00000001
-#define IXON        0x00000400
-#define ICRNL       0x00000100
-#define ISIG        0x00000001
-#define ICANON      0x00000002
-#define ECHO        0x00000008
-#define IEXTEN      0x00008000
-#define VTIME       5
-#define VMIN        6
 
-#define S_IFMT      0170000
-#define S_IFDIR     0040000
-#define S_IFREG     0100000
-#define S_IFLNK     0120000
-#define AT_SYMLINK_NOFOLLOW 0x100
 
 /* Cell attributes: bits 0-2 fg, 3-5 bg, 6 bold, 7 DEC line drawing,
  * 8 terminal default colours. */
@@ -138,89 +99,11 @@ struct winsz { uint16_t row, col, xpix, ypix; };
 #define DEC   0x080
 #define DEFA  0x100
 #define BRIGHT 0x200         /* bright foreground colour (SGR 9x) */
-#define BLACK   0
-#define RED     1
-#define GREEN   2
-#define BROWN   3            /* "brown" in mc's skin: plain yellow */
-#define BLUE    4
-#define MAGENTA 5
-#define CYAN    6
-#define WHITE   7            /* "lightgray" in mc's skin: plain white */
+#include "config.h"
 
-#define C_FRAME  ATTR(WHITE, BLUE, 0)
-#define C_TITLE  ATTR(BLACK, WHITE, 0)
-#define C_HEAD   ATTR(BROWN, BLUE, 1)
-#define C_CURSOR ATTR(BLACK, CYAN, 0)
-#define C_SEL    ATTR(BROWN, BLUE, 1)   /* a marked item */
-#define C_SELCUR ATTR(BROWN, CYAN, 1)   /* a marked item under the cursor */
-#define C_INFO   ATTR(WHITE, BLUE, 0)
-#define C_FREE   ATTR(WHITE, BLUE, 0)
-
-/* Directories: bold white with -DDIR_BOLD, otherwise bright white, not bold. */
-#ifdef DIR_BOLD
-#define C_DIR    ATTR(WHITE, BLUE, 1)
-#else
-#define C_DIR    (ATTR(WHITE, BLUE, 0) | BRIGHT)
-#endif
-
-/* Dialogs, as mc draws them: the quick cd input and the red error box. */
-#define C_QCD     ATTR(BLACK, WHITE, 0)
-#define C_HIST    ATTR(WHITE, BLUE, 0)    /* the [^] history button */
-#define C_SHADE   ATTR(BLACK, BLACK, 1)   /* dialog shadow, keeps the character */
-#define C_QTITLE  ATTR(BLUE, WHITE, 0)
-#define C_FIELD   ATTR(BLACK, CYAN, 0)
-#define C_ERR     ATTR(WHITE, RED, 1)
-#define C_ERRHEAD ATTR(BROWN, RED, 1)
-#define C_QHOT   ATTR(BLUE, WHITE, 1)   /* a hotkey letter, white dialog */
-
-/* Every dialog has a margin of DIALOG_PAD cells, in the dialog's own background,
- * all round its frame; the frame sits inside it, as in mc. Set DIALOG_PAD to 0
- * (-DDIALOG_PAD=0) for frames flush with the edge of the box. */
-#ifndef DIALOG_PAD
-#define DIALOG_PAD 1
-#endif
 #define ERR_H  (7 + 2 * DIALOG_PAD)  /* rows of the error box */
 #define QCD_H  (3 + 2 * DIALOG_PAD)  /* rows of the quick cd box */
 #define OPFW   (opw - 2 * DIALOG_PAD) /* width of a copy, move or question box's frame */
-#define C_QHOTSEL ATTR(BLUE, CYAN, 1)   /* a hotkey letter, on the focused button */
-
-/* File classes, in the order mc's filehighlight.ini tests them. */
-enum { CL_NORMAL, CL_DIR, CL_EXE, CL_CORE, CL_TEMP, CL_ARCHIVE, CL_DOC,
-       CL_SOURCE, CL_MEDIA, CL_GRAPH, CL_DATABASE, CL_STALE };
-
-/* Colours from the [filehighlight] section of mc's default skin. */
-static const uint16_t cl_attr[] = {
-    ATTR(WHITE,   BLUE, 0),   /* normal: lightgray   */
-    C_DIR,                    /* directory           */
-    ATTR(GREEN,   BLUE, 1),   /* executable: brightgreen */
-    ATTR(RED,     BLUE, 0),   /* core: red           */
-    ATTR(BLACK,   BLUE, 1),   /* temp: gray          */
-    ATTR(MAGENTA, BLUE, 1),   /* archive: brightmagenta */
-    ATTR(BROWN,   BLUE, 0),   /* doc: brown          */
-    ATTR(CYAN,    BLUE, 0),   /* source: cyan        */
-    ATTR(GREEN,   BLUE, 0),   /* media: green        */
-    ATTR(CYAN,    BLUE, 1),   /* graph: brightcyan   */
-    ATTR(RED,     BLUE, 1),   /* database: brightred */
-    ATTR(RED,     BLUE, 1),   /* stalelink: brightred */
-};
-
-/* Extension lists, copied from mc's filehighlight.ini. */
-static const struct { const char *ext; uint8_t cls; } cl_ext[] = {
-    { "7z;Z;ace;apk;arc;arj;ark;bz2;cab;cpio;deb;gz;lha;lz;lz4;lzh;lzma;rar;rpm;"
-      "tar;tbz;tbz2;tgz;tlz;txz;tzst;vsix;xz;zip;zoo;zst", CL_ARCHIVE },
-    { "chm;css;ctl;diz;doc;docm;docx;dtd;fodg;fodp;fods;fodt;htm;html;json;letter;"
-      "lsm;mail;man;markdown;md;me;mkd;msg;nroff;odg;odp;ods;odt;pdf;po;ppt;pptm;"
-      "pptx;ps;rtf;sgml;shtml;tex;text;txt;xls;xlsm;xlsx;xml;xsd;xslt", CL_DOC },
-    { "ada;asm;awk;bash;c;c++;caml;cc;cgi;cpp;cxx;diff;erl;go;h;h++;hh;hi;hpp;hs;"
-      "inc;jasm;jav;java;js;m4;mak;mjs;ml;mli;mll;mlp;mly;pas;patch;php;phps;pl;pm;"
-      "prg;py;rb;s;sas;sh;sl;st;swift;tcl;tk;tsx;xq", CL_SOURCE },
-    { "3gp;aac;ac3;ape;asf;avi;dts;flac;flv;it;m3u;m4a;m4v;med;mid;midi;mkv;mod;"
-      "mol;mov;mp2;mp3;mp4;mpeg;mpg;mpl;ogg;ogv;opus;s3m;ts;umx;vob;wav;webm;wma;"
-      "wmv;xm", CL_MEDIA },
-    { "ai;avif;bmp;cdr;eps;gif;ico;jp2;jpeg;jpg;jxl;heic;heif;omf;pcx;pic;png;psb;"
-      "psd;rle;svg;tif;tiff;webp;wmf;xbm;xcf;xpm", CL_GRAPH },
-    { "cdx;dat;db;dbf;dbi;dbx;fox;mdb;mdn;mdx;msql;mssql;pgsql;sql;ssql", CL_DATABASE },
-};
 
 /* A size, in 32 bits: a 30-bit significand and a 2-bit unit (0 bytes, 1 KiB,
  * 1 MiB, 1 GiB).  Exact below 1 GiB; above, to the unit, saturating at 1 EiB.
@@ -268,8 +151,18 @@ static char ent_mark(const struct ent *e)
     return e->cls == CL_DIR ? '/' : e->cls == CL_EXE ? '*' : ' ';
 }
 
+struct archive;
+static long join(char *dst, size_t max, const char *dir, const char *name);
+
+/* The kinds of archive, by their names (archive_kind). */
+enum { AR_NONE, AR_ZIP, AR_TAR, AR_GZ, AR_XZ, AR_ZST };
+static int archive_kind(const char *name);
+
 struct panel {
-    char     path[4096];
+    char     path[4096];         /* the directory; inside an archive, the one holding it */
+    char     arc[256];           /* the archive shown as a directory, "" if none */
+    char     sub[256];           /* the directory inside the archive: "a/b/", "" at its root */
+    struct archive *ar;          /* the archive's index, while arc is set */
     int      n, cur, top;        /* entries shown, cursor, first visible entry */
     int      ne;                 /* entries read, including e[0] = ".." */
     uint64_t free_kb, total_kb;  /* filesystem usage in KiB, 0 if unknown */
@@ -636,6 +529,20 @@ static int disp_path(char *out, int max, const char *path)
     return n;
 }
 
+/* The path at the top of a panel, as drawn. In an archive it is the archive's name
+ * and the directory inside it, as mc's uzip shows: "archive.zip/uzip://a/b". */
+static int panel_title(char *out, int max, const struct panel *p)
+{
+    if (!p->arc[0]) return disp_path(out, max, p->path);
+    strlcpy(out, p->arc, (size_t)max);
+    strlcat(out, archive_kind(p->arc) == AR_ZIP ? "/uzip://" : "/utar://", (size_t)max);
+    if (p->sub[0]) {
+        strlcat(out, p->sub, (size_t)max);
+        out[strlen(out) - 1] = 0;               /* no trailing / */
+    }
+    return (int)strlen(out);
+}
+
 /* Names compare by the part before the first dot, then the part after it,
  * bytewise. Equivalent to sorting the first dot below every other character,
  * which is what mc's filename collation does (measured against mc 4.8). */
@@ -726,19 +633,1471 @@ static int add_name(struct panel *p, const char *name)
     return off;
 }
 
-static void load(struct panel *p)
+/* ------------------------------------------------------------------ archives
+ *
+ * An archive that is entered as a directory (see enter_item) is read once, into an
+ * index of every entry in it: its name, size, date and kind. The directory shown is
+ * listed from the index. The index is kept while the archive file is the one it was
+ * read from (archive_fresh), so going in and out of directories reads nothing again.
+ *
+ * The kinds read: .zip from its central directory; .tar from the file itself; .tgz,
+ * .tar.gz, .txz, .tar.xz, .tar.zst and .tar.zstd from the output of gzip, xz or zstd
+ * (-dc) through a pipe. A compressed tar has no table of contents, so its headers are
+ * read in one pass over the stream, and the data of each entry is skipped. Nothing is
+ * written to disk.
+ *
+ * A file of an archive is written out only to be shown (F3) or copied (F5): into a
+ * directory of its own under TMPDIR, which is removed afterwards. Nothing is ever
+ * written into an archive, which is read-only. */
+
+/* The kinds of entry, in an index. */
+enum { AE_FILE, AE_DIR, AE_LINK, AE_HARD };
+
+/* One entry of an archive, in its index. */
+struct aent {
+    uint32_t name;                      /* offset of its name in the index's names */
+    uint32_t tgt;                       /* for a link: offset of its target, plus 1; else 0 */
+    uint32_t size;                      /* size_pack() */
+    uint32_t mtime;                     /* seconds since 1970 */
+    uint32_t kind;                      /* AE_* */
+};
+
+/* An archive as it was read: its index, and the file it was read from. */
+struct archive {
+    size_t      map;                    /* bytes mapped, for munmap */
+    uint64_t    size, ino;              /* the archive file, as it was read */
+    int64_t     mtime, mnsec;
+    uint32_t    n, nn;                  /* entries, and bytes of names, in use */
+    struct aent *e;
+    char        *nm;
+};
+
+/* A new, empty index. Its memory is anonymous, and it costs little until it fills. */
+static struct archive *archive_new(void)
 {
-    long buf[1024];                 /* 8 KiB, aligned for dirent64 records */
+    size_t hdr = (sizeof(struct archive) + 15) & ~(size_t)15;
+    size_t total = hdr + AR_MAXE * sizeof(struct aent) + AR_NPOOL;
+    uint8_t *m = mmap(0, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct archive *a;
+
+    if (m == MAP_FAILED) return NULL;
+    a = (struct archive *)m;
+    a->map = total;
+    a->e = (struct aent *)(m + hdr);
+    a->nm = (char *)(m + hdr + AR_MAXE * sizeof(struct aent));
+    return a;
+}
+
+static void archive_free(struct archive *a)
+{
+    if (a) munmap(a, a->map);
+}
+
+/* Leave the archive, if the panel is in one: its index is freed. */
+static void vfs_forget(struct panel *p)
+{
+    archive_free(p->ar);
+    p->ar = NULL;
+    p->arc[0] = 0;
+    p->sub[0] = 0;
+}
+
+/* The archive file of panel P, as a path. */
+static void archive_path(char *full, size_t max, const struct panel *p)
+{
+    strlcpy(full, p->path, max);
+    strlcat(full, "/", max);
+    strlcat(full, p->arc, max);
+}
+
+/* A member's name, as it is kept: leading "/" and "./" dropped, and a trailing "/"
+ * makes it a directory (*dir). Its length, without that "/", is *n. NULL if it cannot
+ * be kept: empty, or longer than 255 bytes. */
+static const char *norm_name(const char *name, size_t *n, int *dir)
+{
+    for (;;) {
+        if (name[0] == '/') name++;
+        else if (name[0] == '.' && name[1] == '/') name += 2;
+        else break;
+    }
+    *n = strlen(name);
+    *dir = 0;
+    if (*n && name[*n - 1] == '/') {
+        *dir = 1;
+        (*n)--;
+    }
+    return *n == 0 || *n > 255 ? NULL : name;
+}
+
+/* Add an entry to the index A. NAME is its path inside the archive (see norm_name).
+ * TARGET is a link's target, if it has one. -1 if the index is full. */
+static int archive_add(struct archive *a, const char *name, uint64_t size, uint64_t mtime,
+                       int kind, const char *target)
+{
+    size_t n, tn = 0, k;
+    int dir, withtgt = 0;
+    struct aent *e;
+
+    name = norm_name(name, &n, &dir);
+    if (!name) return 0;
+    if (dir) kind = AE_DIR;
+    if ((kind == AE_LINK || kind == AE_HARD) && target && strlen(target) <= 255) {
+        withtgt = 1;
+        tn = strlen(target);
+    }
+    if (a->n >= AR_MAXE || a->nn + n + 1 + (withtgt ? tn + 1 : 0) > AR_NPOOL) return -1;
+
+    for (k = 0; k < n; k++) a->nm[a->nn + k] = name[k];
+    a->nm[a->nn + n] = 0;
+    e = &a->e[a->n++];
+    e->name = a->nn;
+    e->tgt = 0;
+    a->nn += (uint32_t)n + 1;
+    if (withtgt) {
+        for (k = 0; k < tn; k++) a->nm[a->nn + k] = target[k];
+        a->nm[a->nn + tn] = 0;
+        e->tgt = a->nn + 1;
+        a->nn += (uint32_t)tn + 1;
+    }
+    e->size = size_pack(size);
+    e->mtime = (uint32_t)mtime;
+    e->kind = (uint32_t)kind;
+    return 0;
+}
+
+/* The entry NM of an archive, if it is inside the directory p->sub, is listed in the
+ * panel: as a file, a link or a directory, once however many entries are in it. */
+static void vfs_add(struct panel *p, const char *nm, uint32_t size, uint32_t mtime, int kind)
+{
+    size_t sl = strlen(p->sub), k, l;
+    const char *rest, *slash;
+    char c[256];
+    struct ent *e;
+    int at, isdir;
+
+    for (k = 0; k < sl; k++)
+        if (nm[k] != p->sub[k]) return;
+    rest = nm + sl;
+    if (!*rest) return;
+    slash = rest;
+    while (*slash && *slash != '/') slash++;
+    l = (size_t)(slash - rest);
+    if (l == 0 || l > 255) return;
+    for (k = 0; k < l; k++) c[k] = rest[k];
+    c[l] = 0;
+    if (!scmp(c, ".") || !scmp(c, "..")) return;
+    isdir = *slash == '/' || kind == AE_DIR;    /* more names follow it, or it is one itself */
+    if (isdir) {
+        for (int q = 1; q < p->ne; q++)
+            if (p->e[q].cls == CL_DIR && !scmp(p->nm + p->e[q].name, c)) return;
+    }
+    if (p->ne >= MAXE) return;
+    at = add_name(p, c);
+    if (at < 0) return;
+    e = &p->e[p->ne++];
+    e->name = (uint32_t)at;
+    e->up = 0;
+    e->sel = 0;
+    e->link = !isdir && kind == AE_LINK;
+    e->mtime = mtime;
+    if (isdir) {
+        e->cls = CL_DIR;
+        e->size = 0;
+    } else {
+        e->cls = classify(c, 0);
+        e->size = size;
+    }
+}
+
+/* Every entry of the archive is listed, as the directory p->sub of it. */
+static void archive_list(struct panel *p)
+{
+    const struct archive *a = p->ar;
+
+    for (uint32_t i = 0; a && i < a->n; i++)
+        vfs_add(p, a->nm + a->e[i].name, a->e[i].size, a->e[i].mtime, (int)a->e[i].kind);
+}
+
+/* The target of the link NAME, in the directory p->sub of the archive shown, into TG.
+ * 0 if there is none. */
+static int vfs_target(const struct panel *p, const char *name, char *tg, size_t max)
+{
+    const struct archive *a = p->ar;
+    char full[512];
+
+    if (!a) return 0;
+    strlcpy(full, p->sub, sizeof full);
+    strlcat(full, name, sizeof full);
+    for (uint32_t i = 0; i < a->n; i++) {
+        const struct aent *x = &a->e[i];
+
+        if (x->kind == AE_LINK && x->tgt && !scmp(a->nm + x->name, full)) {
+            strlcpy(tg, a->nm + x->tgt - 1, max);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The kind of archive NAME is, by its name, in any case: AR_NONE if it is not one. */
+static int archive_kind(const char *name)
+{
+    static const struct { const char *ext; uint8_t kind; } ar[] = {
+        { ".zip", AR_ZIP },
+        { ".tar", AR_TAR },
+        { ".tgz", AR_GZ },    { ".tar.gz", AR_GZ },
+        { ".txz", AR_XZ },    { ".tar.xz", AR_XZ },
+        { ".tar.zst", AR_ZST }, { ".tar.zstd", AR_ZST },
+    };
+    size_t n = strlen(name);
+
+    for (size_t i = 0; i < sizeof ar / sizeof ar[0]; i++) {
+        size_t l = strlen(ar[i].ext), k;
+
+        if (n <= l) continue;
+        for (k = 0; k < l && lc(name[n - l + k]) == ar[i].ext[k]; k++)
+            ;
+        if (k == l) return ar[i].kind;
+    }
+    return AR_NONE;
+}
+
+/* Read the input FD up to N bytes, unless it ends first: the number read. */
+static size_t read_full(long fd, void *buf, size_t n)
+{
+    size_t got = 0;
+
+    while (got < n) {
+        long r = read((int)fd, (char *)buf + got, n - got);
+
+        if (r == -EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    return got;
+}
+
+/* ---- inflate: the raw deflate stream (RFC 1951) of a zip member, written out in
+ * pieces. The last INF_WIN bytes written are kept, as a back reference may reach
+ * that far. */
+#define INF_WIN 32768u
+#define INF_OUT 65536u
+
+struct huff { uint16_t count[16]; uint16_t sym[288]; };
+
+struct infl {
+    const uint8_t *in;
+    size_t n, i;                /* the input, and the next byte of it */
+    uint32_t bb;                /* the byte being read: its bits not used yet */
+    int nb;                     /* how many of them are left */
+    uint8_t out[INF_OUT];
+    size_t pos;                 /* bytes of out in use */
+    uint64_t total;             /* bytes written so far, in all */
+    long err;                   /* a negative errno, once the stream is damaged */
+    long (*put)(void *, const uint8_t *, size_t);
+    void *arg;
+};
+
+static const uint16_t lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+static const uint8_t lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+static const uint16_t dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129,
+    193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+static const uint8_t dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+static const uint8_t clorder[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2,
+    14, 1, 15 };
+
+static void inf_put(struct infl *s, const uint8_t *p, size_t n)
+{
+    if (!s->err && n) {
+        long r = s->put(s->arg, p, n);
+
+        if (r < 0) s->err = r;
+    }
+}
+
+/* The next NEED bits of the input, the first one least significant. */
+static uint32_t inf_bits(struct infl *s, int need)
+{
+    uint32_t v = 0;
+
+    for (int k = 0; k < need; k++) {
+        if (!s->nb) {
+            if (s->i >= s->n) {
+                s->err = -EIO;
+                return 0;
+            }
+            s->bb = s->in[s->i++];
+            s->nb = 8;
+        }
+        v |= (s->bb & 1) << k;
+        s->bb >>= 1;
+        s->nb--;
+    }
+    return v;
+}
+
+/* Writes out all of the window but its last INF_WIN bytes, which stay. */
+static void inf_slide(struct infl *s)
+{
+    size_t keep = s->pos - INF_WIN, k;
+
+    inf_put(s, s->out, keep);
+    for (k = 0; k < INF_WIN; k++) s->out[k] = s->out[keep + k];
+    s->pos = INF_WIN;
+}
+
+static void inf_byte(struct infl *s, uint8_t c)
+{
+    if (s->pos == INF_OUT) inf_slide(s);
+    s->out[s->pos++] = c;
+    s->total++;
+}
+
+/* The canonical Huffman code of the N lengths in LEN, for decoding. */
+static void huff_build(struct huff *h, const uint8_t *len, int n)
+{
+    uint16_t offs[16];
+
+    for (int l = 0; l < 16; l++) h->count[l] = 0;
+    for (int i = 0; i < n; i++) h->count[len[i]]++;
+    h->count[0] = 0;
+    offs[1] = 0;
+    for (int l = 1; l < 15; l++) offs[l + 1] = offs[l] + h->count[l];
+    for (int i = 0; i < n; i++)
+        if (len[i]) h->sym[offs[len[i]]++] = (uint16_t)i;
+}
+
+/* One symbol of the code H, read bit by bit. */
+static int huff_decode(struct infl *s, const struct huff *h)
+{
+    int code = 0, first = 0, index = 0;
+
+    for (int len = 1; len < 16; len++) {
+        int count;
+
+        code |= (int)inf_bits(s, 1);
+        count = h->count[len];
+        if (code - count < first) return h->sym[index + (code - first)];
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    s->err = -EINVAL;
+    return 0;
+}
+
+static void inf_codes(struct infl *s, const struct huff *lc, const struct huff *dc)
+{
+    for (;;) {
+        int sym, len, d;
+        uint32_t dist;
+
+        sym = huff_decode(s, lc);
+        if (s->err) return;
+        if (sym < 256) {
+            inf_byte(s, (uint8_t)sym);
+            continue;
+        }
+        if (sym == 256) return;
+        sym -= 257;
+        if (sym >= 29) {
+            s->err = -EINVAL;
+            return;
+        }
+        len = lbase[sym] + (int)inf_bits(s, lext[sym]);
+        d = huff_decode(s, dc);
+        if (s->err) return;
+        if (d >= 30) {
+            s->err = -EINVAL;
+            return;
+        }
+        dist = dbase[d] + inf_bits(s, dext[d]);
+        if (s->err) return;
+        if (dist > s->total) {
+            s->err = -EINVAL;
+            return;
+        }
+        while (len--) inf_byte(s, s->out[s->pos - dist]);
+    }
+}
+
+/* A block stored as it is: its length is checked against its complement. */
+static void inf_stored(struct infl *s)
+{
+    uint32_t len, nlen;
+
+    s->nb = 0;                          /* the rest of the byte is not used */
+    if (s->i + 4 > s->n) {
+        s->err = -EIO;
+        return;
+    }
+    len = s->in[s->i] | s->in[s->i + 1] << 8;
+    nlen = s->in[s->i + 2] | s->in[s->i + 3] << 8;
+    s->i += 4;
+    if (len != (~nlen & 0xffffu)) {
+        s->err = -EINVAL;
+        return;
+    }
+    if (len > s->n - s->i) {
+        s->err = -EIO;
+        return;
+    }
+    while (len--) inf_byte(s, s->in[s->i++]);
+}
+
+/* A block with the fixed codes of the format. */
+static void inf_fixed(struct infl *s)
+{
+    uint8_t len[288 + 30];
+    struct huff lc, dc;
+    int i;
+
+    for (i = 0; i < 144; i++) len[i] = 8;
+    for (; i < 256; i++) len[i] = 9;
+    for (; i < 280; i++) len[i] = 7;
+    for (; i < 288; i++) len[i] = 8;
+    huff_build(&lc, len, 288);
+    for (i = 0; i < 30; i++) len[i] = 5;
+    huff_build(&dc, len, 30);
+    inf_codes(s, &lc, &dc);
+}
+
+/* A block with codes of its own, sent first. */
+static void inf_dynamic(struct infl *s)
+{
+    uint8_t len[320];
+    struct huff cl, lc, dc;
+    int nlen, ndist, ncode, index = 0;
+
+    nlen = (int)inf_bits(s, 5) + 257;
+    ndist = (int)inf_bits(s, 5) + 1;
+    ncode = (int)inf_bits(s, 4) + 4;
+    if (s->err) return;
+    if (nlen > 286 || ndist > 30) {
+        s->err = -EINVAL;
+        return;
+    }
+    for (int i = 0; i < 19; i++) len[i] = 0;
+    for (int i = 0; i < ncode; i++) len[clorder[i]] = (uint8_t)inf_bits(s, 3);
+    huff_build(&cl, len, 19);
+    while (index < nlen + ndist) {
+        int sym, rep, val = 0;
+
+        sym = huff_decode(s, &cl);
+        if (s->err) return;
+        if (sym < 16) {
+            len[index++] = (uint8_t)sym;
+            continue;
+        }
+        if (sym == 16) {
+            if (!index) {
+                s->err = -EINVAL;
+                return;
+            }
+            val = len[index - 1];
+            rep = 3 + (int)inf_bits(s, 2);
+        } else if (sym == 17) {
+            rep = 3 + (int)inf_bits(s, 3);
+        } else {
+            rep = 11 + (int)inf_bits(s, 7);
+        }
+        if (index + rep > nlen + ndist) {
+            s->err = -EINVAL;
+            return;
+        }
+        while (rep--) len[index++] = (uint8_t)val;
+    }
+    if (len[256] == 0) {
+        s->err = -EINVAL;
+        return;
+    }
+    huff_build(&lc, len, nlen);
+    huff_build(&dc, len + nlen, ndist);
+    inf_codes(s, &lc, &dc);
+}
+
+/* Inflates the raw deflate stream IN, N bytes, writing its output through PUT (which
+ * returns 0 or a negative errno). *TOTAL, if given, is the output's size. 0, or a
+ * negative errno. */
+static long inflate_raw(const uint8_t *in, size_t n,
+                        long (*put)(void *, const uint8_t *, size_t), void *arg,
+                        uint64_t *total)
+{
+    static struct infl s;
+    int last;
+
+    s.in = in;
+    s.n = n;
+    s.i = 0;
+    s.bb = 0;
+    s.nb = 0;
+    s.pos = 0;
+    s.total = 0;
+    s.err = 0;
+    s.put = put;
+    s.arg = arg;
+    do {
+        uint32_t type;
+
+        last = (int)inf_bits(&s, 1);
+        type = inf_bits(&s, 2);
+        if (s.err) break;
+        if (type == 0) inf_stored(&s);
+        else if (type == 1) inf_fixed(&s);
+        else if (type == 2) inf_dynamic(&s);
+        else s.err = -EINVAL;
+    } while (!last && !s.err);
+    inf_put(&s, s.out, s.pos);
+    if (total) *total = s.total;
+    return s.err;
+}
+
+/* ---- zip */
+
+#define ZIP_EOCD_SIG 0x06054b50u        /* end of central directory record */
+#define ZIP_CEN_SIG  0x02014b50u        /* central directory file header */
+#define ZIP_LOC_SIG  0x04034b50u        /* local file header */
+#define ZIP_EOCD_LEN 22
+#define ZIP_CEN_LEN  46
+
+static uint32_t zip16(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8; }
+static uint32_t zip32(const uint8_t *p) { return zip16(p) | zip16(p + 2) << 16; }
+
+/* Days since 1970-01-01 of a date: the inverse of civil(). */
+static int32_t days_of(int32_t y, int32_t m, int32_t d)
+{
+    int32_t era, yoe, doy, doe;
+
+    y -= m <= 2;
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* A zip's DOS date and time, which are local time, as seconds since 1970. */
+static uint32_t zip_time(uint32_t dt, uint32_t dd)
+{
+    int64_t t = (int64_t)days_of(1980 + (int32_t)(dd >> 9), (int32_t)((dd >> 5) & 15),
+                                 (int32_t)(dd & 31)) * 86400
+              + (int64_t)(dt >> 11) * 3600 + (int64_t)((dt >> 5) & 63) * 60
+              + (int64_t)(dt & 31) * 2;
+    return (uint32_t)(t - tz_off(t));
+}
+
+/* ---- extraction: the members of an archive that are taken, written under a
+ * directory of their own (the staging directory). A member is written only where
+ * its parent directories are real directories: nothing is written through a
+ * symbolic link, and a name with an empty, "." or ".." component is never written. */
+
+/* What an extraction takes, and where it goes. The paths taken are packed in buf,
+ * NUL-terminated, and off[] gives where each one is. */
+struct xout {
+    char     root[4096];        /* the staging directory, "" when there is none */
+    uint32_t n;
+    uint32_t off[MAXE];
+    size_t   used;
+    char     buf[NPOOL];
+    long     err;               /* the first failure: 0 if none */
+};
+static struct xout xo;
+
+static long xo_add(const char *name)
+{
+    size_t l = strlen(name);
+
+    if (xo.n >= MAXE || xo.used + l + 1 > NPOOL) return -ENOSPC;
+    for (size_t k = 0; k <= l; k++) xo.buf[xo.used + k] = name[k];
+    xo.off[xo.n++] = (uint32_t)xo.used;
+    xo.used += l + 1;
+    return 0;
+}
+
+/* Whether NAME is one of the paths taken, or lies inside a directory taken. */
+static int xwanted(const struct xout *x, const char *name)
+{
+    for (uint32_t i = 0; i < x->n; i++) {
+        const char *s = x->buf + x->off[i];
+        size_t l = strlen(s), k;
+
+        for (k = 0; k < l && name[k] == s[k]; k++)
+            ;
+        if (k == l && (name[l] == 0 || name[l] == '/')) return 1;
+    }
+    return 0;
+}
+
+/* Whether NAME has an empty, "." or ".." component. */
+static int unsafe_name(const char *name)
+{
+    size_t s = 0;
+
+    for (size_t k = 0;; k++) {
+        if (name[k] == '/' || name[k] == 0) {
+            size_t l = k - s;
+
+            if (l == 0 || (l == 1 && name[s] == '.') ||
+                (l == 2 && name[s] == '.' && name[s + 1] == '.'))
+                return 1;
+            if (name[k] == 0) return 0;
+            s = k + 1;
+        }
+    }
+}
+
+static void xfail(struct xout *x, long r)
+{
+    if (r && !x->err) x->err = r;
+}
+
+/* Whether PATH is a directory, and not a link to one. */
+static int is_real_dir(const char *path)
+{
     struct statx sx;
-    struct linux_dirent64 *d = NULL;
+
+    return statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) == 0 &&
+           (sx.stx_mode & S_IFMT) == S_IFDIR;
+}
+
+/* Makes the directories above NAME under ROOT, one by one. A component that is not
+ * a real directory (a file, or a link) stops it: -ENOTDIR. */
+static long xparents(const char *root, const char *name)
+{
+    char path[4352];
+    size_t pl, s = 0;
+
+    strlcpy(path, root, sizeof path);
+    pl = strlen(path);
+    for (size_t k = 0; name[k]; k++) {
+        long r;
+
+        if (name[k] != '/') continue;
+        path[pl++] = '/';
+        for (size_t j = s; j < k; j++) path[pl++] = name[j];
+        path[pl] = 0;
+        r = mkdirat(AT_FDCWD, path, 0755);
+        if (r < 0 && r != -EEXIST) return r;
+        if (!is_real_dir(path)) return -ENOTDIR;
+        s = k + 1;
+    }
+    return 0;
+}
+
+/* Writes all N bytes at P to FD: 0, or a negative errno. */
+static long write_all(long fd, const uint8_t *p, size_t n)
+{
+    while (n) {
+        long r = write((int)fd, p, n);
+
+        if (r == -EINTR) continue;
+        if (r < 0) return r;
+        if (r == 0) return -EIO;
+        p += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+/* A member is written by FILL, which writes its bytes into the file FD, or, when
+ * there is no file (FD < 0), only consumes them: a tar stream must move on. */
+static long xmember(struct xout *x, const char *name, int mode,
+                    long (*fill)(void *, long), void *arg)
+{
+    char path[4352];
+    long fd = -ENAMETOOLONG, r;
+
+    if (!join(path, sizeof path, x->root, name)) {
+        r = xparents(x->root, name);
+        fd = r ? r : open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, (mode_t)mode);
+    }
+    r = fill(arg, fd);
+    if (fd >= 0) close((int)fd);
+    else r = fd;
+    if (r) {
+        if (fd >= 0) unlinkat(AT_FDCWD, path, 0);
+        xfail(x, r);
+    }
+    return r;
+}
+
+static long zdata_put(void *arg, const uint8_t *p, size_t n)
+{
+    return write_all(*(long *)arg, p, n);
+}
+
+/* A zip member's data in the archive: stored, or deflated. */
+struct zdata { const uint8_t *p; uint64_t n, usize; int method; };
+
+static long zdata_fill(void *arg, long fd)
+{
+    const struct zdata *z = arg;
+    uint64_t total = 0;
+    long r;
+
+    if (fd < 0) return fd;
+    if (z->method == 0) return z->n == z->usize ? write_all(fd, z->p, z->n) : -EINVAL;
+    r = inflate_raw(z->p, z->n, zdata_put, &fd, &total);
+    if (r) return r;
+    return total == z->usize ? 0 : -EINVAL;
+}
+
+/* A tar entry's data: the next SIZE bytes of the stream IN. */
+struct tdata { long in; uint64_t size; };
+
+static long tdata_fill(void *arg, long fd)
+{
+    const struct tdata *t = arg;
+    uint8_t buf[4096];
+    uint64_t left = t->size;
+    long r = fd < 0 ? fd : 0;
+
+    while (left) {
+        size_t k = left < sizeof buf ? (size_t)left : sizeof buf;
+
+        if (read_full(t->in, buf, k) != k) return -EIO;
+        if (!r) r = write_all(fd, buf, k);
+        left -= k;
+    }
+    return r;
+}
+
+/* A hard link's content: a copy of the file it is linked to, already written. The
+ * source is not followed through a link: O_NOFOLLOW on its last part. */
+static long hard_fill(void *arg, long fd)
+{
+    const char *src = arg;
+    uint8_t buf[4096];
+    long in, r = fd < 0 ? fd : 0;
+
+    if (fd < 0) return fd;
+    in = open(src, O_RDONLY | O_NOFOLLOW, 0);
+    if (in < 0) return in;
+    for (;;) {
+        long k = read((int)in, buf, sizeof buf);
+
+        if (k == -EINTR) continue;
+        if (k < 0) {
+            r = k;
+            break;
+        }
+        if (k == 0) break;
+        if (!r) r = write_all(fd, buf, (size_t)k);
+    }
+    close((int)in);
+    return r;
+}
+
+static void xdir(struct xout *x, const char *name)
+{
+    char path[4352];
+    long r = join(path, sizeof path, x->root, name);
+
+    if (!r) r = xparents(x->root, name);
+    if (!r) r = mkdirat(AT_FDCWD, path, 0755);
+    if (r == -EEXIST && is_real_dir(path)) r = 0;
+    xfail(x, r);
+}
+
+static void xlink(struct xout *x, const char *name, const char *target)
+{
+    char path[4352];
+    long r = join(path, sizeof path, x->root, name);
+
+    if (!r) r = xparents(x->root, name);
+    if (!r) r = symlinkat(target, AT_FDCWD, path);
+    xfail(x, r);
+}
+
+static void xhard(struct xout *x, const char *name, const char *target)
+{
+    char src[4352];
+    size_t n;
+    int dir;
+    const char *t = target ? norm_name(target, &n, &dir) : NULL;
+    long r = !t || unsafe_name(t) ? -EINVAL : join(src, sizeof src, x->root, t);
+
+    if (!r) r = xparents(x->root, t);
+    if (r) {
+        xfail(x, r);
+        return;
+    }
+    xmember(x, name, 0644, hard_fill, src);
+}
+
+/* A member of a zip archive, from its central directory record. */
+struct zrec {
+    const uint8_t *m;           /* the archive, mapped */
+    uint64_t size;              /* its size */
+    const uint8_t *name;        /* the name, not NUL-terminated */
+    uint32_t nl, method, csize, usize, mtime, mode, off;
+};
+
+/* Calls CB for each record in the central directory of the zip file FD, SIZE bytes,
+ * until CB returns non-zero. 0, or a negative errno: -EINVAL if it is not a zip that
+ * can be read (zip64 is not), -EIO if it cannot be mapped. */
+static long zip_walk(int fd, uint64_t size, long (*cb)(void *, const struct zrec *),
+                     void *ctx)
+{
+    const uint8_t *m;
+    uint64_t cdoff, cdend, pos;
+    uint32_t count, k;
+    int64_t i;
+
+    if (size < ZIP_EOCD_LEN || size > (uint64_t)(size_t)-1) return -EINVAL;
+    m = mmap(0, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) return -EIO;
+
+    /* The end record: the last one of the file, or before a comment of up to 64 KiB,
+     * whose comment length must reach exactly to the end of the file. */
+    for (i = (int64_t)size - ZIP_EOCD_LEN;
+         i >= 0 && i >= (int64_t)size - ZIP_EOCD_LEN - 65535; i--)
+        if (zip32(m + i) == ZIP_EOCD_SIG &&
+            (uint64_t)i + ZIP_EOCD_LEN + zip16(m + i + 20) == size) break;
+    if (i < 0) {
+        munmap((void *)m, (size_t)size);
+        return -EINVAL;
+    }
+    count = zip16(m + i + 10);
+    cdoff = zip32(m + i + 16);
+    cdend = cdoff + zip32(m + i + 12);
+    if (cdend > (uint64_t)i || count == 0xffff || cdoff == 0xffffffffu) {
+        munmap((void *)m, (size_t)size);        /* zip64, or damaged */
+        return -EINVAL;
+    }
+
+    for (k = 0, pos = cdoff; k < count && pos + ZIP_CEN_LEN <= cdend; k++) {
+        const uint8_t *h = m + pos;
+        struct zrec z;
+        uint64_t len;
+
+        if (zip32(h) != ZIP_CEN_SIG) break;
+        z.nl = zip16(h + 28);
+        len = ZIP_CEN_LEN + z.nl + zip16(h + 30) + zip16(h + 32);
+        if (pos + len > cdend) break;
+        z.m = m;
+        z.size = size;
+        z.name = h + ZIP_CEN_LEN;
+        z.method = zip16(h + 10);
+        z.csize = zip32(h + 20);
+        z.usize = zip32(h + 24);
+        z.mtime = zip_time(zip16(h + 12), zip16(h + 14));
+        z.mode = zip32(h + 38) >> 16;
+        z.off = zip32(h + 42);
+        if (cb(ctx, &z)) break;
+        pos += len;
+    }
+    munmap((void *)m, (size_t)size);
+    return 0;
+}
+
+/* The index: each record is added. Stops when the index is full. */
+static long zip_index_cb(void *ctx, const struct zrec *z)
+{
+    struct archive *a = ctx;
+    char nb[256];
+
+    if (z->nl > 255) return 0;
+    for (uint32_t j = 0; j < z->nl; j++) nb[j] = (char)z->name[j];
+    nb[z->nl] = 0;
+    return archive_add(a, nb, z->usize, z->mtime, AE_FILE, NULL) < 0;
+}
+
+/* The extraction: a record taken is written, its data stored or inflated. */
+static long zip_extract_cb(void *ctx, const struct zrec *z)
+{
+    struct xout *x = ctx;
+    char nb[256];
+    const char *name;
+    size_t n;
+    int dir;
+
+    if (z->nl > 255) return 0;
+    for (uint32_t j = 0; j < z->nl; j++) nb[j] = (char)z->name[j];
+    nb[z->nl] = 0;
+    name = norm_name(nb, &n, &dir);
+    if (!name || !xwanted(x, name) || unsafe_name(name)) return 0;
+    if (dir) {
+        xdir(x, name);
+        return 0;
+    }
+    if ((uint64_t)z->off + 30 > z->size || zip32(z->m + z->off) != ZIP_LOC_SIG) {
+        xfail(x, -EINVAL);
+        return 0;
+    }
+    if (z->method != 0 && z->method != 8) {
+        xfail(x, -EINVAL);
+        return 0;
+    }
+    {
+        const uint8_t *h = z->m + z->off;
+        uint64_t data = (uint64_t)z->off + 30 + zip16(h + 26) + zip16(h + 28);
+        struct zdata zd;
+
+        if (data > z->size || z->csize > z->size - data) {
+            xfail(x, -EINVAL);
+            return 0;
+        }
+        zd.p = z->m + data;
+        zd.n = z->csize;
+        zd.usize = z->usize;
+        zd.method = (int)z->method;
+        xmember(x, name, z->mode & 0777 ? (int)(z->mode & 0777) : 0644, zdata_fill, &zd);
+    }
+    return 0;
+}
+
+#define TAR_BLK 512
+
+static void zero_block(void *p, size_t n);
+
+/* A number of N bytes in a tar header: octal, or the GNU form (base-256) for big
+ * values. *bad is set for anything else. */
+static uint64_t tar_num(const uint8_t *p, int n, int *bad)
+{
+    uint64_t v = 0;
+    int i = 0;
+
+    if (p[0] & 0x80) {
+        v = p[0] & 0x7f;
+        for (i = 1; i < n; i++) v = v << 8 | p[i];
+        return v;
+    }
+    while (i < n && (p[i] == ' ' || p[i] == 0)) i++;
+    while (i < n && p[i] >= '0' && p[i] <= '7') v = v << 3 | (uint64_t)(p[i++] - '0');
+    while (i < n && (p[i] == ' ' || p[i] == 0)) i++;
+    if (i < n) *bad = 1;
+    return v;
+}
+
+/* A header of zeros is the end of the archive. */
+static int tar_zero(const uint8_t *h)
+{
+    for (int i = 0; i < TAR_BLK; i++)
+        if (h[i]) return 0;
+    return 1;
+}
+
+/* The checksum of a header: its bytes added up, the checksum field counting as spaces. */
+static int tar_sum_ok(const uint8_t *h)
+{
+    uint32_t sum = 0;
+    int bad = 0;
+
+    for (int i = 0; i < TAR_BLK; i++)
+        sum += (i >= 148 && i < 156) ? ' ' : h[i];
+    return tar_num(h + 148, 8, &bad) == sum && !bad;
+}
+
+/* Skip N bytes of the stream FD: a seek where FD is a file, else read and drop them. */
+static int tar_skip(long fd, uint64_t n)
+{
+    char buf[4096];
+
+    if (lseek((int)fd, 0, SEEK_CUR) >= 0) {
+        while (n) {
+            uint64_t k = n < (1u << 30) ? n : (1u << 30);
+
+            if (lseek((int)fd, (long)k, SEEK_CUR) < 0) return -1;
+            n -= k;
+        }
+        return 0;
+    }
+    while (n) {
+        size_t k = n < sizeof buf ? (size_t)n : sizeof buf;
+
+        if (read_full(fd, buf, k) != k) return -1;
+        n -= k;
+    }
+    return 0;
+}
+
+/* What the headers before an entry say about it: a long name or link (GNU L and K,
+ * or pax path and linkpath), a size and a date (pax). The flags are 1 when set, and 2
+ * when the text is too long to keep: then the entry is not listed. */
+struct tar_meta {
+    char     gname[256];                /* GNU L: the name of the next entry */
+    char     pname[256];                /* pax path */
+    char     lname[256];                /* GNU K, or pax linkpath: a link's target */
+    int      hg, hp, hk;
+    uint64_t psize, pmtime;
+    int      hs, hm;
+};
+
+/* The text of N bytes at B, up to a NUL, copied to OUT (*flag is 1), or too long (2). */
+static void tar_text(const uint8_t *b, uint64_t n, char *out, int *flag)
+{
+    uint64_t k = 0;
+
+    while (k < n && b[k]) k++;
+    if (k > 255) {
+        *flag = 2;
+        return;
+    }
+    for (uint64_t j = 0; j < k; j++) out[j] = (char)b[j];
+    out[k] = 0;
+    *flag = 1;
+}
+
+/* Whether the N bytes at S are the keyword KW. */
+static int tar_kw(const uint8_t *s, uint64_t n, const char *kw)
+{
+    for (uint64_t k = 0; k < n; k++)
+        if (!kw[k] || kw[k] != (char)s[k]) return 0;
+    return kw[n] == 0;
+}
+
+/* A decimal number at the start of N bytes at B, to *out. 0 if there is none. */
+static int tar_dec(const uint8_t *b, uint64_t n, uint64_t *out)
+{
+    uint64_t v = 0, k = 0;
+
+    if (!n || b[0] < '0' || b[0] > '9') return 0;
+    while (k < n && b[k] >= '0' && b[k] <= '9') v = v * 10 + (uint64_t)(b[k++] - '0');
+    *out = v;
+    return 1;
+}
+
+/* The records of a pax extended header, B, N bytes: "LEN KEY=VALUE" and a newline,
+ * one after another. The keys path, linkpath, size and mtime are taken. */
+static void tar_pax(const uint8_t *b, uint64_t n, struct tar_meta *m)
+{
+    uint64_t i = 0;
+
+    while (i < n) {
+        uint64_t len = 0, k = 0, kb, e, vs, ve;
+
+        while (i + k < n && b[i + k] >= '0' && b[i + k] <= '9')
+            len = len * 10 + (uint64_t)(b[i + k++] - '0');
+        if (i + k >= n || k == 0 || len == 0 || len > n - i || b[i + k] != ' ') return;
+
+        kb = i + k + 1;                     /* the key starts after the space */
+        e = kb;
+        while (e < i + len && b[e] != '=') e++;
+        if (e >= i + len) return;
+        vs = e + 1;
+        ve = i + len - 1;                   /* the value ends before the newline */
+        if (ve < vs) ve = vs;
+
+        if (tar_kw(b + kb, e - kb, "path")) {
+            tar_text(b + vs, ve - vs, m->pname, &m->hp);
+        } else if (tar_kw(b + kb, e - kb, "linkpath")) {
+            tar_text(b + vs, ve - vs, m->lname, &m->hk);
+        } else if (tar_kw(b + kb, e - kb, "size")) {
+            m->hs = tar_dec(b + vs, ve - vs, &m->psize);
+        } else if (tar_kw(b + kb, e - kb, "mtime")) {
+            m->hm = tar_dec(b + vs, ve - vs, &m->pmtime);
+        }
+        i += len;
+    }
+}
+
+/* The name of the ustar header H: its prefix, a "/", and its name, into OUT. 0 if it
+ * is too long to keep. The prefix is only there in the POSIX form ("ustar" and NUL),
+ * which the GNU form does not share. */
+static int tar_ustar(const uint8_t *h, char *out)
+{
+    static const char magic[6] = { 'u', 's', 't', 'a', 'r', 0 };
+    size_t k = 0, i;
+    int posix = 1;
+
+    for (i = 0; i < 6; i++)
+        if ((char)h[257 + i] != magic[i]) posix = 0;
+    if (posix) {
+        for (i = 0; i < 155 && h[345 + i]; i++)
+            ;
+        if (i) {
+            if (i + 1 > 255) return 0;
+            for (k = 0; k < i; k++) out[k] = (char)h[345 + k];
+            out[k++] = '/';
+        }
+    }
+    for (i = 0; i < 100 && h[i]; i++)
+        ;
+    if (k + i > 255) return 0;
+    for (size_t j = 0; j < i; j++) out[k + j] = (char)h[j];
+    out[k + i] = 0;
+    return 1;
+}
+
+/* An entry of a tar stream, taken: a file's data is read from FD and written, the rest
+ * is written as it is. Returns the bytes of data read; 0 for an entry not taken, whose
+ * data the caller passes over. */
+static uint64_t xtar_entry(struct xout *x, long fd, const char *name, int kind, int mode,
+                           uint64_t size, const char *target)
+{
+    size_t n;
+    int dir;
+    const char *nn = norm_name(name, &n, &dir);
+    struct tdata td;
+
+    if (!nn || !xwanted(x, nn) || unsafe_name(nn)) return 0;
+    if (dir || kind == AE_DIR) {
+        xdir(x, nn);
+        return 0;
+    }
+    if (kind == AE_LINK) {
+        xlink(x, nn, target);
+        return 0;
+    }
+    if (kind == AE_HARD) {
+        xhard(x, nn, target);
+        return 0;
+    }
+    td.in = fd;
+    td.size = size;
+    xmember(x, nn, mode ? mode : 0644, tdata_fill, &td);
+    return size;
+}
+
+/* Reads the tar stream FD, header after header, and passes over the data of each
+ * entry. With A, each entry is indexed; with X, the entries taken are extracted. PID
+ * is the process writing the stream, or 0 if FD is the file itself. If the index
+ * fills, *full is set and the rest is not read. 0, or -EINVAL if the stream is not
+ * tar. */
+static int tar_scan(struct archive *a, long fd, long pid, int *full, struct xout *x)
+{
+    uint8_t h[TAR_BLK];
+    char lbuf[4096], nm[256], tg[256];
+    struct tar_meta m;
+    int bad = 0, eoa = 0, flag;
+
+    *full = 0;
+    zero_block(&m, sizeof m);
+    for (;;) {
+        uint64_t size, mtime, eff, pad, blk, used = 0;
+        int t, kind, mode, r = 0;
+
+        if (read_full(fd, h, TAR_BLK) != TAR_BLK) break;
+        if (tar_zero(h)) {
+            eoa = 1;
+            break;
+        }
+        if (!tar_sum_ok(h)) {
+            bad = 1;
+            break;
+        }
+        size = tar_num(h + 124, 12, &bad);
+        mtime = tar_num(h + 136, 12, &bad);
+        if (bad) break;
+        t = h[156];
+        blk = (size + TAR_BLK - 1) & ~(uint64_t)(TAR_BLK - 1);
+
+        if (t == 'x' || t == 'g' || t == 'L' || t == 'K') {
+            if (size <= sizeof lbuf) {
+                if (read_full(fd, lbuf, size) != size) break;
+                if (tar_skip(fd, blk - size)) break;
+                if (t == 'x') tar_pax((uint8_t *)lbuf, size, &m);
+                else if (t == 'L') tar_text((uint8_t *)lbuf, size, m.gname, &m.hg);
+                else if (t == 'K') tar_text((uint8_t *)lbuf, size, m.lname, &m.hk);
+            } else {
+                if (tar_skip(fd, blk)) break;
+                if (t == 'x') m.hp = 2;     /* too big to read: its path is unknown */
+                else if (t == 'L') m.hg = 2;
+                else if (t == 'K') m.hk = 2;
+            }
+            continue;
+        }
+
+        eff = m.hs ? m.psize : size;
+        pad = (eff + TAR_BLK - 1) & ~(uint64_t)(TAR_BLK - 1);
+        kind = t == '5' ? AE_DIR : t == '2' ? AE_LINK : t == '1' ? AE_HARD : AE_FILE;
+        mode = (int)(tar_num(h + 100, 8, &flag) & 0777);
+        if (m.hg != 2 && m.hp != 2 && !(kind == AE_LINK && m.hk == 2)) {
+            const char *name = nm, *target = NULL;
+            int ok = 1;
+
+            if (m.hp) name = m.pname;
+            else if (m.hg) name = m.gname;
+            else ok = tar_ustar(h, nm);
+            if (kind == AE_LINK || kind == AE_HARD) {
+                if (m.hk) {
+                    target = m.lname;
+                } else {
+                    tar_text(h + 157, 100, tg, &flag);
+                    target = tg;
+                }
+            }
+            if (ok) {
+                if (x) used = xtar_entry(x, fd, name, kind, mode, eff, target);
+                else r = archive_add(a, name, eff, m.hm ? m.pmtime : mtime, kind, target);
+            }
+        }
+        if (r < 0) {
+            *full = 1;
+            break;
+        }
+        if (tar_skip(fd, pad - used)) break;
+        zero_block(&m, sizeof m);
+    }
+    if (pid && !*full)
+        while (read_full(fd, lbuf, sizeof lbuf) == sizeof lbuf)
+            ;                               /* the rest, so that the process ends cleanly */
+    if (a && bad && a->n == 0 && !eoa) return -EINVAL;
+    return 0;
+}
+
+/* Replace the process by TOOL, found on the PATH, with ARGV: it returns only if no
+ * element of the PATH has it. */
+static void exec_tool(const char *tool, char *const argv[])
+{
+    const char *path = genv("PATH");
+    size_t tl = strlen(tool);
+    char buf[4096];
+
+    if (!path) path = "/usr/bin:/bin";
+    for (;;) {
+        const char *e = path;
+        size_t dl, k;
+
+        while (*e && *e != ':') e++;
+        dl = (size_t)(e - path);
+        if (dl + tl + 2 <= sizeof buf) {
+            for (k = 0; k < dl; k++) buf[k] = path[k];
+            if (dl == 0) buf[k++] = '.';        /* an empty element is the current directory */
+            buf[k++] = '/';
+            for (size_t j = 0; j < tl; j++) buf[k++] = tool[j];
+            buf[k] = 0;
+            execve(buf, argv, envp);
+        }
+        if (!*e) return;
+        path = e + 1;
+    }
+}
+
+/* Run TOOL on the file FULL, to decompress it with -dc: its output is a pipe, and its
+ * read end is returned, with the process in *pid. A negative errno if it cannot be
+ * started. Its input is /dev/null, and its errors go there too. */
+static long ar_spawn(const char *full, const char *tool, long *pid)
+{
+    char *argv[4];
+    int pf[2];
+    long p, dn, r;
+
+    argv[0] = (char *)tool;
+    argv[1] = (char *)"-dc";
+    argv[2] = (char *)full;
+    argv[3] = NULL;
+    r = pipe2(pf, O_CLOEXEC);
+    if (r < 0) return r;
+    p = clone(SIGCHLD, 0, 0, 0, 0);
+    if (p < 0) {
+        close(pf[0]);
+        close(pf[1]);
+        return p;
+    }
+    if (p == 0) {
+        dn = open("/dev/null", O_RDWR | O_CLOEXEC, 0);
+        dup2(pf[1], 1);
+        if (dn >= 0) {
+            dup2(dn, 0);
+            dup2(dn, 2);
+        }
+        exec_tool(tool, argv);
+        exit(127);
+    }
+    close(pf[1]);
+    *pid = p;
+    return pf[0];
+}
+
+/* Wait for the decompressor PID. Unless the index filled (FULL), a failure of the
+ * process is a failure of the archive. */
+static int ar_wait(long pid, int full, int rc)
+{
+    int st = 0;
+
+    while (wait4((int)pid, &st, 0, NULL) == -EINTR)
+        ;
+    if (!full && rc == 0 && ((st & 0x7f) || ((st >> 8) & 0xff))) return -EIO;
+    return rc;
+}
+
+/* Reads the archive of panel P in one pass: indexed into A if A is given, else its
+ * entries taken into X. 0, or a negative errno. */
+static long archive_scan(const struct panel *p, struct archive *a, struct xout *x)
+{
+    char full[4096 + 260];
+    struct statx sx;
+    const char *tool;
+    long fd, pid = 0, out;
+    int kind = archive_kind(p->arc), rc = 0, full_idx = 0;
+
+    archive_path(full, sizeof full, p);
+    if (statx(AT_FDCWD, full, 0, STATX_BASIC_STATS, &sx) != 0 ||
+        (sx.stx_mode & S_IFMT) != S_IFREG)      /* not a file: open() could block */
+        return -EINVAL;
+    fd = open(full, O_RDONLY, 0);
+    if (fd < 0) return fd;
+    /* The index is of this file, and the signature is taken from it. */
+    if (statx((int)fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx) != 0 ||
+        (sx.stx_mode & S_IFMT) != S_IFREG) {
+        close((int)fd);
+        return -EINVAL;
+    }
+    if (a) {
+        a->size = sx.stx_size;
+        a->ino = sx.stx_ino;
+        a->mtime = sx.stx_mtime.tv_sec;
+        a->mnsec = sx.stx_mtime.tv_nsec;
+    }
+
+    switch (kind) {
+    case AR_ZIP:
+        rc = (int)zip_walk((int)fd, sx.stx_size, a ? zip_index_cb : zip_extract_cb,
+                           a ? (void *)a : (void *)x);
+        break;
+    case AR_TAR:
+        rc = tar_scan(a, fd, 0, &full_idx, x);
+        break;
+    case AR_GZ:
+    case AR_XZ:
+    case AR_ZST:
+        tool = kind == AR_GZ ? "gzip" : kind == AR_XZ ? "xz" : "zstd";
+        close((int)fd);
+        fd = -1;
+        out = ar_spawn(full, tool, &pid);
+        if (out < 0) {
+            rc = (int)out;
+            break;
+        }
+        rc = tar_scan(a, out, pid, &full_idx, x);
+        close((int)out);
+        rc = ar_wait(pid, full_idx, rc);
+        break;
+    default:
+        rc = -EINVAL;
+        break;
+    }
+    if (fd >= 0) close((int)fd);
+    return rc;
+}
+
+/* Read the archive of panel P (P->arc, in P->path) into a new index, which replaces
+ * the index there is. 0, or a negative errno: then the index there is kept. */
+static int archive_read(struct panel *p)
+{
+    struct archive *a = archive_new();
+    int rc;
+
+    if (!a) return -EIO;
+    rc = (int)archive_scan(p, a, NULL);
+    if (rc) {
+        archive_free(a);
+        return rc;
+    }
+    archive_free(p->ar);
+    p->ar = a;
+    return 0;
+}
+
+/* The temporary directory of an extraction: a new one, under TMPDIR, or /tmp. Its
+ * path is xo.root. */
+static long xtmp_make(void)
+{
+    const char *t = genv("TMPDIR");
+    char num[32];
+    long pid = getpid();
+
+    if (!t || !*t) t = "/tmp";
+    for (unsigned k = 0; k < 1000; k++) {
+        long r;
+        int l;
+
+        strlcpy(xo.root, t, sizeof xo.root);
+        strlcat(xo.root, "/mc-", sizeof xo.root);
+        l = (int)utoa((unsigned long)pid, num);
+        num[l] = 0;
+        strlcat(xo.root, num, sizeof xo.root);
+        strlcat(xo.root, "-", sizeof xo.root);
+        l = (int)utoa(k, num);
+        num[l] = 0;
+        strlcat(xo.root, num, sizeof xo.root);
+        r = mkdirat(AT_FDCWD, xo.root, 0700);
+        if (r == 0) return 0;
+        if (r != -EEXIST) break;
+    }
+    xo.root[0] = 0;
+    return -EEXIST;
+}
+
+/* The targets of the hard links taken are staged too: a hard link is written as a copy
+ * of its target, which is then in the staging directory, but is not copied itself. */
+static void vfs_hard_targets(const struct panel *p)
+{
+    const struct archive *a = p->ar;
+
+    for (uint32_t i = 0; a && i < a->n; i++) {
+        const struct aent *x = &a->e[i];
+        char tg[256];
+        const char *t;
+        size_t n;
+        int dir;
+
+        if (x->kind != AE_HARD || !x->tgt || !xwanted(&xo, a->nm + x->name)) continue;
+        strlcpy(tg, a->nm + x->tgt - 1, sizeof tg);
+        t = norm_name(tg, &n, &dir);
+        if (t) xo_add(t);
+    }
+}
+
+/* Takes the items of the archive panel P that a job works on (the marked ones, if SEL,
+ * else the highlighted one) into a new staging directory, and writes them there in one
+ * pass over the archive. The job then copies them from there. 0, or a negative errno. */
+static long vfs_stage(const struct panel *p, int sel)
+{
+    long r;
+
+    xo.n = 0;
+    xo.used = 0;
+    xo.err = 0;
+    r = xtmp_make();
+    if (r) return r;
+    for (int d = 0; d < p->n; d++) {
+        const struct ent *e = &p->e[p->ord[d]];
+        char inner[512];
+
+        if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+        strlcpy(inner, p->sub, sizeof inner);
+        strlcat(inner, p->nm + e->name, sizeof inner);
+        r = xo_add(inner);
+        if (r) break;
+        if (is_dir(e)) xdir(&xo, inner);
+    }
+    /* a member that fails is missing from the staging directory: the copy says so */
+    if (!r) {
+        vfs_hard_targets(p);
+        r = archive_scan(p, NULL, &xo);
+    }
+    return r;
+}
+
+/* Whether the index of panel P is of the archive file as it is now. */
+static int archive_fresh(const struct panel *p)
+{
+    char full[4096 + 260];
+    struct statx sx;
+
+    if (!p->ar) return 0;
+    archive_path(full, sizeof full, p);
+    if (statx(AT_FDCWD, full, 0, STATX_BASIC_STATS, &sx) != 0) return 0;
+    return sx.stx_size == p->ar->size && sx.stx_ino == p->ar->ino &&
+           sx.stx_mtime.tv_sec == p->ar->mtime && sx.stx_mtime.tv_nsec == p->ar->mnsec;
+}
+
+/* The "..." entry, always first: its name is at offset 0 of the pool, and its date
+ * is the mtime of the parent of the path as mc knows it (lexically, so through a
+ * symlink it is not the real parent). Inside an archive, that is the directory the
+ * archive is in. */
+static void load_up(struct panel *p)
+{
     struct ent *e = &p->e[0];
-    long fd, r, off;
+    struct statx sx;
 
-    fd = open(p->path, O_RDONLY | O_DIRECTORY, 0);
-
-    /* ".." is always the first entry, and its name is at offset 0 of the pool;
-     * its date is the mtime of the parent of the path as mc knows it (lexically,
-     * so through a symlink it is not the real parent) */
     p->nn = 0;
     add_name(p, "..");
     e->name = 0;
@@ -758,6 +2117,54 @@ static void load(struct panel *p)
             e->mtime = (uint32_t)sx.stx_mtime.tv_sec;
     }
     p->ne = 1;
+}
+
+/* The list: "..." first (not in the root directory, and always inside an archive),
+ * then the rest sorted. */
+static void sort_list(struct panel *p)
+{
+    int up = p->arc[0] || !(p->path[0] == '/' && p->path[1] == 0), first = up ? 1 : 0;
+
+    p->n = 0;
+    if (up) p->ord[p->n++] = 0;
+    for (int i = 1; i < p->ne; i++) p->ord[p->n++] = (uint16_t)i;
+    /* insertion sort; plenty fast for ordinary directories */
+    for (int i = first + 1; i < p->n; i++) {
+        uint16_t v = p->ord[i];
+        int j = i;
+        while (j > first && ecmp(p, p->ord[j - 1], v) > 0) {
+            p->ord[j] = p->ord[j - 1];
+            j--;
+        }
+        p->ord[j] = v;
+    }
+}
+
+/* Read the panel's directory again: p->path, or the archive p->arc at the
+ * directory p->sub. 0 on success; a negative errno if an archive cannot be read,
+ * when the listing is only "...". */
+static int load(struct panel *p)
+{
+    long buf[1024];                 /* 8 KiB, aligned for dirent64 records */
+    struct statx sx;
+    struct linux_dirent64 *d = NULL;
+    struct ent *e;
+    long fd, r, off;
+
+    if (p->arc[0]) {
+        int rc = 0;
+
+        load_up(p);
+        if (!archive_fresh(p)) rc = archive_read(p);
+        if (rc == 0) archive_list(p);
+        sort_list(p);
+        p->free_kb = p->total_kb = 0;               /* as mc: an archive has no free space shown */
+        return rc;
+    }
+
+    fd = open(p->path, O_RDONLY | O_DIRECTORY, 0);
+
+    load_up(p);
 
     while (fd >= 0 && (r = getdents64((int)fd, buf, sizeof buf)) > 0) {
         for (off = 0; off < r; off += d->d_reclen) {
@@ -802,24 +2209,7 @@ static void load(struct panel *p)
     }
     if (fd >= 0) close((int)fd);
 
-    /* The list: ".." first (not in the root directory), then the rest sorted. */
-    {
-        int up = !(p->path[0] == '/' && p->path[1] == 0), first = up ? 1 : 0;
-
-        p->n = 0;
-        if (up) p->ord[p->n++] = 0;
-        for (int i = 1; i < p->ne; i++) p->ord[p->n++] = (uint16_t)i;
-        /* insertion sort; plenty fast for ordinary directories */
-        for (int i = first + 1; i < p->n; i++) {
-            uint16_t v = p->ord[i];
-            int j = i;
-            while (j > first && ecmp(p, p->ord[j - 1], v) > 0) {
-                p->ord[j] = p->ord[j - 1];
-                j--;
-            }
-            p->ord[j] = v;
-        }
-    }
+    sort_list(p);
 
     {
         struct statfs f;
@@ -829,6 +2219,7 @@ static void load(struct panel *p)
             p->total_kb = ((uint64_t)f.f_blocks * (uint64_t)f.f_bsize) >> 10;
         }
     }
+    return 0;
 }
 
 /* Keep the cursor visible. As in mc, crossing the bottom edge moves the list
@@ -869,7 +2260,10 @@ static void panel_rescan(struct panel *p)
             k += (int)l;
         }
     }
-    load(p);
+    if (load(p) != 0 && p->arc[0]) {            /* the archive is gone: its directory */
+        vfs_forget(p);
+        load(p);
+    }
     for (j = 1; j < p->ne && k; j++) {
         const char *en = p->nm + p->e[j].name;
         for (int s = 0; s < k; s += (int)strlen(ob + s) + 1) {
@@ -992,7 +2386,7 @@ static void panel_row(struct panel *p, int y, int x0, int pw, int active)
     if (nw < 1 || H < 6) return;
 
     if (y == 0) {                                   /* top border with path */
-        int tl = disp_path(pb, sizeof pb, p->path), tc;
+        int tl = panel_title(pb, sizeof pb, p), tc;
         tl = cut_cols(pb, tl, pw - 12);
         tc = tcols(pb, tl);
         setc(x0, 'l', dec);
@@ -1079,6 +2473,12 @@ static void panel_row(struct panel *p, int y, int x0, int pw, int active)
 
             if (e->up) {
                 n = cat(t, "UP--DIR");
+            } else if (e->link && p->arc[0]) {      /* in an archive: the target, from its index */
+                char tg[256];
+
+                n = cat(t, "-> ");
+                if (vfs_target(p, p->nm + e->name, tg, sizeof tg))
+                    n += fit_name(t + n, tg, pw - 5);
             } else if (e->link) {                   /* "-> target", read now: links are few */
                 char tg[256];
                 long tl = -1;
@@ -1354,11 +2754,12 @@ static void page_up(struct panel *p)
 /* Up, Down, Home, End, PgUp, PgDn on the active panel. */
 
 static void enter_dir(struct panel *p);
+static void vfs_open(struct panel *p, const struct ent *e);
+static void vfs_view(struct panel *p, const struct ent *e);
 static void zero_block(void *p, size_t n);
 
 /* ----------------------------------------------------------- keys and lines */
 
-#define ESC_WAIT_MS 1000        /* after an ESC, how long the rest of a key may take */
 #define K_INCOMPLETE (-1)
 #define K_ESC    0x1b
 #define K_UP     0x100
@@ -2159,6 +3560,11 @@ static void enter_item(struct panel *p)
         enter_dir(p);
         return;
     }
+    if (p->arc[0]) return;                      /* inside an archive: not extracted yet */
+    if (archive_kind(p->nm + e->name) != AR_NONE) {
+        vfs_open(p, e);
+        return;
+    }
     if (!is_exe(e)) {
         char type[16];
         const char *script = media_script(p->nm + e->name, type);
@@ -2185,6 +3591,10 @@ static void view_item(struct panel *p)
     e = &p->e[p->ord[p->cur]];
     if (is_dir(e)) {
         enter_dir(p);
+        return;
+    }
+    if (p->arc[0]) {
+        vfs_view(p, e);
         return;
     }
     argv[0] = (char *)"mcview";
@@ -2216,6 +3626,39 @@ static void run_command(void)
     argv[2] = cmd;
     argv[3] = NULL;
     run_child(sh, argv, P[act].path, 0, cmd);
+}
+
+/* Alt+Enter: the highlighted name goes on the command line, at the cursor, and
+ * a space after it. The name is quoted as mc quotes it: a backslash before each
+ * character the shell would read as special, and before a leading ~ or #; a
+ * leading - gets ./ in front, so it is not an option. A name that does not fit
+ * on the line is not typed at all. */
+static void put_name(const struct panel *p)
+{
+    const struct ent *e;
+    const char *s;
+    char t[520];
+    int n = 0, j;
+
+    if (!p->n) return;
+    e = &p->e[p->ord[p->cur]];
+    s = p->nm + e->name;
+    if (*s == '-') {
+        t[n++] = '.';
+        t[n++] = '/';
+    }
+    for (; *s && n < (int)sizeof t - 4; s++) {
+        int c = (unsigned char)*s, esc = 0;
+
+        for (const char *q = "\t\r\n \"'\\;?|[]{}<>`!$&*()"; *q; q++)
+            if (*q == c) esc = 1;
+        if (n == 0 && (c == '~' || c == '#')) esc = 1;
+        if (esc) t[n++] = '\\';
+        t[n++] = (char)c;
+    }
+    t[n++] = ' ';
+    if (cmdl.len + n >= (int)sizeof cmdl.buf) return;
+    for (j = 0; j < n; j++) line_insert(&cmdl, (unsigned char)t[j]);
 }
 
 /* Up, Down, Home, End, PgUp and PgDn on the active panel. */
@@ -2404,6 +3847,7 @@ static void change_to(struct panel *p, const char *res, const char *shown)
         return;
     }
     close((int)fd);
+    vfs_forget(p);                              /* a real directory: out of any archive */
     strlcpy(old, p->path, sizeof old);
     strlcpy(p->path, res, sizeof p->path);
     load(p);
@@ -2440,6 +3884,80 @@ static void change_to(struct panel *p, const char *res, const char *shown)
     }
 }
 
+/* The highlight on the entry called NAME, if the list has one. */
+static void select_name(struct panel *p, const char *name)
+{
+    p->cur = 0;
+    p->top = 0;
+    for (int i = 0; i < p->n; i++)
+        if (!scmp(p->nm + p->e[p->ord[i]].name, name)) {
+            p->cur = i;
+            break;
+        }
+    scroll(p);
+}
+
+/* Enter the archive named by E, a file of the panel's directory: the panel shows the
+ * archive's root. An archive that cannot be read is an error, and nothing changes. */
+static void vfs_open(struct panel *p, const struct ent *e)
+{
+    char name[256];
+    int rc;
+
+    strlcpy(name, p->nm + e->name, sizeof name);    /* load() rewrites the names */
+    strlcpy(p->arc, name, sizeof p->arc);
+    p->sub[0] = 0;
+    rc = load(p);
+    if (rc != 0) {
+        vfs_forget(p);
+        load(p);
+        set_error("Cannot open archive", name, -rc);
+        return;
+    }
+    p->cur = 0;
+    p->top = 0;
+    scroll(p);
+}
+
+/* Enter the directory E of the archive shown. */
+static void vfs_enter(struct panel *p, const struct ent *e)
+{
+    char name[256];
+
+    if (strlen(p->sub) + strlen(p->nm + e->name) + 2 > sizeof p->sub) return;
+    strlcpy(name, p->nm + e->name, sizeof name);    /* load() rewrites the names */
+    strlcat(p->sub, name, sizeof p->sub);
+    strlcat(p->sub, "/", sizeof p->sub);
+    load(p);
+    p->cur = 0;
+    p->top = 0;
+    scroll(p);
+}
+
+/* ".." in an archive: up one directory inside it, its highlight on the directory
+ * left; at the archive's root, out of the archive, its highlight on the archive. */
+static void vfs_up(struct panel *p)
+{
+    char name[256];
+    size_t n, st;
+
+    if (!p->sub[0]) {
+        strlcpy(name, p->arc, sizeof name);
+        vfs_forget(p);
+        load(p);
+        select_name(p, name);
+        return;
+    }
+    n = strlen(p->sub) - 1;                         /* the last / */
+    st = n;
+    while (st > 0 && p->sub[st - 1] != '/') st--;   /* the directory left is sub[st..n) */
+    strlcpy(name, p->sub + st, sizeof name);
+    name[n - st] = 0;
+    p->sub[st] = 0;
+    load(p);
+    select_name(p, name);
+}
+
 /* Enter on a directory, or on "..": change the panel to it. Files do nothing. */
 static void enter_dir(struct panel *p)
 {
@@ -2449,6 +3967,11 @@ static void enter_dir(struct panel *p)
     if (!p->n) return;
     e = &p->e[p->ord[p->cur]];
     if (!is_dir(e)) return;
+    if (p->arc[0]) {                                /* inside an archive */
+        if (e->up) vfs_up(p);
+        else vfs_enter(p, e);
+        return;
+    }
     strlcpy(abs, p->path, sizeof abs);
     if (e->up) {
         strlcat(abs, "/..", sizeof abs);
@@ -2680,6 +4203,8 @@ static struct {
     int skip_err;               /* Skip all was chosen: failures pass items over */
 } job;
 static char job_dst[4096];      /* the destination: a directory, or the file itself */
+/* where the items are: the panel's directory, or the staging directory */
+static char job_base[4096];
 static long job_skips;          /* items passed over: a move keeps a source whose copy skipped any */
 
 /* How a file is written, and what is decided about one that exists. */
@@ -2772,6 +4297,11 @@ static void delete_open(struct panel *p)
     const struct ent *e;
     char fitted[256];
     int n, files, dirs;
+
+    if (p->arc[0]) {                                /* read-only: nothing is deleted */
+        set_error("Read-only archive", p->arc, EROFS);
+        return;
+    }
 
     job.sel = marked_any(p);
     if (job.sel) {
@@ -3622,6 +5152,41 @@ static long job_item(const char *src, const char *dst)
 }
 
 /* The job is over: the panels read their files again. */
+/* F3 on a file of the archive panel P: the file is written to a staging directory of
+ * its own, mcview runs on it, and the directory goes when mcview has exited. */
+static void vfs_view(struct panel *p, const struct ent *e)
+{
+    char inner[512], path[4352], *argv[3];
+    struct statx sx;
+    long r;
+
+    strlcpy(inner, p->sub, sizeof inner);
+    strlcat(inner, p->nm + e->name, sizeof inner);
+    xo.n = 0;
+    xo.used = 0;
+    xo.err = 0;
+    r = xtmp_make();
+    if (!r) r = xo_add(inner);
+    if (!r) {
+        vfs_hard_targets(p);
+        r = archive_scan(p, NULL, &xo);
+    }
+    if (!r && join(path, sizeof path, xo.root, inner)) r = -ENAMETOOLONG;
+    if (!r && (statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) != 0 ||
+               (sx.stx_mode & S_IFMT) != S_IFREG))
+        r = -ENOENT;
+    if (r) {
+        set_error("Cannot extract", inner, -r);
+    } else {
+        argv[0] = (char *)"mcview";
+        argv[1] = path;
+        argv[2] = NULL;
+        run_child("mcview", argv, xo.root, RUN_SEARCH, NULL);
+    }
+    if (xo.root[0]) del_tree(xo.root, 1);
+    xo.root[0] = 0;
+}
+
 static void job_end(void)
 {
     mode = MODE_NORMAL;
@@ -3648,7 +5213,7 @@ static void job_run(void)
 
         if (at < 0) break;
         e = &p->e[p->ord[at]];
-        r = join(src, sizeof src, p->path, p->nm + e->name);
+        r = join(src, sizeof src, job_base, p->nm + e->name);
         if (!r) {
             if (job.dir) r = join(dst, sizeof dst, job_dst, p->nm + e->name);
             else r = strlcpy(dst, job_dst, sizeof dst) < sizeof dst ? 0 : -ENAMETOOLONG;
@@ -3790,6 +5355,23 @@ static void op_confirm(void)
     }
     strlcpy(job_dst, res, sizeof job_dst);
     job.dir = isdir;
+    if (p->arc[0]) {
+        long r = vfs_stage(p, job.sel);
+
+        if (r) {
+            if (xo.root[0]) del_tree(xo.root, 1);
+            xo.root[0] = 0;
+            mode = MODE_NORMAL;
+            set_error("Cannot extract from", p->arc, -r);
+            return;
+        }
+        strlcpy(job_base, xo.root, sizeof job_base);
+        job_run();
+        del_tree(xo.root, 1);
+        xo.root[0] = 0;
+        return;
+    }
+    strlcpy(job_base, p->path, sizeof job_base);
     job_run();
 }
 
@@ -3803,6 +5385,15 @@ static void op_open(int kind)
     const struct ent *e = NULL;
     const char *name = "";
     int n, k, l, files, dirs;
+
+    if (kind == JOB_MOVE && p->arc[0]) {
+        set_error("Read-only archive", p->arc, EROFS);
+        return;
+    }
+    if (P[act ^ 1].arc[0]) {                        /* nothing is written into an archive */
+        set_error("Read-only archive", P[act ^ 1].arc, EROFS);
+        return;
+    }
 
     job.kind = kind;
     job.sel = marked_any(p);
@@ -4128,6 +5719,11 @@ static int handle_key(int key)
     if (key == (K_ALT | 's')) {
         mode = MODE_QSEARCH;
         line_clear(&qline);
+        return 0;
+    }
+    /* Alt+Enter: the highlighted name goes on the command line (put_name) */
+    if (key == (K_ALT | '\r') || key == (K_ALT | '\n')) {
+        put_name(p);
         return 0;
     }
     if (key == '\r' || key == '\n') {

@@ -87,9 +87,6 @@ __attribute__((noreturn)) static void die(const char *msg)
  * the kernel restarts the call only if the host program's handler was
  * installed with SA_RESTART, which not every libc's signal() does.  Any
  * program linking this must survive handlers of its own, so retry. */
-#ifndef EINTR
-#define EINTR 4
-#endif
 /* Once the connection is up (xup), losing it -- the server went away,
  * an `ssh -X` link dropped -- is not fatal to the program: reads and
  * writes become no-ops (a read returns zeros, which parse as an ignorable

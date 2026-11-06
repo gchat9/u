@@ -2,7 +2,13 @@ TARGET := mc
 RW     := 1
 include ../_mk/common.mk
 
-# make DIR_BOLD=1 draws directories in bold white (default: bright white, not bold)
-ifeq ($(DIR_BOLD),1)
-CFLAGS += -DDIR_BOLD
-endif
+# The i386 six-argument system call (mmap) takes ebp. With -Os, gcc keeps a frame
+# pointer in some functions, which then cannot take it: omit the frame pointer.
+CFLAGS += -fomit-frame-pointer
+
+# The parameters are in config.h: a change there rebuilds mc.
+mc: config.h
+
+.PHONY: tests
+tests: mc
+	python3 tests/run.py
