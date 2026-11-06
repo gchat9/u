@@ -22,7 +22,23 @@
  *                      With something on the command line: run that with
  *                      $SHELL -c instead.
  *     F3, ESC 3        mcview on the highlighted file (or enter a directory)
- *     F8, ESC 8        delete the highlighted file, after asking (not directories)
+ *     F5, ESC 5        copy the marked items, or else the highlighted one.
+ *                      A question asks for the destination, which starts as the
+ *                      other panel's directory; a directory there takes the items
+ *                      under their own names. A directory is copied with what is
+ *                      in it, and merged into one that exists. A file that exists
+ *                      is asked about: Yes, No, Append, or All, Older, None,
+ *                      Smaller, Size differs for the rest of the job. A progress
+ *                      box follows; Esc (or A) stops the copy, and removes what
+ *                      was being written.
+ *     F6, ESC 6        move (rename) the same way. Across file systems, a copy
+ *                      and then the removal of the source.
+ *     F8, ESC 8        delete the marked items, or else the highlighted one, after
+ *                      asking. A non-empty directory is asked about again, once
+ *                      for each directory of the selection: Yes, No, All (the
+ *                      rest), None (the rest), or Abort.
+ *     Insert           mark the highlighted item (or unmark it), and move down;
+ *     Shift+Down/Up    the same, Shift+Up moving up. ".." is never marked.
  *     Ctrl+R           read the active panel's directory again
  *     Alt+C            quick cd: type a directory, Enter changes to it
  *     Left/Right, Ctrl+Left/Right, Alt+Backspace, Backspace, Delete
@@ -36,8 +52,8 @@
  * the shell, and no job it started is kept; the active panel then goes to the
  * directory the shell is in. The next Ctrl+O starts another, where the last
  * prompt was. When the shell exits, mc exits too. In the panels, "cd DIR" on
- * the command line is the same as Alt+C DIR.  A panel is read again when its
- * directory has changed, after a command, a viewer or the shell, see rescan_changed().  Alt+S is quick search: the info
+ * the command line is the same as Alt+C DIR.  A panel is read again when a
+ * file has changed, after a command, a viewer, the shell or a file operation, see rescan_changed().  Alt+S is quick search: the info
  * line takes the letters typed, and the highlight goes to the first name that
  * begins with them, see qs_handle().  Enter on a media file (mp3, ogg,
  * opus, m4a, mp4, webm, mkv, gif, png, webp, jpg, jpeg) runs the viewer of
@@ -64,6 +80,18 @@
 #define MAXW   1024          /* widest terminal we draw */
 #define TZMAX  8192          /* room for /etc/localtime */
 #define EINTR  4             /* interrupted system call */
+#define EIO    5             /* input/output error */
+#define EEXIST 17            /* file exists */
+#define EXDEV  18            /* rename across file systems */
+#define EINVAL 22            /* invalid argument */
+#define ENOTDIR 20           /* not a directory */
+#define ECANCELED 125        /* a copy stopped by Esc */
+#define ESAME 1000           /* not an errno: source and destination are one file */
+#define ESUB 1002            /* not an errno: a directory into itself */
+#define ENOENT 2             /* no such file or directory */
+#define ENOTEMPTY 39         /* directory not empty */
+#define ENAMETOOLONG 36      /* file name too long */
+#define AT_REMOVEDIR 0x200   /* unlinkat: remove a directory */
 #define SIGINT 2
 #define SIGQUIT 3
 #define SIGCHLD 17
@@ -123,6 +151,8 @@ struct winsz { uint16_t row, col, xpix, ypix; };
 #define C_TITLE  ATTR(BLACK, WHITE, 0)
 #define C_HEAD   ATTR(BROWN, BLUE, 1)
 #define C_CURSOR ATTR(BLACK, CYAN, 0)
+#define C_SEL    ATTR(BROWN, BLUE, 1)   /* a marked item */
+#define C_SELCUR ATTR(BROWN, CYAN, 1)   /* a marked item under the cursor */
 #define C_INFO   ATTR(WHITE, BLUE, 0)
 #define C_FREE   ATTR(WHITE, BLUE, 0)
 
@@ -141,6 +171,18 @@ struct winsz { uint16_t row, col, xpix, ypix; };
 #define C_FIELD   ATTR(BLACK, CYAN, 0)
 #define C_ERR     ATTR(WHITE, RED, 1)
 #define C_ERRHEAD ATTR(BROWN, RED, 1)
+#define C_QHOT   ATTR(BLUE, WHITE, 1)   /* a hotkey letter, white dialog */
+
+/* Every dialog has a margin of DIALOG_PAD cells, in the dialog's own background,
+ * all round its frame; the frame sits inside it, as in mc. Set DIALOG_PAD to 0
+ * (-DDIALOG_PAD=0) for frames flush with the edge of the box. */
+#ifndef DIALOG_PAD
+#define DIALOG_PAD 1
+#endif
+#define ERR_H  (7 + 2 * DIALOG_PAD)  /* rows of the error box */
+#define QCD_H  (3 + 2 * DIALOG_PAD)  /* rows of the quick cd box */
+#define OPFW   (opw - 2 * DIALOG_PAD) /* width of a copy, move or question box's frame */
+#define C_QHOTSEL ATTR(BLUE, CYAN, 1)   /* a hotkey letter, on the focused button */
 
 /* File classes, in the order mc's filehighlight.ini tests them. */
 enum { CL_NORMAL, CL_DIR, CL_EXE, CL_CORE, CL_TEMP, CL_ARCHIVE, CL_DOC,
@@ -208,6 +250,7 @@ struct ent {
     uint32_t cls  : 4;           /* CL_*: what the entry is, see above */
     uint32_t link : 1;           /* a symbolic link */
     uint32_t up   : 1;           /* the ".." entry */
+    uint32_t sel  : 1;           /* marked for a group operation (Insert, Shift+arrows) */
     uint32_t size;               /* size_pack() */
     uint32_t mtime;              /* seconds since 1970, see above */
 };
@@ -227,7 +270,6 @@ static char ent_mark(const struct ent *e)
 
 struct panel {
     char     path[4096];
-    uint64_t dir_mtime, dir_ctime;  /* the directory's, in ns, when it was last read */
     int      n, cur, top;        /* entries shown, cursor, first visible entry */
     int      ne;                 /* entries read, including e[0] = ".." */
     uint64_t free_kb, total_kb;  /* filesystem usage in KiB, 0 if unknown */
@@ -333,7 +375,8 @@ static int          prompt_len;      /* length of the command line prompt */
 
 /* Modal state: a quick cd input box, or the error box shown after a failed cd
  * (any key closes it). */
-enum { MODE_NORMAL, MODE_QCD, MODE_ERR, MODE_QSEARCH, MODE_QUERY };
+enum { MODE_NORMAL, MODE_QCD, MODE_ERR, MODE_QSEARCH, MODE_QUERY, MODE_OP, MODE_PROG,
+       MODE_CONFLICT };
 static int          mode;
 /* A line being edited: the quick cd text and the command line. POS is the
  * cursor, FIRST the first character shown. */
@@ -683,16 +726,6 @@ static int add_name(struct panel *p, const char *name)
     return off;
 }
 
-static int dir_stamp(const char *path, uint64_t *mt, uint64_t *ct)
-{
-    struct statx sx;
-
-    if (statx(AT_FDCWD, path, 0, STATX_BASIC_STATS, &sx) != 0) return -1;
-    *mt = (uint64_t)sx.stx_mtime.tv_sec * 1000000000u + sx.stx_mtime.tv_nsec;
-    *ct = (uint64_t)sx.stx_ctime.tv_sec * 1000000000u + sx.stx_ctime.tv_nsec;
-    return 0;
-}
-
 static void load(struct panel *p)
 {
     long buf[1024];                 /* 8 KiB, aligned for dirent64 records */
@@ -701,8 +734,6 @@ static void load(struct panel *p)
     struct ent *e = &p->e[0];
     long fd, r, off;
 
-    if (dir_stamp(p->path, &p->dir_mtime, &p->dir_ctime) != 0)
-        p->dir_mtime = p->dir_ctime = 0;
     fd = open(p->path, O_RDONLY | O_DIRECTORY, 0);
 
     /* ".." is always the first entry, and its name is at offset 0 of the pool;
@@ -714,6 +745,7 @@ static void load(struct panel *p)
     e->size = 0;
     e->cls = CL_DIR;
     e->up = 1;
+    e->sel = 0;
     e->link = 0;
     e->mtime = 0;
     {
@@ -742,6 +774,7 @@ static void load(struct panel *p)
             e = &p->e[p->ne];
             e->name = (uint32_t)at;
             e->up = 0;
+            e->sel = 0;
             e->size = 0;
             e->mtime = 0;
             e->cls = CL_NORMAL;
@@ -816,24 +849,47 @@ static void scroll(struct panel *p)
     }
 }
 
-/* Read the directory of P again, and keep the highlight on the same name if it
- * is still there, else on the same position. */
+/* Read the directory of P again. The highlight stays on the same name if it is
+ * still there, else on the same position; the marks stay on the names that are
+ * still there too. The names of the marked entries wait in ob, which is free
+ * between frames, so a marked name past the end of ob is not kept. */
 static void panel_rescan(struct panel *p)
 {
     char name[256];
-    int at = p->cur, i;
+    int at = p->cur, i, k = 0, j;
 
     name[0] = 0;
     if (p->n > 0) strlcpy(name, p->nm + p->e[p->ord[p->cur]].name, sizeof name);
+    for (i = 0; i < p->n; i++) {
+        const struct ent *e = &p->e[p->ord[i]];
+        size_t l = strlen(p->nm + e->name) + 1;
+
+        if (e->sel && !e->up && (size_t)k + l <= sizeof ob) {
+            memcpy(ob + k, p->nm + e->name, l);
+            k += (int)l;
+        }
+    }
     load(p);
+    for (j = 1; j < p->ne && k; j++) {
+        const char *en = p->nm + p->e[j].name;
+        for (int s = 0; s < k; s += (int)strlen(ob + s) + 1) {
+            size_t q = 0;
+
+            while (ob[s + (int)q] && ob[s + (int)q] == en[q]) q++;
+            if (!ob[s + (int)q] && !en[q]) {
+                p->e[j].sel = 1;
+                break;
+            }
+        }
+    }
     p->cur = at < p->n ? at : p->n - 1;
     if (p->cur < 0) p->cur = 0;
     for (i = 0; i < p->n; i++) {
         const char *en = p->nm + p->e[p->ord[i]].name;
-        size_t k = 0;
+        size_t k2 = 0;
 
-        while (name[k] && name[k] == en[k]) k++;
-        if (name[k] == 0 && en[k] == 0) {
+        while (name[k2] && name[k2] == en[k2]) k2++;
+        if (name[k2] == 0 && en[k2] == 0) {
             p->cur = i;
             break;
         }
@@ -841,17 +897,14 @@ static void panel_rescan(struct panel *p)
     scroll(p);
 }
 
-/* After something may have changed the directories (a command, a viewer, the
- * shell, a deletion), a panel is read again only if its directory has changed:
- * its ctime or mtime differ from when it was read. */
+/* After something may have changed the files (a command, a viewer, the shell, a
+ * file operation), both panels are read again: a file can change in place, its
+ * size and date, without its directory changing at all. The highlight and the
+ * marks stay on their names. */
 static void rescan_changed(void)
 {
-    for (int i = 0; i < 2; i++) {
-        uint64_t mt = 0, ct = 0;
-
-        if (dir_stamp(P[i].path, &mt, &ct) != 0 || mt != P[i].dir_mtime || ct != P[i].dir_ctime)
-            panel_rescan(&P[i]);
-    }
+    panel_rescan(&P[0]);
+    panel_rescan(&P[1]);
 }
 
 /* ------------------------------------------------------------ drawing */
@@ -987,7 +1040,7 @@ static void panel_row(struct panel *p, int y, int x0, int pw, int active)
             char sz[8];
             int sl;
 
-            a = hit ? C_CURSOR : cl_attr[e->cls];
+            a = hit ? (e->sel ? C_SELCUR : C_CURSOR) : e->sel ? C_SEL : cl_attr[e->cls];
 
             sets(x0 + 1, t, name_text(t, nw, p, e), a);
 
@@ -1094,9 +1147,9 @@ static uint32_t dec_char(uint32_t c)
     return c >= 0x60 && c <= 0x7e ? dec_uni[c - 0x60] : c;
 }
 
-static void put_utf8(uint32_t cp)
+/* The UTF-8 bytes of the code point CP, into B (4 bytes at most); returns their number. */
+static int utf8_enc(char *b, uint32_t cp)
 {
-    char b[4];
     int n = 0;
 
     if (cp < 0x80) {
@@ -1114,7 +1167,14 @@ static void put_utf8(uint32_t cp)
         b[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
         b[n++] = (char)(0x80 | (cp & 0x3f));
     }
-    put(b, n);
+    return n;
+}
+
+static void put_utf8(uint32_t cp)
+{
+    char b[4];
+
+    put(b, utf8_enc(b, cp));
 }
 
 /* Does S name a UTF-8 encoding (UTF-8, utf8, utf-8 ...)? */
@@ -1315,21 +1375,50 @@ static void zero_block(void *p, size_t n);
 #define K_CLEFT  0x10b
 #define K_CRIGHT 0x10c
 #define K_ALTBS  0x10d
+#define K_CHAR   0x100000   /* a character typed: K_CHAR | its code point */
 #define K_F8     0x10e
+#define K_F5     0x10f
+#define K_F6     0x110
+#define K_SUP    0x111
+#define K_SDOWN  0x112
+#define K_INS    0x113
 #define K_NONE   0x1ff
 #define K_ALT    0x200          /* Alt+x is K_ALT | x */
 
 /* Decode one key at in[i]. Returns the key and sets *len, or K_INCOMPLETE if
  * the buffer ends inside a key. Plain bytes are their own keys. */
+/* The key for the bytes at in[i], which is not an Esc: a well-formed UTF-8 character
+ * is one key, K_CHAR | its code point, of *len bytes; anything else is its byte, as
+ * before. K_INCOMPLETE: a character the end of the input cuts off. */
+static int char_key(const unsigned char *in, int n, int i, int *len)
+{
+    int c = in[i], l, k;
+    uint32_t cp;
+
+    if (c < 0xc2 || c > 0xf4) return c;
+    l = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : 2;
+    if (i + l > n) return K_INCOMPLETE;
+    cp = c & ((1 << (7 - l)) - 1);
+    for (k = 1; k < l; k++) {
+        if ((in[i + k] & 0xc0) != 0x80) return c;
+        cp = cp << 6 | (in[i + k] & 0x3f);
+    }
+    if (cp < (l == 2 ? 0x80 : l == 3 ? 0x800 : 0x10000) || cp > 0x10ffff ||
+        (cp >= 0xd800 && cp <= 0xdfff)) return c;
+    *len = l;
+    return K_CHAR | (int)cp;
+}
+
 static int key_parse(const unsigned char *in, int n, int i, int *len)
 {
     int j, k, fin, c, nums[2];
 
     *len = 1;
-    if (in[i] != K_ESC) return in[i];
+    if (in[i] != K_ESC) return char_key(in, n, i, len);
     if (i + 1 >= n) return K_INCOMPLETE;
     if (in[i + 1] == 0x7f || in[i + 1] == 0x08) { *len = 2; return K_ALTBS; }
     if (in[i + 1] == K_ESC) return K_ESC;       /* ESC ESC: the first is Esc, as in mc */
+    if (in[i + 1] >= 0x80) return K_ESC;        /* not Alt+a character: the Esc alone */
     if (in[i + 1] != '[' && in[i + 1] != 'O') { *len = 2; return K_ALT | (in[i + 1] & 0x7f); }
 
     j = i + 2;
@@ -1345,8 +1434,8 @@ static int key_parse(const unsigned char *in, int n, int i, int *len)
     fin = in[j];
     *len = j + 1 - i;
     switch (fin) {
-    case 'A': return K_UP;
-    case 'B': return K_DOWN;
+    case 'A': return nums[1] == 2 ? K_SUP : K_UP;
+    case 'B': return nums[1] == 2 ? K_SDOWN : K_DOWN;
     case 'C': return nums[1] == 5 ? K_CRIGHT : K_RIGHT;
     case 'D': return nums[1] == 5 ? K_CLEFT : K_LEFT;
     case 'H': return K_HOME;
@@ -1356,10 +1445,13 @@ static int key_parse(const unsigned char *in, int n, int i, int *len)
         switch (nums[0]) {
         case 1: case 7:  return K_HOME;
         case 4: case 8:  return K_END;
+        case 2:          return K_INS;
         case 3:          return K_DEL;
         case 5:          return K_PGUP;
         case 6:          return K_PGDN;
         case 13:         return K_F3;
+        case 15:         return K_F5;
+        case 17:         return K_F6;
         case 19:         return K_F8;
         case 21:         return K_F10;
         }
@@ -1473,6 +1565,16 @@ static int word_left(const struct line *l)
 
 /* A key in a line being edited: cursor moves, deletion, typing. Keys that do
  * not edit are ignored. W and HIST give the field for the view. */
+/* A character typed, as its UTF-8 bytes, at the cursor. */
+static void line_char(struct line *l, uint32_t cp)
+{
+    char b[4];
+    int n = utf8_enc(b, cp), j;
+
+    if (l->len + n >= (int)sizeof l->buf) return;
+    for (j = 0; j < n; j++) line_insert(l, (unsigned char)b[j]);
+}
+
 static void line_key(struct line *l, int key, int w, int hist)
 {
     int p;
@@ -1501,6 +1603,10 @@ static void line_key(struct line *l, int key, int w, int hist)
         if (l->pos < l->len) line_cut(l, l->pos, char_next(l, l->pos));
         break;
     default:                       /* a byte of a UTF-8 character is typed as it comes */
+        if (key & K_CHAR) {
+            line_char(l, (uint32_t)(key & ~K_CHAR));
+            break;
+        }
         if (((key >= 0x20 && key < 0x7f) || (key >= 0x80 && key < 0x100)) &&
             l->len < (int)sizeof l->buf - 1)
             line_insert(l, key);
@@ -2131,6 +2237,21 @@ static void nav_key(struct panel *p, int key)
     scroll(p);
 }
 
+/* Insert, and Shift+Up or Shift+Down: the highlighted item is marked (or unmarked,
+ * if it was marked already), and the cursor moves one item: down for Insert and
+ * Shift+Down, up for Shift+Up. \"..\" is never marked; the cursor stops at either end. */
+static void sel_key(struct panel *p, int key)
+{
+    if (p->n == 0) return;
+    if (!p->e[p->ord[p->cur]].up) p->e[p->ord[p->cur]].sel ^= 1;
+    if (key == K_SUP) {
+        if (p->cur > 0) p->cur--;
+    } else if (p->cur < p->n - 1) {
+        p->cur++;
+    }
+    scroll(p);
+}
+
 /* ------------------------------------------------------------- quick cd */
 
 static void change_to(struct panel *p, const char *res, const char *shown);
@@ -2173,8 +2294,11 @@ static const char *errstr(long e)
     case 5:  return "Input/output error";
     case 13: return "Permission denied";
     case 16: return "Device or resource busy";
+    case 17: return "File exists";
     case 20: return "Not a directory";
     case 21: return "Is a directory";
+    case 22: return "Invalid argument";
+    case 28: return "No space left on device";
     case 30: return "Read-only file system";
     case 36: return "File name too long";
     case 39: return "Directory not empty";
@@ -2191,7 +2315,8 @@ static void set_error(const char *head, const char *shown, long e)
     int w = 0, maxp = cols - 6, l;
 
     elen[0] = cat(eline[0], head);
-    l = cat(eline[1], shown);
+    strlcpy(eline[1], shown, sizeof eline[1]);
+    l = (int)strlen(eline[1]);
     elen[1] = cut_cols(eline[1], l, maxp);
     eline[1][elen[1]] = 0;
     elen[2] = cat(eline[2], errstr(e));
@@ -2202,7 +2327,7 @@ static void set_error(const char *head, const char *shown, long e)
     eline[2][elen[2]++] = ')';
     eline[2][elen[2]] = 0;
     for (int i = 0; i < 3; i++) if (tcols(eline[i], elen[i]) > w) w = tcols(eline[i], elen[i]);
-    ewidth = w + 6;
+    ewidth = w + 4 + 2 * DIALOG_PAD;
     if (ewidth > cols) ewidth = cols;
     mode = MODE_ERR;
 }
@@ -2210,10 +2335,14 @@ static void set_error(const char *head, const char *shown, long e)
 /* Change the active panel to the directory the user typed. As in mc: blanks
  * around the text are dropped, an empty entry means $HOME, "~" is $HOME, and a
  * relative path is taken from the panel's directory. */
-static void quick_cd(const char *typed)
+/* The absolute path TYPED names, as quick cd takes it: blanks around it are
+ * dropped, an empty entry or ~ is $HOME, ~USER is that account's home, and a
+ * relative path is taken from BASE. RES gets the path, SHOWN the path as typed,
+ * for the error box. */
+static void path_of(const char *typed, const char *base, char *res, size_t rmax,
+                    char *shown, size_t smax)
 {
-    char s[256], shown[512], abs[4096], res[4096];
-    struct panel *p = &P[act];
+    char s[256], abs[4096];
     const char *home = genv("HOME");
     size_t a = 0, b, n = 0;
 
@@ -2225,7 +2354,7 @@ static void quick_cd(const char *typed)
     s[n] = 0;
 
     if (n == 0) {
-        strlcpy(shown, home ? home : "/", sizeof shown);
+        strlcpy(shown, home ? home : "/", smax);
     } else if (s[0] == '~') {                      /* ~ and ~/ : the account's home */
         size_t k = 1;
         char hb[4096];
@@ -2235,25 +2364,31 @@ static void quick_cd(const char *typed)
         ok = k == 1 ? pw_field(NULL, 0, uid, 5, hb, sizeof hb)
                     : pw_field(s + 1, k - 1, 0, 5, hb, sizeof hb);
         if (ok) {
-            strlcpy(shown, hb, sizeof shown);
-            strlcat(shown, s + k, sizeof shown);
+            strlcpy(shown, hb, smax);
+            strlcat(shown, s + k, smax);
         } else {
-            strlcpy(shown, s, sizeof shown);
+            strlcpy(shown, s, smax);
         }
     } else {
-        strlcpy(shown, s, sizeof shown);
+        strlcpy(shown, s, smax);
     }
 
     if (shown[0] == '/') {
         strlcpy(abs, shown, sizeof abs);
     } else {
-        strlcpy(abs, p->path, sizeof abs);
+        strlcpy(abs, base, sizeof abs);
         if (abs[strlen(abs) - 1] != '/') strlcat(abs, "/", sizeof abs);
         strlcat(abs, shown, sizeof abs);
     }
-    canon(res, sizeof res, abs);
+    canon(res, rmax, abs);
+}
 
-    change_to(p, res, shown);
+static void quick_cd(const char *typed)
+{
+    char res[4096], shown[512];
+
+    path_of(typed, P[act].path, res, sizeof res, shown, sizeof shown);
+    change_to(&P[act], res, shown);
 }
 
 /* Change panel P to the absolute directory RES. SHOWN is the path as given,
@@ -2330,23 +2465,28 @@ static void enter_dir(struct panel *p)
  * at X0 with width PW. The top and bottom rows are blank margins. */
 static void qcd_draw_row(int y, int x0, int pw)
 {
-    int dy = y - (rows - 7), r = x0 + pw - 1, f = pw - 12, x;
+    int top = rows - 2 - QCD_H, dy = y - top, r = x0 + pw - 1;
+    int fl = x0 + DIALOG_PAD, fr = r - DIALOG_PAD, fd, x;
     const char *title = " Quick cd ";
 
+    if (y < top || y >= top + QCD_H) return;
     for (x = x0; x <= r; x++) setc(x, ' ', C_QCD);
-    if (dy == 0 || dy == 4) return;                /* margins */
-    if (dy == 1 || dy == 3) {                      /* frame */
-        setc(x0 + 1, dy == 1 ? 'l' : 'm', C_QCD | DEC);
-        for (x = x0 + 2; x <= x0 + pw - 3; x++) setc(x, 'q', C_QCD | DEC);
-        setc(x0 + pw - 2, dy == 1 ? 'k' : 'j', C_QCD | DEC);
-        if (dy == 1) sets(x0 + 2 + (pw - 4 - 10) / 2, title, 10, C_QTITLE);
+    if (dy < DIALOG_PAD || dy >= QCD_H - DIALOG_PAD) return;       /* the margin */
+    fd = dy - DIALOG_PAD;
+    if (fd == 0 || fd == 2) {                      /* frame, titled on top */
+        setc(fl, fd == 0 ? 'l' : 'm', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, fd == 0 ? 'k' : 'j', C_QCD | DEC);
+        if (fd == 0) sets(fl + 1 + (fr - fl - 1 - 10) / 2, title, 10, C_QTITLE);
     } else {                                       /* input line */
-        setc(x0 + 1, 'x', C_QCD | DEC);
-        setc(x0 + pw - 2, 'x', C_QCD | DEC);
-        sets(x0 + 3, "cd", 2, C_QCD);
-        line_view(&qline, pw - 9, 3);
-        line_draw(&qline, x0 + 6, f, C_FIELD);
-        sets(x0 + 6 + f, "[^]", 3, C_HIST);
+        int f = (pw - 2 * DIALOG_PAD) - 10;
+
+        setc(fl, 'x', C_QCD | DEC);
+        setc(fr, 'x', C_QCD | DEC);
+        sets(fl + 2, "cd", 2, C_QCD);
+        line_view(&qline, f + 3, 3);
+        line_draw(&qline, fl + 5, f, C_FIELD);
+        sets(fl + 5 + f, "[^]", 3, C_HIST);
     }
 }
 
@@ -2355,7 +2495,7 @@ static void qcd_draw_row(int y, int x0, int pw)
 /* Position of the error box: mc's wtools placement for message dialogs. */
 static void err_geom(int *x, int *y)
 {
-    int h = 9, w = ewidth;
+    int h = ERR_H, w = ewidth;
     int ypos = rows / 3 - (h - 3) / 2;
 
     if (ypos + h < rows / 2) {                     /* too high: centre it */
@@ -2371,25 +2511,27 @@ static void err_geom(int *x, int *y)
 
 static void err_draw_row(int y, int ex, int ey)
 {
-    int dy = y - ey, w = ewidth, x0 = ex, r = ex + w - 1, x, i;
+    int dy = y - ey - DIALOG_PAD, fw = ewidth - 2 * DIALOG_PAD;
+    int x0 = ex + DIALOG_PAD, r = x0 + fw - 1, x, i;
 
-    if (dy < 0 || dy >= 9) return;
-    for (x = x0; x <= r; x++) setc(x, ' ', C_ERR);
-    if (dy == 1) {                                 /* top frame with title */
-        setc(x0 + 1, 'l', C_ERR | DEC);
-        for (x = x0 + 2; x <= x0 + w - 3; x++) setc(x, 'q', C_ERR | DEC);
-        setc(x0 + w - 2, 'k', C_ERR | DEC);
-        sets(x0 + 2 + (w - 4 - 7) / 2, " Error ", 7, C_ERRHEAD);
-    } else if (dy == 7) {                          /* bottom frame */
-        setc(x0 + 1, 'm', C_ERR | DEC);
-        for (x = x0 + 2; x <= x0 + w - 3; x++) setc(x, 'q', C_ERR | DEC);
-        setc(x0 + w - 2, 'j', C_ERR | DEC);
-    } else if (dy >= 2 && dy <= 6) {               /* sides */
-        setc(x0 + 1, 'x', C_ERR | DEC);
-        setc(x0 + w - 2, 'x', C_ERR | DEC);
-        if (dy >= 3 && dy <= 5) {                  /* message lines, centred */
-            i = dy - 3;
-            sets(x0 + 2 + (w - 4 - tcols(eline[i], elen[i])) / 2, eline[i], elen[i], C_ERR);
+    if (y < ey || y >= ey + ERR_H) return;
+    for (x = ex; x < ex + ewidth; x++) setc(x, ' ', C_ERR);
+    if (dy < 0 || dy >= 7) return;
+    if (dy == 0) {                                 /* top frame with title */
+        setc(x0, 'l', C_ERR | DEC);
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_ERR | DEC);
+        setc(r, 'k', C_ERR | DEC);
+        sets(x0 + 2 + (fw - 4 - 7) / 2, " Error ", 7, C_ERRHEAD);
+    } else if (dy == 6) {                          /* bottom frame */
+        setc(x0, 'm', C_ERR | DEC);
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_ERR | DEC);
+        setc(r, 'j', C_ERR | DEC);
+    } else {                                       /* sides; the message lines, centred */
+        setc(x0, 'x', C_ERR | DEC);
+        setc(r, 'x', C_ERR | DEC);
+        if (dy >= 2 && dy <= 4) {
+            i = dy - 2;
+            sets(x0 + 2 + (fw - 4 - tcols(eline[i], elen[i])) / 2, eline[i], elen[i], C_ERR);
         }
     }
 }
@@ -2436,9 +2578,11 @@ static void shade(int x0, int x1)
  * screen with a title, two lines of text and buttons, one of them selected.  The
  * question is Yes or No; a failure is Skip, Skip all, Retry or Abort.  Only
  * files are deleted: F8 on a directory does nothing. */
-enum { QY_ASK, QY_ERR };
+enum { QY_ASK, QY_ERR, QY_DIR };
 struct qy_button { const char *label; int hot; };   /* hot: the index of the hotkey in the label */
 static const struct qy_button qy_yesno[2] = { { "[ Yes ]", 2 }, { "[ No ]", 2 } };
+static const struct qy_button qy_recurse[5] = { { "[ Yes ]", 2 }, { "[ No ]", 2 }, { "[ All ]", 3 },
+                                                 { "[ None ]", 5 }, { "[ Abort ]", 2 } };
 static const struct qy_button qy_failed[4] = { { "[ Skip ]", 2 }, { "[ Skip all ]", 5 },
                                                { "[ Retry ]", 2 }, { "[ Abort ]", 2 } };
 static int  qy_kind;
@@ -2449,8 +2593,8 @@ static int  qrx, qry, qrw, qrh;         /* the box, with its margin of one cell 
 
 static const struct qy_button *qy_buttons(int *n)
 {
-    *n = qy_kind == QY_ASK ? 2 : 4;
-    return qy_kind == QY_ASK ? qy_yesno : qy_failed;
+    *n = qy_kind == QY_ASK ? 2 : qy_kind == QY_DIR ? 5 : 4;
+    return qy_kind == QY_ASK ? qy_yesno : qy_kind == QY_DIR ? qy_recurse : qy_failed;
 }
 
 /* The box, and where it goes.  Its width is that of the widest of the title, the
@@ -2468,10 +2612,10 @@ static void qy_geom(void)
     if (6 > m) m = 6;                   /* the title: "Delete", 5 for "Error" */
     if (t1 > m) m = t1;
     if (t2 > m) m = t2;
-    qrw = m + 6;
-    qrh = 2 + 6;                        /* two lines of text, and the frame, with the margin */
+    qrw = m + 4 + 2 * DIALOG_PAD;
+    qrh = 6 + 2 * DIALOG_PAD;          /* two lines of text, and the frame, with the margin */
     qrx = (cols - qrw + 1) / 2;
-    qry = qy_kind == QY_ASK ? (rows - 6) / 3 : (rows - 4) / 2;
+    qry = qy_kind != QY_ERR ? (rows - 6) / 3 : (rows - 4) / 2;
     if (qrx < 0) qrx = 0;
     if (qry < 0) qry = 0;
 }
@@ -2485,7 +2629,8 @@ static void qy_label(int x, const char *label, int hot, uint16_t base, uint16_t 
 
 static void qy_draw_row(int y)
 {
-    int fx = qrx + 1, fw = qrw - 2, fh = qrh - 2, in = fw - 2, dy = y - (qry + 1), x, nb;
+    int fx = qrx + DIALOG_PAD, fw = qrw - 2 * DIALOG_PAD, fh = 6, in = fw - 2;
+    int dy = y - (qry + DIALOG_PAD), x, nb;
     const struct qy_button *b;
 
     if (y < qry || y >= qry + qrh) return;
@@ -2496,7 +2641,7 @@ static void qy_draw_row(int y)
     if (dy == 0 || dy == 3 || dy == 5)
         for (x = fx + 1; x < fx + fw - 1; x++) setc(x, 'q', C_ERR | DEC);
     if (dy == 0) {
-        const char *title = qy_kind == QY_ASK ? " Delete " : " Error ";
+        const char *title = qy_kind != QY_ERR ? " Delete " : " Error ";
         int tl = (int)strlen(title);
 
         sets(fx + 1 + (in - tl) / 2, title, tl, C_ERRHEAD);
@@ -2520,85 +2665,161 @@ static void qy_draw_row(int y)
     }
 }
 
-/* F8 or ESC 8 on a file: the question.  The name is shown as mc shows it, cut to
- * 43 cells in the middle: 64 cells less the question's own 17 and 4 for the box. */
+/* The job: F5, F6 or F8 done to a set of files. The set is the marked files and
+ * directories of the panel if any is marked, else the highlighted item. Each item
+ * is copied, moved or deleted in turn, and a directory is done as a whole: what is
+ * in it is done too, recursively. A question is asked while the job runs, and the
+ * job waits for its answer (modal_wait), so walking down a tree is plain recursion.
+ * Esc, or Abort, stops the job at once: an item it has not finished keeps its mark. */
+enum { JOB_COPY, JOB_MOVE, JOB_DEL };
+static struct {
+    int kind;                   /* JOB_COPY, JOB_MOVE or JOB_DEL */
+    int sel;                    /* the marked items, not just the highlighted one */
+    int dir;                    /* the destination is a directory: an item keeps its name in it */
+    int pos;                    /* the next display index of the panel to look at */
+    int skip_err;               /* Skip all was chosen: failures pass items over */
+} job;
+static char job_dst[4096];      /* the destination: a directory, or the file itself */
+static long job_skips;          /* items passed over: a move keeps a source whose copy skipped any */
+
+/* How a file is written, and what is decided about one that exists. */
+enum { HOW_NEW, HOW_OVER, HOW_APPEND };
+enum { DEC_NONE, DEC_NEW, DEC_OVER, DEC_APPEND, DEC_SKIP };
+
+/* The overwrite question, as mc asks it. cf_group is the group answer that stands for
+ * the rest of the job (CF_ASK: the question is asked for each file). The figures are
+ * those of the pair in hand; cf_srcp and cf_dstp are its paths, as the question shows. */
+enum { CF_ASK, CF_ALL, CF_OLDER, CF_NONE, CF_SMALLER, CF_SIZE };
+#define CF_H 15                 /* rows of the question's box */
+static int cf_group, cf_zero, cf_sel, cf_ans;
+static uint64_t cf_ssize, cf_dsize;
+static int64_t cf_smt, cf_dmt;
+static const char *cf_srcp, *cf_dstp;
+
+static int dgrp;                /* the answer to non-empty directories: 0 ask, 1 All, 2 None */
+static int qy_ans;              /* the answer given to a failure or a directory question */
+
+/* The input: the block read, from which the keys are taken, by the main loop and by
+ * a question's wait alike. kbuf_eof is set when input has ended. */
+static unsigned char kbuf[64];
+static int kbuf_n, kbuf_i, kbuf_eof;
+
+static int handle_key(int key);
+static void modal_wait(void);
+static int take_key(void);
+static void job_run(void);
+
+/* Whether two files are one file: the same device and inode. */
+static int same_file(const struct statx *a, const struct statx *b)
+{
+    return a->stx_dev_major == b->stx_dev_major && a->stx_dev_minor == b->stx_dev_minor &&
+           a->stx_ino == b->stx_ino;
+}
+
+/* The rule of the group answer for the pair in hand, as mc has it: a zero-length file
+ * is not written over when the checkbox says so, except by Yes or Smaller. DEC_NONE
+ * when the question is to be asked (CF_ASK). */
+static int conflict_rule(void)
+{
+    int zero = cf_zero && cf_ssize == 0;
+
+    switch (cf_group) {
+    case CF_ALL:     return zero ? DEC_SKIP : DEC_OVER;
+    case CF_OLDER:   return cf_smt > cf_dmt && !zero ? DEC_OVER : DEC_SKIP;
+    case CF_NONE:    return DEC_SKIP;
+    case CF_SMALLER: return cf_ssize > cf_dsize ? DEC_OVER : DEC_SKIP;
+    case CF_SIZE:    return cf_ssize != cf_dsize && !zero ? DEC_OVER : DEC_SKIP;
+    }
+    return DEC_NONE;
+}
+
+/* The marked items: whether any is marked (a directory counts), and how many marked
+ * files and directories there are. ".." is never marked. */
+static int marked_any(const struct panel *p)
+{
+    for (int i = 0; i < p->ne; i++)
+        if (p->e[i].sel && !p->e[i].up) return 1;
+    return 0;
+}
+
+static void marked_counts(const struct panel *p, int *files, int *dirs)
+{
+    *files = *dirs = 0;
+    for (int i = 0; i < p->ne; i++)
+        if (p->e[i].sel && !p->e[i].up) {
+            if (is_dir(&p->e[i])) (*dirs)++;
+            else (*files)++;
+        }
+}
+
+/* The display index of the next item the job works on, or -1 when there is none. */
+static int job_next(const struct panel *p)
+{
+    for (; job.pos < p->n; job.pos++) {
+        const struct ent *e = &p->e[p->ord[job.pos]];
+
+        if (e->up) continue;
+        if (job.sel ? e->sel : job.pos == p->cur) return job.pos++;
+    }
+    return -1;
+}
+
+/* F8 or ESC 8: the question. For marked items it counts them, worded as mc words it:
+ * "files", "directories", or "files/directories" when both are there. For the
+ * highlighted item it names it: "Delete directory" or "Delete file", and the name. */
 static void delete_open(struct panel *p)
 {
     const struct ent *e;
     char fitted[256];
-    int n;
+    int n, files, dirs;
 
-    if (p->n == 0) return;
-    e = &p->e[p->ord[p->cur]];
-    if (e->up || is_dir(e)) return;
-    n = fit_name(fitted, p->nm + e->name, 43);
+    job.sel = marked_any(p);
+    if (job.sel) {
+        marked_counts(p, &files, &dirs);
+        if (files + dirs == 0) return;
+        qy_n1 = cat(qy_t1, "Delete ");
+        if (files + dirs == 1) {
+            qy_n1 += cat(qy_t1 + qy_n1, dirs ? "directory" : "file");
+        } else {
+            qy_n1 += (int)utoa((unsigned long)(files + dirs), qy_t1 + qy_n1);
+            qy_n1 += cat(qy_t1 + qy_n1, dirs == 0 ? " files" : files == 0 ? " directories"
+                                                              : " files/directories");
+        }
+        qy_n1 += cat(qy_t1 + qy_n1, "?");
+        qy_n2 = 0;
+    } else {
+        if (p->n == 0) return;
+        e = &p->e[p->ord[p->cur]];
+        if (e->up) return;
+        n = fit_name(fitted, p->nm + e->name, 43);
+        qy_n1 = cat(qy_t1, is_dir(e) ? "Delete directory" : "Delete file");
+        qy_n2 = 0;
+        qy_t2[qy_n2++] = '"';
+        for (int k = 0; k < n; k++) qy_t2[qy_n2++] = fitted[k];
+        qy_t2[qy_n2++] = '"';
+        qy_t2[qy_n2++] = '?';
+    }
     qy_kind = QY_ASK;
-    qy_n1 = cat(qy_t1, "Delete file");
-    qy_n2 = 0;
-    qy_t2[qy_n2++] = '"';
-    for (int k = 0; k < n; k++) qy_t2[qy_n2++] = fitted[k];
-    qy_t2[qy_n2++] = '"';
-    qy_t2[qy_n2++] = '?';
-    qy_t2[qy_n2] = 0;
     qy_sel = 0;
     mode = MODE_QUERY;
 }
 
-/* Remove the highlighted file.  If that fails, the box asks what to do: Skip,
- * Skip all, Retry, or Abort.  If it works, the panels read their directories
- * again where those have changed. */
-static void delete_attempt(struct panel *p)
-{
-    const struct ent *e;
-    char path[4352];
-    int k;
-    long r;
-
-    if (p->n == 0) return;
-    e = &p->e[p->ord[p->cur]];
-    k = cat(path, p->path);
-    if (k && path[k - 1] != '/') path[k++] = '/';
-    k += cat(path + k, p->nm + e->name);
-    path[k] = 0;
-    r = unlinkat(AT_FDCWD, path, 0);
-    if (r >= 0) {
-        mode = MODE_NORMAL;
-        rescan_changed();
-        return;
-    }
-    qy_kind = QY_ERR;
-    qy_n1 = cat(qy_t1, "Cannot remove file \"");
-    k = 0;
-    while (path[k] && qy_n1 + k < (int)sizeof qy_t1 - 3) {
-        qy_t1[qy_n1 + k] = path[k];
-        k++;
-    }
-    qy_n1 += k;
-    qy_t1[qy_n1++] = '"';
-    qy_t1[qy_n1] = 0;
-    qy_n2 = cat(qy_t2, errstr(-r));
-    qy_t2[qy_n2++] = ' ';
-    qy_t2[qy_n2++] = '(';
-    k = (int)utoa((unsigned long)-r, qy_t2 + qy_n2);
-    qy_n2 += k;
-    qy_t2[qy_n2++] = ')';
-    qy_t2[qy_n2] = 0;
-    qy_sel = 0;
-    mode = MODE_QUERY;
-}
-
-/* The choice of a button: Yes deletes the file; of the failure's buttons, Retry
- * tries again, and the others close the box. */
+/* The choice of a button. Yes in the Delete question starts the job. Every other
+ * question (a failure, a directory) only records its answer: the job waiting for it
+ * goes on. */
 static void qy_choose(int b)
 {
     if (qy_kind == QY_ASK) {
-        if (b == 0) delete_attempt(&P[act]);
-        else mode = MODE_NORMAL;
-    } else if (b == 2) {
-        delete_attempt(&P[act]);
-    } else {
         mode = MODE_NORMAL;
+        if (b == 0) {
+            job.kind = JOB_DEL;
+            job.dir = 0;
+            job_run();
+        }
+        return;
     }
+    qy_ans = b;
+    mode = MODE_NORMAL;
 }
 
 /* The keys of a question: its hotkeys, Enter for the selected button, Left and
@@ -2609,7 +2830,7 @@ static int qy_handle(int key)
     const struct qy_button *b = qy_buttons(&nb);
 
     if (key == K_ESC) {
-        qy_choose(qy_kind == QY_ASK ? 1 : 3);
+        qy_choose(qy_kind == QY_ASK ? 1 : nb - 1);
         return 0;
     }
     if (key == 13 || key == 10) {
@@ -2633,6 +2854,1001 @@ static int qy_handle(int key)
     return 0;
 }
 
+/* ------------------------------------------------ copy and move (F5, F6)
+ *
+ * A file is copied or moved in two steps, as mc does it: a question, with the
+ * destination typed in a field (Enter does it, Esc gives up), and then a
+ * progress box while the bytes go across. The destination starts as the other
+ * panel's directory. */
+
+static void draw(void);
+
+enum { OP_COPY, OP_MOVE };
+static char op_t1[320];                 /* the question's text: Copy "name" to: */
+static int op_n1;
+static struct line dline;               /* the destination, as typed */
+static int opx, opy, opw, oph;          /* the box: column, row, width, height */
+static const char *op_title[2] = { " Copy ", " Move " };
+static const char *pg_src, *pg_dst;     /* the progress box: the source name, the destination */
+static int pg_pct;                      /* percentage the progress box shows, -1 before the first */
+
+/* The terminal size, if it has changed: the screen, the panels and the shell's
+ * pseudo-terminal follow it. */
+static void check_size(void)
+{
+    struct winsz ws;
+
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.col && ws.row &&
+        (ws.col != cols || ws.row != rows)) {
+        cols = ws.col > MAXW ? MAXW : ws.col;
+        rows = ws.row;
+        if (sh_fd >= 0) size_pty(sh_fd);
+        scroll(&P[0]);
+        scroll(&P[1]);
+        if (!hidden) outs("\x1b[2J");
+    }
+}
+
+/* S, N bytes of UTF-8, in W cells: all of it if it fits, else as much of its
+ * end as fits after a ~ for what is cut from the front. */
+static void show_tail(int x, const char *s, int n, int w, uint16_t a)
+{
+    int k = 0, total = tcols(s, n);
+
+    if (total <= w) {
+        sets(x, s, n, a);
+        return;
+    }
+    while (total > w - 1 && k < n) total -= cwidth(utf8_get(s, n, &k));
+    setc(x, '~', a);
+    sets(x + 1, s + k, n - k, a);
+}
+
+/* The box: 64 cells wide, or less on a narrow screen, and in the upper third of
+ * the screen. The question is six rows, the progress box nine. */
+static void op_geom(void)
+{
+    opw = cols - 4 < 64 ? cols - 4 : 64;
+    if (opw < 8) opw = 8;
+    oph = (mode == MODE_PROG ? 9 : mode == MODE_CONFLICT ? CF_H : 6) + 2 * DIALOG_PAD;
+    opx = (cols - opw) / 2;
+    opy = (rows - oph) / 3;
+    if (opx < 0) opx = 0;
+    if (opy < 0) opy = 0;
+}
+
+/* The progress bar: [=====     ] and the percentage, in W cells at X. */
+static void op_bar(int x, int w)
+{
+    int bw = w - 9, pct = pg_pct > 0 ? pg_pct : 0, filled = pct * bw / 100;
+    char pc[4];
+
+    if (bw < 1) return;
+    setc(x, '[', C_QCD);
+    for (int i = 0; i < bw; i++) setc(x + 1 + i, ' ', i < filled ? C_FIELD : C_QCD);
+    setc(x + 1 + bw, ']', C_QCD);
+    putnum(pc, (unsigned long)pct, 3);
+    setc(x + 2 + bw, ' ', C_QCD);
+    sets(x + 3 + bw, pc, 3, C_QCD);
+    setc(x + 6 + bw, '%', C_QCD);
+}
+
+/* One row of the box.  The question: its text, the destination field, and the
+ * buttons.  The progress box: source and destination, the bar and [ Abort ]. */
+static void op_row(int dy)
+{
+    int prog = mode == MODE_PROG, fh = oph - 2 * DIALOG_PAD;
+    int x0 = opx + DIALOG_PAD, r = opx + opw - 1 - DIALOG_PAD, in = OPFW - 4, x;
+    int sep = prog ? 6 : 3, btn = prog ? 7 : 4;
+
+    if (dy < 0 || dy >= oph) return;
+    for (x = opx; x < opx + opw; x++) setc(x, ' ', C_QCD);     /* the margin too */
+    dy -= DIALOG_PAD;
+    if (dy < 0 || dy >= fh) return;
+    if (dy == 0 || dy == fh - 1) {                       /* the frame, titled on top */
+        setc(x0, dy ? 'm' : 'l', C_QCD | DEC);
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_QCD | DEC);
+        setc(r, dy ? 'j' : 'k', C_QCD | DEC);
+        if (!dy) sets(x0 + (OPFW - 6) / 2, op_title[job.kind == JOB_COPY ? 0 : 1], 6, C_QTITLE);
+        return;
+    }
+    setc(x0, dy == sep ? 't' : 'x', C_QCD | DEC);
+    setc(r, dy == sep ? 'u' : 'x', C_QCD | DEC);
+    if (dy == sep) {
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_QCD | DEC);
+        return;
+    }
+    if (dy == btn) {
+        if (prog) {
+            qy_label(x0 + 2 + (in - 9) / 2, "[ Abort ]", 2, C_FIELD, C_QHOTSEL);
+        } else {
+            x = x0 + 2 + (in - 18) / 2;
+            sets(x, "[ OK ]", 6, C_FIELD);
+            sets(x + 8, "[ Cancel ]", 10, C_QCD);
+        }
+        return;
+    }
+    if (!prog) {
+        if (dy == 1) sets(x0 + 2, op_t1, op_n1, C_QCD);
+        if (dy == 2) {
+            line_view(&dline, in, 0);
+            line_draw(&dline, x0 + 2, in, C_FIELD);
+        }
+        return;
+    }
+    if (dy == 1) sets(x0 + 2, "Source", 6, C_QCD);
+    if (dy == 2) show_tail(x0 + 2, pg_src, (int)strlen(pg_src), in, C_QCD);
+    if (dy == 3) sets(x0 + 2, "Target", 6, C_QCD);
+    if (dy == 4) show_tail(x0 + 2, pg_dst, (int)strlen(pg_dst), in, C_QCD);
+    if (dy == 5) op_bar(x0 + 2, in);
+}
+
+/* Whether Esc, or A (the Abort of the progress box), has been typed alone, without
+ * waiting for more input. Other keys typed during a copy are dropped. */
+static int esc_typed(void)
+{
+    struct pollfd pf;
+    unsigned char k[8];
+    long n;
+
+    pf.fd = 0;
+    pf.events = POLLIN;
+    pf.revents = 0;
+    if (poll(&pf, 1, 0) <= 0) return 0;
+    n = read(0, k, sizeof k);
+    if (n == 1 && (k[0] == 'a' || k[0] == 'A')) return 1;
+    return n >= 1 && k[0] == K_ESC && (n == 1 || k[1] == K_ESC);
+}
+
+/* A chunk of the copy is done: the progress box is drawn again if its
+ * percentage has moved. */
+static void pg_update(uint64_t done, uint64_t total)
+{
+    int pct = total ? (int)udiv64(done * 100, total, NULL) : 100;
+
+    if (pct > 100) pct = 100;
+    if (pct == pg_pct) return;
+    pg_pct = pct;
+    check_size();
+    draw();
+}
+
+/* Copy IN to OUT a chunk at a time, through ob: nothing else uses ob while the
+ * copy runs, as draw() only runs once the chunk is written. Esc stops it, and
+ * the result is -ECANCELED. */
+static long copy_data(long in, long out, uint64_t total)
+{
+    uint64_t done = 0;
+
+    for (;;) {
+        long n = read((int)in, ob, sizeof ob), off = 0;
+
+        if (n == -EINTR) continue;
+        if (n <= 0) return n;
+        while (off < n) {
+            long w = write((int)out, ob + off, (size_t)(n - off));
+
+            if (w == -EINTR) continue;
+            if (w <= 0) return w < 0 ? w : -EIO;
+            off += w;
+        }
+        done += (uint64_t)n;
+        pg_update(done, total);
+        if (esc_typed()) return -ECANCELED;
+    }
+}
+
+/* Copy the file or link SRC to DST, made with the mode of SRC; a link is copied as
+ * a link. HOW says what to do if DST exists: HOW_NEW (it must not), HOW_OVER
+ * (truncate it), HOW_APPEND (add to its end). A copy that fails leaves no DST
+ * behind, but only one made here: an existing file that was written over stays
+ * as far as the copy got. Only files and links are copied. Returns 0, or -errno. */
+static long copy_file(const char *src, const char *dst, int how)
+{
+    struct statx sx;
+    char tg[4096];
+    long in, out, r;
+    uint32_t type;
+
+    r = statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx);
+    if (r) return r;
+    type = sx.stx_mode & S_IFMT;
+    if (type == S_IFLNK) {
+        r = readlinkat(AT_FDCWD, src, tg, sizeof tg - 1);
+        if (r < 0) return r;
+        tg[r] = 0;
+        if (how != HOW_NEW) unlinkat(AT_FDCWD, dst, 0);    /* a link is replaced, not written in */
+        return symlinkat(tg, AT_FDCWD, dst);
+    }
+    if (type != S_IFREG) return -EINVAL;
+    in = open(src, O_RDONLY, 0);
+    if (in < 0) return in;
+    out = open(dst, O_WRONLY | O_CREAT |
+               (how == HOW_NEW ? O_EXCL : how == HOW_OVER ? O_TRUNC : O_APPEND),
+               sx.stx_mode & 07777);
+    if (out < 0) {
+        close((int)in);
+        return out;
+    }
+    if (how != HOW_APPEND) fchmod((int)out, sx.stx_mode & 07777);   /* not left to the umask */
+    r = copy_data(in, out, sx.stx_size);
+    close((int)in);
+    close((int)out);
+    if (r && how == HOW_NEW) unlinkat(AT_FDCWD, dst, 0);
+    return r;
+}
+
+/* Copy or move SRC to DST, with HOW as in copy_file(). A move is a rename, which
+ * replaces DST; it cannot append, and across file systems it is a copy and then
+ * the removal of SRC. A new DST must not exist. Returns 0, or -errno. */
+static long op_file(const char *src, const char *dst, int how)
+{
+    struct statx sx;
+    long r;
+
+    if (how == HOW_NEW && statx(AT_FDCWD, dst, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) == 0)
+        return -EEXIST;
+    if (job.kind == JOB_COPY) return copy_file(src, dst, how);
+    if (how != HOW_APPEND) {
+        r = renameat2(AT_FDCWD, src, AT_FDCWD, dst, 0);
+        if (r != -EXDEV) return r;
+    }
+    r = copy_file(src, dst, how);
+    if (r == 0) r = unlinkat(AT_FDCWD, src, 0);
+    return r;
+}
+
+/* The overwrite question, as mc asks it: the new file and the one that exists,
+ * with sizes and dates; Yes, No and Append for this file; and for the rest of the
+ * job All, Older, None, Smaller and Size differs, with a checkbox for zero-length
+ * files, and Abort. Items 0 to 9 are the buttons in focus order. */
+static const char *const cf_label[10] = {
+    "[ Yes ]", "[ No ]", "[ Append ]", "", "[ All ]", "[ Older ]", "[ None ]",
+    "[ Smaller ]", "[ Size differs ]", "[ Abort ]"
+};
+static const char cf_hot[10] = { 'y', 'n', 'p', 'z', 'l', 'o', 'e', 'm', 's', 'a' };
+static const unsigned char cf_at[10] = { 7, 7, 7, 10, 11, 11, 11, 11, 11, 13 };   /* each item's row */
+
+static const char *cf_str(int i)
+{
+    if (i == 3) return cf_zero ? "[x] Don't overwrite with zero length file"
+                               : "[ ] Don't overwrite with zero length file";
+    return cf_label[i];
+}
+
+/* The index in S of its first letter HOT, either case, or -1: the hotkey's letter. */
+static int hot_at(const char *s, int hot)
+{
+    for (int k = 0; s[k]; k++) {
+        int c = (unsigned char)s[k];
+
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == hot) return k;
+    }
+    return -1;
+}
+
+/* The buttons of row DY, centred in the IN cells after X0. */
+static void cf_buttons(int dy, int x0, int in)
+{
+    int items[10], n = 0, w = 0, x;
+
+    for (int i = 0; i < 10; i++)
+        if (cf_at[i] == dy) items[n++] = i;
+    for (int j = 0; j < n; j++) w += (int)strlen(cf_str(items[j])) + (j ? 1 : 0);
+    x = x0 + 1 + (in - w) / 2;
+    for (int j = 0; j < n; j++) {
+        const char *s = cf_str(items[j]);
+        int sel = items[j] == cf_sel;
+
+        qy_label(x, s, hot_at(s, cf_hot[items[j]]), sel ? C_TITLE : C_ERR,
+                 sel ? ATTR(BROWN, WHITE, 1) : C_ERRHEAD);
+        x += (int)strlen(s) + 1;
+    }
+}
+
+/* One row of the question. */
+static void cf_row(int dy)
+{
+    int x0 = opx + DIALOG_PAD, r = opx + opw - 1 - DIALOG_PAD, x, in = OPFW - 2, l;
+    char sz[16], tm[16];
+
+    if (dy < 0 || dy >= oph) return;
+    for (x = opx; x < opx + opw; x++) setc(x, ' ', C_ERR);     /* the margin too */
+    dy -= DIALOG_PAD;
+    if (dy < 0 || dy >= CF_H) return;
+    if (dy == 0 || dy == CF_H - 1) {
+        setc(x0, dy ? 'm' : 'l', C_ERR | DEC);
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_ERR | DEC);
+        setc(r, dy ? 'j' : 'k', C_ERR | DEC);
+        if (!dy) sets(x0 + (OPFW - 13) / 2, " File exists ", 13, C_ERRHEAD);
+        return;
+    }
+    if (dy == 5 || dy == 8 || dy == 12) {
+        setc(x0, 't', C_ERR | DEC);
+        for (x = x0 + 1; x < r; x++) setc(x, 'q', C_ERR | DEC);
+        setc(r, 'u', C_ERR | DEC);
+        return;
+    }
+    setc(x0, 'x', C_ERR | DEC);
+    setc(r, 'x', C_ERR | DEC);
+    switch (dy) {
+    case 1:
+    case 3: {
+        const char *p = dy == 1 ? cf_srcp : cf_dstp;
+
+        sets(x0 + 2, dy == 1 ? "New     :" : "Existing:", 9, C_ERR);
+        show_tail(x0 + 12, p, (int)strlen(p), r - x0 - 12, C_ERR);
+        break;
+    }
+    case 2:
+    case 4: {
+        uint64_t size = dy == 2 ? cf_ssize : cf_dsize;
+        int64_t mt = dy == 2 ? cf_smt : cf_dmt;
+
+        l = fmt_size(sz, 7, size, 0);
+        sets(x0 + 12, sz, l, C_ERR);
+        fmt_date(tm, mt);
+        sets(r - 13, tm, 12, C_ERR);
+        break;
+    }
+    case 6:
+        sets(x0 + 1 + (in - 20) / 2, "Overwrite this file?", 20, C_ERR);
+        break;
+    case 9:
+        sets(x0 + 1 + (in - 20) / 2, "Overwrite all files?", 20, C_ERR);
+        break;
+    default:
+        cf_buttons(dy, x0, in);
+        break;
+    }
+}
+
+/* The question's choice of button I. The checkbox just toggles; Abort ends the
+ * job; the per-file answers decide this file; a group answer stands for the rest. */
+static void cf_choose(int i)
+{
+    cf_sel = i;
+    if (i == 3) {                       /* the checkbox just toggles */
+        cf_zero ^= 1;
+        return;
+    }
+    cf_ans = i;
+    mode = MODE_NORMAL;
+}
+
+/* The keys of the question: Enter for the focused button, Left and Right (and
+ * Tab) to move the focus, the hotkeys, and Esc for Abort. */
+static int cf_handle(int key)
+{
+    if (key == K_ESC) {
+        cf_choose(9);
+        return 0;
+    }
+    if (key == '\r' || key == '\n') {
+        cf_choose(cf_sel);
+        return 0;
+    }
+    if (key == K_LEFT) {
+        cf_sel = (cf_sel + 9) % 10;
+        return 0;
+    }
+    if (key == K_RIGHT || key == 9) {
+        cf_sel = (cf_sel + 1) % 10;
+        return 0;
+    }
+    if (key >= 'A' && key <= 'Z') key += 32;
+    for (int i = 0; i < 10; i++)
+        if (key == cf_hot[i]) {
+            cf_choose(i);
+            return 0;
+        }
+    return 0;
+}
+
+/* the walk is recursive: these call each other */
+static long del_tree(const char *path, int approved);
+static long copy_tree(const char *src, const char *dst);
+static long move_tree(const char *src, const char *dst);
+
+/* A failure: the box says what failed, and why, and offers Skip, Skip all, Retry and
+ * Abort. Returns 0 to pass the item over, 1 to try it again, or -ECANCELED. */
+static long fail_ask(const char *head, const char *path, long e)
+{
+    int k = 0;
+
+    if (job.skip_err) {
+        job_skips++;
+        return 0;
+    }
+    qy_kind = QY_ERR;
+    qy_n1 = cat(qy_t1, head);
+    qy_t1[qy_n1++] = ' ';
+    qy_t1[qy_n1++] = '"';
+    while (path[k] && qy_n1 < (int)sizeof qy_t1 - 3) qy_t1[qy_n1++] = path[k++];
+    qy_t1[qy_n1++] = '"';
+    if (e == -ESAME) {
+        qy_n2 = cat(qy_t2, "Same file as the source");
+    } else if (e == -ESUB) {
+        qy_n2 = cat(qy_t2, "Inside the directory itself");
+    } else {
+        qy_n2 = cat(qy_t2, errstr(-e));
+        qy_t2[qy_n2++] = ' ';
+        qy_t2[qy_n2++] = '(';
+        qy_n2 += (int)utoa((unsigned long)-e, qy_t2 + qy_n2);
+        qy_t2[qy_n2++] = ')';
+    }
+    qy_sel = 0;
+    mode = MODE_QUERY;
+    modal_wait();
+    if (kbuf_eof) return -ECANCELED;
+    if (qy_ans == 1) job.skip_err = 1;
+    if (qy_ans == 0 || qy_ans == 1) {
+        job_skips++;
+        return 0;
+    }
+    if (qy_ans == 2) return 1;
+    return -ECANCELED;
+}
+
+/* An item that cannot be tried again: the box, and its answer. Retry counts as Skip. */
+static long item_fail(const char *head, const char *path, long e)
+{
+    long a = fail_ask(head, path, e);
+
+    if (a < 0) return a;
+    if (a == 1) job_skips++;
+    return 0;
+}
+
+/* The question for a destination that exists: 0 to write it as *how says, 1 to pass
+ * the file over, -ESAME for the same file, or -ECANCELED. */
+static long conflict(const char *src, const char *dst, int *how)
+{
+    struct statx ss, ds;
+    int dec;
+
+    *how = HOW_NEW;
+    if (statx(AT_FDCWD, dst, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ds)) return 0;
+    if (statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ss)) return 0;
+    if (same_file(&ss, &ds)) return -ESAME;
+    cf_ssize = ss.stx_size;
+    cf_smt = ss.stx_mtime.tv_sec;
+    cf_dsize = ds.stx_size;
+    cf_dmt = ds.stx_mtime.tv_sec;
+    cf_srcp = src;
+    cf_dstp = dst;
+    if (cf_group == CF_ASK) {
+        cf_ans = -1;
+        cf_sel = 0;
+        mode = MODE_CONFLICT;
+        modal_wait();
+        if (kbuf_eof || cf_ans < 0 || cf_ans == 9) return -ECANCELED;
+        switch (cf_ans) {
+        case 0: dec = DEC_OVER; break;
+        case 1: dec = DEC_SKIP; break;
+        case 2: dec = DEC_APPEND; break;
+        default:                            /* a group answer stands for the rest */
+            cf_group = cf_ans == 4 ? CF_ALL : cf_ans == 5 ? CF_OLDER : cf_ans == 6 ? CF_NONE
+                     : cf_ans == 7 ? CF_SMALLER : CF_SIZE;
+            dec = conflict_rule();
+        }
+    } else {
+        dec = conflict_rule();
+    }
+    if (dec == DEC_SKIP) {
+        job_skips++;
+        return 1;
+    }
+    *how = dec == DEC_OVER ? HOW_OVER : dec == DEC_APPEND ? HOW_APPEND : HOW_NEW;
+    return 0;
+}
+
+/* A non-empty directory at the top of the job: is it deleted with what is in it? The
+ * answer stands for the directories after it, as All and None say. Returns 1 to
+ * delete it, 0 to skip it, or -ECANCELED. */
+static long dir_ask(const char *path)
+{
+    int k = 0;
+
+    if (dgrp) return dgrp == 1;
+    qy_kind = QY_DIR;
+    qy_n1 = cat(qy_t1, "Directory \"");
+    while (path[k] && qy_n1 < (int)sizeof qy_t1 - 16) qy_t1[qy_n1++] = path[k++];
+    qy_n1 += cat(qy_t1 + qy_n1, "\" not empty.");
+    qy_n2 = cat(qy_t2, "Delete it recursively?");
+    qy_sel = 0;
+    mode = MODE_QUERY;
+    modal_wait();
+    if (kbuf_eof) return -ECANCELED;
+    switch (qy_ans) {
+    case 0: return 1;
+    case 1: return 0;
+    case 2: dgrp = 1; return 1;
+    case 3: dgrp = 2; return 0;
+    default: return -ECANCELED;
+    }
+}
+
+/* DIR and NAME into D (max bytes): a path. Returns 0, or -ENAMETOOLONG. */
+static long join(char *d, size_t max, const char *dir, const char *name)
+{
+    size_t ld = strlen(dir), ln = strlen(name), k;
+    int slash = ld && dir[ld - 1] != '/';
+
+    if (ld + (slash ? 1 : 0) + ln + 1 > max) return -ENAMETOOLONG;
+    memcpy(d, dir, ld);
+    k = ld;
+    if (slash) d[k++] = '/';
+    memcpy(d + k, name, ln);
+    d[k + ln] = 0;
+    return 0;
+}
+
+/* Whether D lies inside the directory S. */
+static int under(const char *d, const char *s)
+{
+    size_t l = strlen(s), k;
+
+    if (strlen(d) <= l || d[l] != '/') return 0;
+    for (k = 0; k < l; k++)
+        if (d[k] != s[k]) return 0;
+    return 1;
+}
+
+/* Calls FN with each name in the directory PATH, but "." and "..", until FN returns
+ * non-zero, which is what this returns; or the -errno of the directory, if it cannot
+ * be read. */
+static long each_entry(const char *path, long (*fn)(const char *name, void *ctx), void *ctx)
+{
+    long buf[128];                      /* 1 KiB, aligned for the records */
+    long fd, n = 0, off, r = 0;
+
+    fd = open(path, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return fd;
+    while (!r && (n = getdents64((int)fd, buf, sizeof buf)) > 0) {
+        for (off = 0; off < n && !r; ) {
+            struct linux_dirent64 *d = (struct linux_dirent64 *)((char *)buf + off);
+            const char *nm = d->d_name;
+
+            off += d->d_reclen;
+            if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+            r = fn(nm, ctx);
+        }
+    }
+    if (n < 0 && !r) r = n;
+    close((int)fd);
+    return r;
+}
+
+/* The directory's entries, one at a time, deleted. */
+static long del_child(const char *name, void *ctx)
+{
+    const char *dir = ctx;
+    char child[4352];
+    long r = join(child, sizeof child, dir, name);
+
+    if (r) return item_fail("Cannot remove", dir, r);
+    return del_tree(child, 1);
+}
+
+/* Deletes PATH: a file or a link is unlinked; a directory is removed when empty.
+ * When it is not, it is deleted with what is in it, if that is approved: a top item
+ * is asked about (dir_ask), and the items under it are approved with it. Returns 0,
+ * or -ECANCELED. */
+static long del_tree(const char *path, int approved)
+{
+    struct statx sx;
+    long r, a;
+
+    for (;;) {
+        if (statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx)) return 0;
+        if ((sx.stx_mode & S_IFMT) != S_IFDIR) {
+            r = unlinkat(AT_FDCWD, path, 0);
+            if (r == 0) return 0;
+            a = fail_ask("Cannot remove file", path, r);
+        } else {
+            r = unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+            if (r == 0) return 0;
+            if (r == -ENOTEMPTY || r == -EEXIST) {
+                if (!approved) {
+                    a = dir_ask(path);
+                    if (a <= 0) {
+                        if (a == 0) job_skips++;
+                        return a;
+                    }
+                    approved = 1;
+                }
+                r = each_entry(path, del_child, (void *)path);
+                if (r == -ECANCELED) return r;
+                if (r == 0) {
+                    r = unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+                    if (r == 0) return 0;
+                }
+            }
+            a = fail_ask("Cannot remove directory", path, r);
+        }
+        if (a < 0) return a;
+        if (a == 0) return 0;
+    }
+}
+
+struct tctx { const char *src, *dst; };
+
+/* One entry of a directory being copied or moved: its source and destination. */
+static long copy_child(const char *name, void *ctx)
+{
+    const struct tctx *t = ctx;
+    char cs[4352], cd[4352];
+    long r = join(cs, sizeof cs, t->src, name);
+
+    if (!r) r = join(cd, sizeof cd, t->dst, name);
+    if (r) return item_fail("Cannot copy to", t->dst, r);
+    return copy_tree(cs, cd);
+}
+
+static long move_child(const char *name, void *ctx)
+{
+    const struct tctx *t = ctx;
+    char cs[4352], cd[4352];
+    long r = join(cs, sizeof cs, t->src, name);
+
+    if (!r) r = join(cd, sizeof cd, t->dst, name);
+    if (r) return item_fail("Cannot move to", t->dst, r);
+    return move_tree(cs, cd);
+}
+
+/* A directory is made at DST with MODE: the umask has been at it, so the mode is set
+ * after. Returns 0, 1 to pass the directory over, or -ECANCELED. */
+static long make_dir(const char *dst, int mode)
+{
+    long r, a, fd;
+
+    for (;;) {
+        r = mkdirat(AT_FDCWD, dst, 0777);
+        if (r == 0) break;
+        if (r == -EEXIST) return 0;
+        a = fail_ask("Cannot create directory", dst, r);
+        if (a < 0) return a;
+        if (a == 0) return 1;
+    }
+    fd = open(dst, O_RDONLY | O_DIRECTORY, 0);
+    if (fd >= 0) {
+        fchmod((int)fd, mode);
+        close((int)fd);
+    }
+    return 0;
+}
+
+/* One file, link or directory-less item of a copy or move, as the question has it:
+ * the destination is asked about when it exists, and a failure of the write is asked
+ * about. Returns 0, or -ECANCELED. */
+static long leaf(const char *src, const char *dst, int move)
+{
+    int how;
+    long r, a;
+
+    r = conflict(src, dst, &how);
+    if (r == -ESAME) return item_fail(move ? "Cannot move to" : "Cannot copy to", dst, r);
+    if (r == 1) return 0;
+    if (r) return r;
+    for (;;) {
+        pg_src = src;
+        pg_dst = dst;
+        pg_pct = -1;
+        mode = MODE_PROG;
+        r = move ? op_file(src, dst, how) : copy_file(src, dst, how);
+        if (r == 0 || r == -ECANCELED) return r;
+        a = fail_ask(move ? "Cannot move to" : "Cannot copy to", dst, r);
+        if (a < 0) return a;
+        if (a == 0) return 0;
+    }
+}
+
+/* A copy of SRC to DST: a file, a link, or a directory made, and what is in it copied
+ * too; a directory that is there already is merged into. Returns 0, or -ECANCELED. */
+static long copy_tree(const char *src, const char *dst)
+{
+    struct statx ss, ds;
+    struct tctx t;
+    long r;
+
+    r = statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ss);
+    if (r) return item_fail("Cannot copy", src, r);
+    if ((ss.stx_mode & S_IFMT) != S_IFDIR) return leaf(src, dst, 0);
+    if (under(dst, src)) return item_fail("Cannot copy to", dst, -ESUB);
+    r = statx(AT_FDCWD, dst, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ds);
+    if (r == 0) {
+        if ((ds.stx_mode & S_IFMT) != S_IFDIR) return item_fail("Cannot copy to", dst, -ENOTDIR);
+        if (same_file(&ss, &ds)) return item_fail("Cannot copy to", dst, -ESAME);
+    } else {
+        r = make_dir(dst, ss.stx_mode & 07777);
+        if (r) return r < 0 ? r : 0;
+    }
+    t.src = src;
+    t.dst = dst;
+    r = each_entry(src, copy_child, &t);
+    if (r == -ECANCELED) return r;
+    if (r) return item_fail("Cannot copy", src, r);
+    return 0;
+}
+
+/* A move of SRC to DST: a rename when DST is free; across file systems, a copy and
+ * then the removal of SRC, which is kept if anything in it was passed over. Into a
+ * directory that is there, the move is into it, item by item, and the directory
+ * goes when it is empty. Returns 0, or -ECANCELED. */
+static long move_tree(const char *src, const char *dst)
+{
+    struct statx ss, ds;
+    struct tctx t;
+    long r, s0;
+
+    r = statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ss);
+    if (r) return item_fail("Cannot move", src, r);
+    if ((ss.stx_mode & S_IFMT) != S_IFDIR) return leaf(src, dst, 1);
+    if (under(dst, src)) return item_fail("Cannot move to", dst, -ESUB);
+    r = statx(AT_FDCWD, dst, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &ds);
+    if (r == -ENOENT) {
+        r = renameat2(AT_FDCWD, src, AT_FDCWD, dst, 0);
+        if (r == 0) return 0;
+        if (r != -EXDEV) return item_fail("Cannot move to", dst, r);
+        s0 = job_skips;
+        r = copy_tree(src, dst);
+        if (r) return r;
+        if (job_skips != s0) return 0;
+        return del_tree(src, 1);
+    }
+    if (r) return item_fail("Cannot move to", dst, r);
+    if ((ds.stx_mode & S_IFMT) != S_IFDIR) return item_fail("Cannot move to", dst, -ENOTDIR);
+    if (same_file(&ss, &ds)) return item_fail("Cannot move to", dst, -ESAME);
+    t.src = src;
+    t.dst = dst;
+    s0 = job_skips;
+    r = each_entry(src, move_child, &t);
+    if (r == -ECANCELED) return r;
+    if (r) return item_fail("Cannot move", src, r);
+    if (job_skips != s0) return 0;
+    r = unlinkat(AT_FDCWD, src, AT_REMOVEDIR);
+    if (r == 0) return 0;
+    return item_fail("Cannot remove directory", src, r);
+}
+
+/* One item of the job, at the top: SRC, and DST when copying or moving. */
+static long job_item(const char *src, const char *dst)
+{
+    if (job.kind == JOB_DEL) return del_tree(src, 0);
+    if (job.kind == JOB_COPY) return copy_tree(src, dst);
+    return move_tree(src, dst);
+}
+
+/* The job is over: the panels read their files again. */
+static void job_end(void)
+{
+    mode = MODE_NORMAL;
+    rescan_changed();
+}
+
+/* The items, in display order, one after another. An item that Esc stopped keeps its
+ * mark; every other item loses it, done or passed over. */
+static void job_run(void)
+{
+    struct panel *p = &P[act];
+    char src[4352], dst[4352];
+
+    job.pos = 0;
+    job.skip_err = 0;
+    dgrp = 0;
+    cf_group = CF_ASK;
+    cf_zero = 0;
+    cf_sel = 0;
+    while (!kbuf_eof) {
+        int at = job_next(p);
+        const struct ent *e;
+        long r;
+
+        if (at < 0) break;
+        e = &p->e[p->ord[at]];
+        r = join(src, sizeof src, p->path, p->nm + e->name);
+        if (!r) {
+            if (job.dir) r = join(dst, sizeof dst, job_dst, p->nm + e->name);
+            else r = strlcpy(dst, job_dst, sizeof dst) < sizeof dst ? 0 : -ENAMETOOLONG;
+        }
+        if (r) {
+            if (item_fail("Cannot copy to", job_dst, r) == -ECANCELED) break;
+            p->e[p->ord[at]].sel = 0;
+            continue;
+        }
+        r = job_item(src, dst);
+        if (r == -ECANCELED) break;
+        p->e[p->ord[at]].sel = 0;
+    }
+    job_end();
+}
+
+/* The keys of a question of the job: handled as usual, until the question is answered
+ * (its handler leaves the question's mode). Called from inside the handler of the key
+ * that started the job, reading from the block the main loop reads from. */
+static void modal_wait(void)
+{
+    while (!kbuf_eof && (mode == MODE_QUERY || mode == MODE_CONFLICT)) {
+        int key;
+
+        draw();
+        key = take_key();
+        if (key != K_NONE) handle_key(key);
+    }
+}
+
+/* The last key taken was an Esc that another Esc followed at once. Each Esc after
+ * such an Esc is taken at once too, as long as it comes within ESC_WAIT_MS of the one
+ * before: it is a key of its own, not the start of a sequence (no sequence begins
+ * with Esc Esc). esc_ts is the time of the last Esc of the chain. */
+static int esc_chain;
+static struct timespec esc_ts;      /* when the last Esc of the chain was taken */
+
+/* The time of the last Esc of the chain: esc_ts. */
+static void esc_mark(void)
+{
+    clock_gettime(CLOCK_REALTIME, &esc_ts);
+}
+
+/* Whether less than ESC_WAIT_MS has passed since esc_mark(). No 64-bit arithmetic, and
+ * no division, which some targets would make a library call: the difference is taken
+ * in seconds and nanoseconds, and only up to one second's difference is measured, so
+ * it fits 32 bits. */
+static int esc_recent(void)
+{
+    struct timespec ts;
+    long ds, el;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ds = ts.tv_sec - esc_ts.tv_sec;
+    if (ds < 0 || ds > 1) return 0;
+    el = ds * 1000000000L + (ts.tv_nsec - esc_ts.tv_nsec);
+    return el >= 0 && el < ESC_WAIT_MS * 1000000L;
+}
+
+/* The next key of the input block. A lone Esc at the end of the block may be the start
+ * of a sequence, so it waits ESC_WAIT_MS for the rest, unless it follows an Esc taken
+ * at once (above). The screen is drawn before such a wait, so what has been done shows
+ * while the rest may come. When the block is used up it is read again. K_NONE: nothing
+ * to handle here (a sequence cut off is dropped, or a read was interrupted). */
+static int take_key(void)
+{
+    int len, key;
+
+    for (;;) {
+        if (kbuf_i >= kbuf_n) {
+            long n = read(0, kbuf, sizeof kbuf);
+
+            if (n == -EINTR) {
+                check_size();
+                return K_NONE;
+            }
+            if (n <= 0) {
+                kbuf_eof = 1;
+                return K_NONE;
+            }
+            kbuf_n = (int)n;
+            kbuf_i = 0;
+        }
+        key = key_parse(kbuf, kbuf_n, kbuf_i, &len);
+        if (key != K_INCOMPLETE) {
+            kbuf_i += len;
+            esc_chain = key == K_ESC;
+            if (esc_chain) esc_mark();
+            return key;
+        }
+        if (esc_chain && kbuf[kbuf_i] == K_ESC) {
+            if (esc_recent()) {                      /* an Esc after an Esc: taken at once */
+                kbuf_i++;
+                esc_mark();
+                return K_ESC;
+            }
+            esc_chain = 0;                           /* too long after the last: a new key */
+        }
+        draw();
+        {
+            int m = wait_input(kbuf, kbuf_n, sizeof kbuf, ESC_WAIT_MS);
+
+            if (m > kbuf_n) {
+                kbuf_n = m;
+                continue;
+            }
+            esc_chain = 0;
+            if (kbuf[kbuf_i] == K_ESC && kbuf_i + 1 == kbuf_n) {
+                kbuf_i++;
+                return K_ESC;
+            }
+            kbuf_i = kbuf_n;
+            return K_NONE;
+        }
+    }
+}
+
+/* Enter in the question: the job starts. A destination that is a directory takes
+ * each item under its own name; marked items need a directory to go to. An empty
+ * destination does nothing. */
+static void op_confirm(void)
+{
+    struct panel *p = &P[act];
+    char res[4096], shown[512];
+    struct statx sx;
+    int isdir;
+
+    if (!dline.len) {
+        mode = MODE_NORMAL;
+        return;
+    }
+    path_of(dline.buf, p->path, res, sizeof res, shown, sizeof shown);
+    isdir = statx(AT_FDCWD, res, 0, STATX_BASIC_STATS, &sx) == 0 &&
+            (sx.stx_mode & S_IFMT) == S_IFDIR;
+    if (job.sel && !isdir) {
+        mode = MODE_NORMAL;
+        set_error(job.kind == JOB_COPY ? "Cannot copy to" : "Cannot move to", res, ENOTDIR);
+        return;
+    }
+    strlcpy(job_dst, res, sizeof job_dst);
+    job.dir = isdir;
+    job_run();
+}
+
+/* F5 or F6: the question. For marked items it gives their number, else it names the
+ * highlighted item, as a file or a directory. The destination starts as the other
+ * panel's directory. Nothing is asked when nothing is marked and the highlight is on
+ * "..". */
+static void op_open(int kind)
+{
+    struct panel *p = &P[act];
+    const struct ent *e = NULL;
+    const char *name = "";
+    int n, k, l, files, dirs;
+
+    job.kind = kind;
+    job.sel = marked_any(p);
+    if (job.sel) {
+        marked_counts(p, &files, &dirs);
+        if (files + dirs == 0) return;
+    } else {
+        if (!p->n) return;
+        e = &p->e[p->ord[p->cur]];
+        if (e->up) return;
+        name = p->nm + e->name;
+    }
+    mode = MODE_OP;
+    op_geom();
+    n = cat(op_t1, kind == JOB_COPY ? "Copy " : "Move ");
+    if (job.sel) {
+        n += (int)utoa((unsigned long)(files + dirs), op_t1 + n);
+        n += cat(op_t1 + n, files + dirs == 1 ? " file to:" : " files to:");
+    } else {
+        if (is_dir(e)) n += cat(op_t1 + n, "directory ");
+        n += cat(op_t1 + n, "\"");
+        k = cut_cols(name, (int)strlen(name), opw - 26);
+        for (int i = 0; i < k; i++) op_t1[n++] = name[i];
+        n += cat(op_t1 + n, "\" to:");
+    }
+    op_n1 = n;
+    line_clear(&dline);
+    l = (int)strlen(P[act ^ 1].path);
+    if (l + 2 < (int)sizeof dline.buf) {
+        cat(dline.buf, P[act ^ 1].path);
+        if (dline.buf[l - 1] != '/') dline.buf[l++] = '/';
+        dline.buf[l] = 0;
+        dline.len = dline.pos = l;
+    }
+}
+
+/* Keys in the question: Enter does it, Esc gives up, the rest edits the
+ * destination. */
+static int op_handle(int key)
+{
+    if (key == K_ESC) mode = MODE_NORMAL;
+    else if (key == '\r' || key == '\n') op_confirm();
+    else line_key(&dline, key, OPFW - 4, 0);
+    return 0;
+}
+
 static void draw(void)
 {
     int lw = cols / 2, ax = act == lft ? 0 : lw, aw = act == lft ? lw : cols - lw;
@@ -2645,6 +3861,7 @@ static void draw(void)
 
     if (mode == MODE_ERR) err_geom(&ex, &ey);
     if (mode == MODE_QUERY) qy_geom();
+    if (mode == MODE_OP || mode == MODE_PROG || mode == MODE_CONFLICT) op_geom();
     for (int y = 0; y < rows; y++) {
         for (int x = 0; x < cols; x++) {
             row[x].c = ' ';
@@ -2656,31 +3873,40 @@ static void draw(void)
             panel_row(&P[lft], y, 0, lw, act == lft);
             panel_row(&P[lft ^ 1], y, lw, cols - lw, act == (lft ^ 1));
         }
-        if (mode == MODE_QCD && y >= rows - 7 && y <= rows - 3)
-            qcd_draw_row(y, ax, aw);
-        if (mode == MODE_ERR && y >= ey && y <= ey + 8)
-            err_draw_row(y, ex, ey);
+        if (mode == MODE_QCD) qcd_draw_row(y, ax, aw);
+        if (mode == MODE_ERR) err_draw_row(y, ex, ey);
         if (mode == MODE_QUERY) qy_draw_row(y);
+        if (mode == MODE_OP || mode == MODE_PROG || mode == MODE_CONFLICT) {
+            if (mode == MODE_CONFLICT) cf_row(y - opy);
+            else op_row(y - opy);
+            if (y >= opy + 1 && y <= opy + oph) shade(opx + opw, opx + opw + 1);
+            if (y == opy + oph) shade(opx + 2, opx + opw + 1);
+        }
         if (mode == MODE_QUERY) {
             if (y >= qry + 1 && y <= qry + qrh) shade(qrx + qrw, qrx + qrw + 1);
             if (y == qry + qrh) shade(qrx + 2, qrx + qrw + 1);
         }
         /* shadows: to the right of each box, and under it */
         if (mode == MODE_QCD) {
-            if (y >= rows - 6 && y <= rows - 3) shade(ax + aw, ax + aw + 1);
-            if (y == rows - 2) shade(ax + 2, ax + aw + 1);
+            int top = rows - 2 - QCD_H;
+
+            if (y >= top + 1 && y <= top + QCD_H - 1) shade(ax + aw, ax + aw + 1);
+            if (y == top + QCD_H) shade(ax + 2, ax + aw + 1);
         }
         if (mode == MODE_ERR) {
-            if (y >= ey + 1 && y <= ey + 8) shade(ex + ewidth, ex + ewidth + 1);
-            if (y == ey + 9) shade(ex + 2, ex + ewidth + 1);
+            if (y >= ey + 1 && y <= ey + ERR_H) shade(ex + ewidth, ex + ewidth + 1);
+            if (y == ey + ERR_H) shade(ex + 2, ex + ewidth + 1);
         }
         emit_row(y, cols);
     }
 
     /* cursor: in the quick cd field, otherwise on the command line */
     if (mode == MODE_QCD) {
-        cy = rows - 5;
-        cx = ax + 6 + line_cells(&qline);
+        cy = rows - 4 - DIALOG_PAD;
+        cx = ax + DIALOG_PAD + 5 + line_cells(&qline);
+    } else if (mode == MODE_OP) {
+        cy = opy + DIALOG_PAD + 2;
+        cx = opx + DIALOG_PAD + 2 + line_cells(&dline);
     } else {
         cy = rows - 1;
         cx = prompt_len + line_cells(&cmdl);
@@ -2843,22 +4069,29 @@ static int qs_handle(int key)
         }
         return 0;
     }
-    if (key == 8 || key == 127) {
-        if (qline.len) qline.buf[--qline.len] = 0;
+    if (key == 8 || key == 127) {                 /* a character goes, whole */
+        if (qline.len) qline.len = char_prev(&qline, qline.len);
+        qline.buf[qline.len] = 0;
         return 0;
     }
-    if (key >= 0x20 && key < 0x7f) {
-        int at;
+    if ((key >= 0x20 && key < 0x7f) || (key & K_CHAR)) {
+        char b[4];
+        int n, at;
 
-        if (qline.len >= 255) return 0;
-        qline.buf[qline.len] = (char)key;
-        at = qs_find(p, p->cur, qline.buf, qline.len + 1);
+        if (key & K_CHAR) {
+            n = utf8_enc(b, (uint32_t)(key & ~K_CHAR));
+        } else {
+            b[0] = (char)key;
+            n = 1;
+        }
+        if (qline.len + n >= (int)sizeof qline.buf) return 0;
+        memcpy(qline.buf + qline.len, b, n);
+        at = qs_find(p, p->cur, qline.buf, qline.len + n);
         if (at >= 0) {
-            qline.len++;
+            qline.len += n;
+            qline.buf[qline.len] = 0;
             p->cur = at;
             scroll(p);
-        } else {
-            qline.buf[qline.len] = 0;
         }
         return 0;
     }
@@ -2878,6 +4111,8 @@ static int handle_key(int key)
         qcd_handle(key);
         return 0;
     }
+    if (mode == MODE_CONFLICT) return cf_handle(key);
+    if (mode == MODE_OP) return op_handle(key);
     if (mode == MODE_QUERY) return qy_handle(key);
     if (mode == MODE_QSEARCH) return qs_handle(key);
     if (key == (K_ALT | '0') || key == K_F10) return 1;
@@ -2904,20 +4139,22 @@ static int handle_key(int key)
     else if (key == 15) toggle_hidden();           /* Ctrl+O */
     else if (key == 18) panel_rescan(p);           /* Ctrl+R: read the directory again */
     else if (key == K_F8 || key == (K_ALT | '8')) delete_open(p);
+    else if (key == K_F5 || key == (K_ALT | '5')) op_open(OP_COPY);
+    else if (key == K_F6 || key == (K_ALT | '6')) op_open(OP_MOVE);
     else if (key == 21) lft ^= 1;                  /* Ctrl+U */
+    else if (key == K_INS || key == K_SUP || key == K_SDOWN) sel_key(p, key);
     else if (key == K_UP || key == K_DOWN || key == K_PGUP || key == K_PGDN ||
              key == K_HOME || key == K_END)
         nav_key(p, key);
     else if (key == K_LEFT || key == K_RIGHT || key == K_CLEFT || key == K_CRIGHT ||
              key == K_ALTBS || key == K_DEL || key == 8 || key == 127 ||
-             (key >= 0x20 && key < 0x7f) || (key >= 0x80 && key < 0x100))
+             (key >= 0x20 && key < 0x7f) || (key >= 0x80 && key < 0x100) || (key & K_CHAR))
         line_key(&cmdl, key, cmd_width(), 0);
     return 0;
 }
 
 __attribute__((noreturn, noinline)) static void main(int argc, char **argv)
 {
-    unsigned char in[64];
     int quit = 0;
     long n;
 
@@ -2944,53 +4181,34 @@ __attribute__((noreturn, noinline)) static void main(int argc, char **argv)
     tty_enter();
 
     while (!quit) {
-        struct winsz ws;
-
-        if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.col && ws.row &&
-            (ws.col != cols || ws.row != rows)) {
-            cols = ws.col > MAXW ? MAXW : ws.col;
-            rows = ws.row;
-            if (sh_fd >= 0) size_pty(sh_fd);
-            scroll(&P[0]);
-            scroll(&P[1]);
-            if (!hidden) outs("\x1b[2J");
-        }
+        check_size();
         draw();
 
         if (!wait_term()) continue;          /* SIGWINCH: the loop re-reads the size */
-        n = read(0, in, sizeof in);
+        n = read(0, kbuf, sizeof kbuf);
         if (n == -EINTR) continue;
         if (n <= 0) break;
+        kbuf_n = (int)n;
+        kbuf_i = 0;
 
-        for (int i = 0; i < n && !quit; ) {
-            int len, key;
+        while (kbuf_i < kbuf_n && !quit) {
+            int key;
 
             if (hidden) {                    /* the shell view: as typed, but Ctrl+O */
-                int j = i;
+                int j = kbuf_i;
 
-                while (j < n && in[j] != 15) j++;
-                shell_in(in + i, j - i);
-                if (j == n) break;
-                i = j + 1;
+                while (j < kbuf_n && kbuf[j] != 15) j++;
+                shell_in(kbuf + kbuf_i, j - kbuf_i);
+                if (j == kbuf_n) {
+                    kbuf_i = kbuf_n;
+                    break;
+                }
+                kbuf_i = j + 1;
                 toggle_hidden();
                 continue;
             }
-            key = key_parse(in, (int)n, i, &len);
-            if (key == K_INCOMPLETE) {
-                int m = wait_input(in, (int)n, sizeof in, ESC_WAIT_MS);
-
-                if (m > n) {                   /* the rest of the key arrived */
-                    n = m;
-                    continue;
-                }
-                if (in[i] == K_ESC && i + 1 == n) {   /* a lone ESC */
-                    key = K_ESC;
-                    len = 1;
-                } else {
-                    break;                     /* a cut-off sequence: drop it */
-                }
-            }
-            i += len;
+            key = take_key();
+            if (key == K_NONE) continue;
             quit = handle_key(key);
         }
     }

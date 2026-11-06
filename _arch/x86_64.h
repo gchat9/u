@@ -159,6 +159,9 @@ static inline long chdir(const char *path)
 static inline long readlink(const char *pathname, char *buf, size_t bufsize)
     { _syscall3(89, pathname, buf, bufsize); }
 
+static inline long fchmod(int fd, mode_t mode)
+    { _syscall2(91, fd, mode); }
+
 static inline long sysinfo(struct sysinfo *buf)
     { _syscall1(99, buf); }
 
@@ -174,11 +177,20 @@ static inline long getdents64(int fd, void *dirp, size_t count)
 static inline long clock_gettime(clockid_t clk_id, struct timespec *ts)
     { _syscall2(228, clk_id, ts); }
 
+static inline long mkdirat(int dirfd, const char *pathname, mode_t mode)
+    { _syscall3(258, dirfd, pathname, mode); }
+
 static inline long unlinkat(int dirfd, const char *pathname, int flags)
     { _syscall3(263, dirfd, pathname, flags); }
 
+static inline long symlinkat(const char *target, int newdirfd, const char *linkpath)
+    { _syscall3(266, target, newdirfd, linkpath); }
+
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(267, dirfd, pathname, buf, bufsize); }
+
+static inline long renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
+    { _syscall5(316, olddirfd, oldpath, newdirfd, newpath, flags); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(318, buf, buflen, flags); }

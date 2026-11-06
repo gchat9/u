@@ -101,6 +101,9 @@ static inline long readlink(const char *pathname, char *buf, size_t bufsize)
 static inline long munmap(void *addr, size_t length)
     { _syscall2(91, addr, length); }
 
+static inline long fchmod(int fd, mode_t mode)
+    { _syscall2(94, fd, mode); }
+
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(99, path, buf); }
 
@@ -154,11 +157,20 @@ static inline void *mmap(void *addr, size_t length, int prot, int flags,
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(265, clk_id, tp); }
 
+static inline long mkdirat(int dirfd, const char *pathname, mode_t mode)
+    { _syscall3(296, dirfd, pathname, mode); }
+
 static inline long unlinkat(int dirfd, const char *pathname, int flags)
     { _syscall3(301, dirfd, pathname, flags); }
 
+static inline long symlinkat(const char *target, int newdirfd, const char *linkpath)
+    { _syscall3(304, target, newdirfd, linkpath); }
+
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(305, dirfd, pathname, buf, bufsize); }
+
+static inline long renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
+    { _syscall5(353, olddirfd, oldpath, newdirfd, newpath, flags); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(355, buf, buflen, flags); }

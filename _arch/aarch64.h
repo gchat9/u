@@ -72,14 +72,23 @@ static inline long dup2(int oldfd, int newfd)
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(29, fd, request, arg); }
 
+static inline long mkdirat(int dirfd, const char *pathname, mode_t mode)
+    { _syscall3(34, dirfd, pathname, mode); }
+
 static inline long unlinkat(int dirfd, const char *pathname, int flags)
     { _syscall3(35, dirfd, pathname, flags); }
+
+static inline long symlinkat(const char *target, int newdirfd, const char *linkpath)
+    { _syscall3(36, target, newdirfd, linkpath); }
 
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(43, path, buf); }
 
 static inline long chdir(const char *path)
     { _syscall1(49, path); }
+
+static inline long fchmod(int fd, mode_t mode)
+    { _syscall2(52, fd, mode); }
 
 static inline long openat(int dirfd, const char *pathname, int flags, int mode)
     { _syscall4(56, dirfd, pathname, flags, mode); }
@@ -198,6 +207,9 @@ static inline long wait4(int pid, int *status, int options, void *rusage)
 static inline void *mmap(void *addr, size_t length, int prot, int flags,
                          int fd, long offset)
     { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
+
+static inline long renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
+    { _syscall5(276, olddirfd, oldpath, newdirfd, newpath, flags); }
 
 static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
     { _syscall3(278, buf, buflen, flags); }
