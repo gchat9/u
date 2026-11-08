@@ -206,14 +206,37 @@ static inline long statx(int dirfd, const char *pathname, int flags,
 //////// main
 
 #ifdef EXPORT__START
+/*
+ * At process entry on Linux/ARM:
+ *
+ *   [sp + 0]  = argc
+ *   [sp + 4]  = argv[0]
+ *   [sp + 8]  = argv[1]
+ *
+ * The entry point only passes &argc to _start_c(), a function like any other,
+ * with a frame of its own: main() is inlined into it, and its locals live below
+ * sp, never over argc and argv. (A naked _start has no frame, and the locals of
+ * an inlined main() were stored at sp and above: on top of the arguments.)
+ */
+__asm__ (
+    ".pushsection .text.startup\n"
+    ".syntax unified\n"
+    ".thumb\n"
+    ".globl _start\n"
+    ".type _start, %function\n"
+    ".thumb_func\n"
+    "_start:\n"
+    "mov r0, sp\n"
+    "b.w _start_c\n"
+    ".popsection\n"
+);
+
 // prototype for main
 __attribute__((noreturn)) static void main(int argc, char **argv);
-//__attribute__((noreturn)) static int main(int argc, char **argv);
 
-__attribute__((naked)) __attribute__((noreturn)) void _start(void) {
-    register void *sp asm("sp");
-    long argc = ((long *)sp)[0];
-    char **argv = (char **)((long *)sp + 1);
+__attribute__((used, noreturn)) void _start_c(long *argc_pointer) {
+    long argc = argc_pointer[0];
+    char **argv = (char **)(argc_pointer + 1);
     main(argc, argv);
     __builtin_unreachable();
 }

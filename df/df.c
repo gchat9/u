@@ -1,4 +1,5 @@
 #include "../_sys/_main.h"
+#include "../_lib/udiv64.h"
 
 struct options {
     uint64_t block_size;
@@ -30,14 +31,15 @@ static int put_u64(uint64_t v)
 {
     char buf[24];
     char *p = buf + sizeof(buf);
-    do { *--p = (char)('0' + v % 10); } while (v /= 10);
+    uint64_t r;
+    do { v = udiv64(v, 10, &r); *--p = (char)('0' + r); } while (v);
     return put(p, (size_t)(buf + sizeof(buf) - p));
 }
 
 static size_t digits_u64(uint64_t v)
 {
     size_t n = 1;
-    while (v >= 10) { v /= 10; n++; }
+    while (v >= 10) { v = udiv64(v, 10, NULL); n++; }
     return n;
 }
 
@@ -46,7 +48,7 @@ static int put_human(uint64_t bytes, int decimal)
     static const char suffix[] = "KMGTPE";
     uint64_t base = decimal ? 1000 : 1024;
     uint64_t divisor = 1;
-    uint64_t whole, tenth;
+    uint64_t whole, tenth, rem;
     int exp = 0;
 
     while (exp < 6 && bytes >= divisor * base) {
@@ -55,8 +57,8 @@ static int put_human(uint64_t bytes, int decimal)
     }
     if (!exp) return put_u64(bytes);
 
-    whole = bytes / divisor;
-    tenth = (bytes % divisor) * 10 / divisor;
+    whole = udiv64(bytes, divisor, &rem);
+    tenth = udiv64(rem * 10, divisor, NULL);
     if (whole >= 10) {
         if (tenth >= 5) whole++;
         return put_u64(whole) || put(&suffix[exp - 1], 1);
@@ -140,7 +142,7 @@ static int is_block_size_option(const char *s)
 static void parse_options(int argc, char **argv, struct options *o, int *first)
 {
     int i;
-    o->block_size = 1024;
+    *o = (struct options){ .block_size = 1024 };
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (a[0] != '-' || a[1] == '\0') break;
@@ -197,8 +199,8 @@ static int print_value(uint64_t blocks, uint64_t block_size,
 {
     if (o->human || o->decimal_human)
         return put_human(blocks * block_size, o->decimal_human);
-    return put_u64((blocks * block_size + o->block_size - 1) /
-                   o->block_size);
+    return put_u64(udiv64(blocks * block_size + o->block_size - 1,
+                          o->block_size, NULL));
 }
 
 static int print_count(uint64_t value, const struct options *o)
@@ -212,18 +214,18 @@ static size_t value_len(uint64_t blocks, uint64_t block_size,
 {
     uint64_t value = blocks * block_size;
     if (!o->human && !o->decimal_human)
-        return digits_u64((value + o->block_size - 1) / o->block_size);
+        return digits_u64(udiv64(value + o->block_size - 1, o->block_size, NULL));
     {
         uint64_t base = o->decimal_human ? 1000 : 1024;
-        uint64_t divisor = 1, whole, tenth;
+        uint64_t divisor = 1, whole, tenth, rem;
         int exp = 0;
         while (exp < 6 && value >= divisor * base) {
             divisor *= base;
             exp++;
         }
         if (!exp) return digits_u64(value);
-        whole = value / divisor;
-        tenth = (value % divisor) * 10 / divisor;
+        whole = udiv64(value, divisor, &rem);
+        tenth = udiv64(rem * 10, divisor, NULL);
         return (whole >= 10 ? digits_u64(whole + (tenth >= 5)) :
                 digits_u64(whole) + (tenth ? 2 : 0)) + 1;
     }
@@ -266,8 +268,8 @@ static int print_fs(const char *path, const struct statfs *s,
         used = total - s->f_bfree;
         avail = s->f_bavail;
     }
-    pct = used + avail ? (int)((used * 100 + used + avail - 1) /
-                               (used + avail)) : 0;
+    pct = used + avail ? (int)udiv64(used * 100 + used + avail - 1,
+                                     used + avail, NULL) : 0;
 
     if (put(mount.source, mount.source_len) ||
         spaces(source_width > mount.source_len ? source_width - mount.source_len : 1))
