@@ -5,6 +5,7 @@ import tarfile
 import unittest
 
 import fixtures
+import term
 from case import MCTestCase
 from term import ALT_C, ALT_ENTER, ALT_LF, DOWN, ENTER, LEFT
 
@@ -107,6 +108,42 @@ class EnterTests(MCTestCase):
         t.send(b"echo hi > h.txt", .2)
         t.send(ENTER, 1.0)
         self.assertTrue(os.path.exists(os.path.join(d, "sub", "h.txt")))
+
+
+class StartDirTests(MCTestCase):
+    """The panel starts in the directory the shell has us in: as PWD names it,
+    so a symbolic link to it stays in the path."""
+
+    def link(self):
+        real = os.path.join(self.root, "real")
+        os.makedirs(real)
+        link = os.path.join(self.root, "link")
+        os.symlink(real, link)
+        return real, link
+
+    def test_pwd_keeps_the_link(self):
+        real, link = self.link()
+        t = self.start(link, env={"PWD": link})
+        self.assertEqual(t.title(), link)
+
+    def test_without_pwd_the_real_directory_is_shown(self):
+        real, link = self.link()
+        t = self.start(link)
+        self.assertEqual(t.title(), real)
+
+    def test_stale_pwd_is_ignored(self):
+        real, link = self.link()
+        t = self.start(link, env={"PWD": self.home()})
+        self.assertEqual(t.title(), real)
+
+    @unittest.skipUnless(os.path.exists(term.REFERENCE), "the installed mc is not there")
+    def test_matches_reference(self):
+        real, link = self.link()
+        for env in ({"PWD": link}, {"PWD": self.home()}, {}):
+            with self.subTest(pwd=env.get("PWD")):
+                ref = self.start_reference(link, env)
+                ours = self.start(link, env=env)
+                self.assertEqual(ours.title(), ref.title())
 
 
 if __name__ == "__main__":

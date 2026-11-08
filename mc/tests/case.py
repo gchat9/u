@@ -35,7 +35,7 @@ class MCTestCase(unittest.TestCase):
         self.terms.append(t)
         return t
 
-    def start_reference(self, cwd):
-        t = term.reference(cwd, self.home())
+    def start_reference(self, cwd, env=None):
+        t = term.reference(cwd, self.home(), env)
         self.terms.append(t)
         return t

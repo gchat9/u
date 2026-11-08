@@ -50,7 +50,7 @@ class Term:
                                      cwd=cwd, env=base, start_new_session=True)
         os.close(slave)
         self.base = 0                       # the column the active panel starts at
-        self.pump(1.0)
+        self.pump(0.2, 3.0)               # mc is drawn in milliseconds: settle, not wait
 
     def tab(self):
         """Switch to the other panel, which is the active one from now on."""
@@ -66,6 +66,7 @@ class Term:
                 return
             try:
                 data = os.read(self.master, 65536)
+                self.sent = getattr(self, "sent", 0) + len(data)
             except OSError:
                 return
             if not data:
@@ -169,6 +170,6 @@ def ours(cwd, home=None, env=None):
     return Term([MC], cwd, dict({"LANG": "C"}, **(env or {})), home=home)
 
 
-def reference(cwd, home):
+def reference(cwd, home, env=None):
     reference_home(home)
-    return Term([REFERENCE, "-c"], cwd, {"LANG": "C.UTF-8"}, home=home)
+    return Term([REFERENCE, "-c"], cwd, dict({"LANG": "C.UTF-8"}, **(env or {})), home=home)

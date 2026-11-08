@@ -15,6 +15,11 @@
 #define DIR_BOLD   0
 #define DIALOG_PAD 1
 
+/* Sort: 1 adds the Version choice to the Sort order dialog, with the version
+ * order it sorts by (mc's filevercmp), which is then in mc's code; 0 leaves
+ * both out. */
+#define VERSION_SORT 0
+
 /* Colours: the ANSI colour numbers, then mc's skin (ATTR is in mc.c) */
 #define BLACK   0
 #define RED     1
@@ -51,6 +56,17 @@
 #define C_QHOT   ATTR(BLUE, WHITE, 1)   /* a hotkey letter, white dialog */
 
 #define C_QHOTSEL ATTR(BLUE, CYAN, 1)   /* a hotkey letter, on the focused button */
+
+/* The menu bar and its dropdown, as mc's skin has them: the title the menu is on,
+ * and the highlighted entry, are black. */
+#define C_MENU       ATTR(WHITE, CYAN, 1)
+#define C_MENUHOT    ATTR(BROWN, CYAN, 1)
+#define C_MENUSEL    ATTR(WHITE, BLACK, 1)
+#define C_MENUSELHOT ATTR(BROWN, BLACK, 1)
+
+/* The sort order dialog's hotkey letters: blue on white, and on the focus. */
+#define C_DHOT       ATTR(BLUE, WHITE, 0)
+#define C_DHOTF      ATTR(BLUE, CYAN, 0)
 
 /* File classes, in the order mc's filehighlight.ini tests them. */
 enum { CL_NORMAL, CL_DIR, CL_EXE, CL_CORE, CL_TEMP, CL_ARCHIVE, CL_DOC,

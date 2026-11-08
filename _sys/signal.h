@@ -2,6 +2,7 @@
 
 #define SIGINT           2
 #define SIGQUIT          3
+#define SIGPIPE         13
 #define SIGCHLD         17
 #define SIGWINCH        28  /* terminal size changed */
 

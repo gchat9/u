@@ -56,6 +56,32 @@
  *                      cursor, quoted for the shell, and a space after it
  *     Left/Right, Ctrl+Left/Right, Alt+Backspace, Backspace, Delete
  *                      edit the command line, and the quick cd box
+ *     F9, ESC 9        the menu bar, on the side of the active panel. Left and
+ *                      Right move between the titles; Down or Enter opens the
+ *                      dropdown of Left or Right, whose one entry, Sort order...
+ *                      (or its letter, s), opens the dialog for that panel. There
+ *                      Tab and the arrows move, Space chooses or toggles, the
+ *                      letters of the labels pick, OK applies and Esc cancels.
+ *                      The sort is by name, unsorted, extension, size,
+ *                      modify, access or change time, or inode (and version, if
+ *                      VERSION_SORT in config.h is 1), reversed or not,
+ *                      case sensitive or not, with executables after directories
+ *                      or not; the directory is read again, the highlight staying
+ *                      on its file. File, Command and Options are empty for now.
+ *                      The Left and Right dropdowns also have Shell link... (h),
+ *                      which opens a directory on another machine, sh://user@host/dir,
+ *                      over ssh; "cd sh://user@host/dir" does the same on the command
+ *                      line. Going up from its root goes back to the local directory
+ *                      it was opened from. F3 fetches a file to view it; F5 and F6
+ *                      copy and move between the link and this machine, or within the
+ *                      link, and F8 removes files and empty directories there. Nothing
+ *                      on the link is replaced: a name that exists is refused, and a
+ *                      directory that is not empty is not removed. Enter on a file
+ *                      there, and commands, are not done yet.
+ *     +, -             select, unselect the entries matching a shell pattern (the
+ *                      dialog: the last pattern is not offered at first, Enter
+ *                      applies it, Esc cancels; directories are included, \"..\" never)
+ *     *                invert the selection of the files (not of the directories)
  *     ESC 0, F10       exit (in the panels)
  *
  * The shell is $SHELL -i on a pseudo-terminal of its own. Ctrl+O starts one in
@@ -158,6 +184,14 @@ static long join(char *dst, size_t max, const char *dir, const char *name);
 enum { AR_NONE, AR_ZIP, AR_TAR, AR_GZ, AR_XZ, AR_ZST };
 static int archive_kind(const char *name);
 
+/* The sort of a panel: its field, and flags, in one byte.  Zero is the default:
+ * by name, case sensitive, directories first. */
+enum { SF_NAME, SF_UNSORTED, SF_VERSION, SF_EXT, SF_SIZE, SF_MTIME, SF_ATIME, SF_CTIME, SF_INODE };
+#define SO_FIELD 0x0f       /* the SF_ field */
+#define SO_FOLD  0x10       /* names compare without case */
+#define SO_REV   0x20       /* in reverse */
+#define SO_EXEC  0x40       /* executables after the directories, before the rest */
+
 struct panel {
     char     path[4096];         /* the directory; inside an archive, the one holding it */
     char     arc[256];           /* the archive shown as a directory, "" if none */
@@ -165,6 +199,8 @@ struct panel {
     struct archive *ar;          /* the archive's index, while arc is set */
     int      n, cur, top;        /* entries shown, cursor, first visible entry */
     int      ne;                 /* entries read, including e[0] = ".." */
+    uint8_t  sort;               /* SF_ and SO_ bits, see sort_list() */
+    uint8_t  rem;                /* 1: on a shell link, its path is the directory there */
     uint64_t free_kb, total_kb;  /* filesystem usage in KiB, 0 if unknown */
     struct ent e[MAXE];          /* e[0] is always ".." */
     uint16_t ord[MAXE];          /* display order: ord[0] == 0, rest sorted */
@@ -246,6 +282,8 @@ static int cut_cols(const char *s, int n, int max)
 
 static struct panel P[2];
 static struct cell  row[MAXW];
+static int rfull = 1;            /* repaint everything: the terminal shows something else now */
+static int rlast = -1;           /* the mode of the last draw */
 static char         ob[4096];    /* output buffer */
 static int          on;
 static int          cols = 80, rows = 24;
@@ -269,7 +307,7 @@ static int          prompt_len;      /* length of the command line prompt */
 /* Modal state: a quick cd input box, or the error box shown after a failed cd
  * (any key closes it). */
 enum { MODE_NORMAL, MODE_QCD, MODE_ERR, MODE_QSEARCH, MODE_QUERY, MODE_OP, MODE_PROG,
-       MODE_CONFLICT };
+       MODE_CONFLICT, MODE_MENU, MODE_SORT, MODE_LINK, MODE_GROUP };
 static int          mode;
 /* A line being edited: the quick cd text and the command line. POS is the
  * cursor, FIRST the first character shown. */
@@ -531,8 +569,23 @@ static int disp_path(char *out, int max, const char *path)
 
 /* The path at the top of a panel, as drawn. In an archive it is the archive's name
  * and the directory inside it, as mc's uzip shows: "archive.zip/uzip://a/b". */
+/* The shell link state (see shell links): user@host of the link, the local directory
+ * it was opened from, and ssh's process and pipes. */
+static char rhost[256];                 /* user@host of the link, "" if none */
+static char rorig[4096];                /* the local directory the link was opened from */
+static long rpid = -1;                  /* ssh, -1 if not running */
+static int  rw = -1, rr = -1;           /* ssh's input and output */
+static char rb[1024];                   /* read from ssh, not yet taken */
+static int  rn, rpos;
+
 static int panel_title(char *out, int max, const struct panel *p)
 {
+    if (p->rem) {
+        strlcpy(out, "sh://", (size_t)max);
+        strlcat(out, rhost, (size_t)max);
+        strlcat(out, p->path, (size_t)max);
+        return (int)strlen(out);
+    }
     if (!p->arc[0]) return disp_path(out, max, p->path);
     strlcpy(out, p->arc, (size_t)max);
     strlcat(out, archive_kind(p->arc) == AR_ZIP ? "/uzip://" : "/utar://", (size_t)max);
@@ -543,10 +596,23 @@ static int panel_title(char *out, int max, const struct panel *p)
     return (int)strlen(out);
 }
 
+static int lc(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+/* A character to compare, folded to lower case if FOLD. */
+static int kc(unsigned char c, int fold) { return fold ? lc(c) : c; }
+
+/* Strings compare bytewise, or without case if FOLD. */
+static int fcmp(const char *a, const char *b, int fold)
+{
+    while (*a && kc(*a, fold) == kc(*b, fold)) { a++; b++; }
+    return kc(*a, fold) - kc(*b, fold);
+}
+
 /* Names compare by the part before the first dot, then the part after it,
- * bytewise. Equivalent to sorting the first dot below every other character,
- * which is what mc's filename collation does (measured against mc 4.8). */
-static int ncmp(const char *a, const char *b)
+ * bytewise or without case (FOLD). Equivalent to sorting the first dot below
+ * every other character, which is what mc's filename collation does (measured
+ * against mc 4.8). */
+static int ncmp(const char *a, const char *b, int fold)
 {
     const char *da = a, *db = b;
     size_t la, lb, m;
@@ -557,23 +623,159 @@ static int ncmp(const char *a, const char *b)
     lb = (size_t)(db - b);
     m = la < lb ? la : lb;
     for (size_t i = 0; i < m; i++)
-        if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
+        if (kc(a[i], fold) != kc(b[i], fold)) return kc(a[i], fold) - kc(b[i], fold);
     if (la != lb) return la < lb ? -1 : 1;
     if (!*da && !*db) return 0;
     if (!*da) return -1;
     if (!*db) return 1;
-    return scmp(da + 1, db + 1);
+    return fcmp(da + 1, db + 1, fold);
 }
 
-/* Directories first, then by name. */
-static int ecmp(const struct panel *p, uint16_t x, uint16_t y)
+#if VERSION_SORT
+/* Version order, as mc's filevercmp (gnulib's filenvercmp): digit runs compare as
+ * numbers, letters sort before other characters, a tilde before everything, dot
+ * names first, and the suffix of a name (.ext) after the rest of it. */
+static int vdigit(int c) { return c >= '0' && c <= '9'; }
+static int valpha(int c) { c |= 0x20; return c >= 'a' && c <= 'z'; }
+static int valnum(int c) { return vdigit(c) || valpha(c); }
+
+/* The length of the name without its suffix: the names compare without it first. */
+static size_t vprefix(const char *s, size_t n)
+{
+    size_t i = 0, pl = 0;
+
+    for (;;) {
+        if (i == n) return pl;
+        i++;
+        pl = i;
+        while (i + 1 < n && s[i] == '.' && (valpha(s[i + 1]) || s[i + 1] == '~'))
+            for (i += 2; i < n && (valnum(s[i]) || s[i] == '~'); i++)
+                ;
+    }
+}
+
+/* The order of the character at S[P] (N bytes): -1 at the end, 0 for a digit, a
+ * letter as it is, -2 for a tilde, and any other byte above the letters. */
+static int vorder(const char *s, size_t p, size_t n)
+{
+    int c;
+
+    if (p >= n) return -1;
+    c = (unsigned char)s[p];
+    if (vdigit(c)) return 0;
+    if (valpha(c)) return c;
+    if (c == '~') return -2;
+    return c + 256;
+}
+
+static int verrevcmp(const char *s1, size_t n1, const char *s2, size_t n2)
+{
+    size_t p1 = 0, p2 = 0;
+
+    while (p1 < n1 || p2 < n2) {
+        int first = 0;
+
+        while ((p1 < n1 && !vdigit(s1[p1])) || (p2 < n2 && !vdigit(s2[p2]))) {
+            int c1 = vorder(s1, p1, n1), c2 = vorder(s2, p2, n2);
+            if (c1 != c2) return c1 - c2;
+            p1++;
+            p2++;
+        }
+        while (p1 < n1 && s1[p1] == '0') p1++;
+        while (p2 < n2 && s2[p2] == '0') p2++;
+        while (p1 < n1 && p2 < n2 && vdigit(s1[p1]) && vdigit(s2[p2])) {
+            if (!first) first = s1[p1] - s2[p2];
+            p1++;
+            p2++;
+        }
+        if (p1 < n1 && vdigit(s1[p1])) return 1;
+        if (p2 < n2 && vdigit(s2[p2])) return -1;
+        if (first) return first;
+    }
+    return 0;
+}
+
+static int filevercmp(const char *a, const char *b)
+{
+    size_t na = strlen(a), nb = strlen(b), pa, pb;
+    int r;
+
+    if (!na || !nb) return !na ? (nb ? -1 : 0) : 1;
+    if (a[0] == '.') {
+        if (b[0] != '.') return -1;
+        if (na == 1 || nb == 1) return na == 1 ? (nb == 1 ? 0 : -1) : 1;
+        {
+            int ad = a[1] == '.' && na == 2, bd = b[1] == '.' && nb == 2;
+            if (ad || bd) return ad ? (bd ? 0 : -1) : 1;
+        }
+    } else if (b[0] == '.') {
+        return 1;
+    }
+    pa = vprefix(a, na);
+    pb = vprefix(b, nb);
+    r = verrevcmp(a, pa, b, pb);
+    if (r || (pa == na && pb == nb)) return r;
+    return verrevcmp(a, na, b, nb);
+}
+
+#endif
+
+/* The extension of a name, as mc's extension(): after the last dot, or "". */
+static const char *ext_of(const char *s)
+{
+    const char *d = NULL;
+
+    for (; *s; s++)
+        if (*s == '.') d = s;
+    return d ? d + 1 : "";
+}
+
+/* The group an entry sorts in, first: directories; then executables, if SO_EXEC. */
+static int grp(const struct ent *e, int s)
+{
+    return is_dir(e) ? 2 : (s & SO_EXEC) && is_exe(e) ? 1 : 0;
+}
+
+static int kcmp(int64_t a, int64_t b) { return (a > b) - (a < b); }
+
+/* Two names by the panel's flags: a dot name always comes first, and otherwise
+ * the order is reversed if SO_REV. */
+static int namecmp(const struct panel *p, uint16_t x, uint16_t y)
+{
+    const char *a = p->nm + p->e[x].name, *b = p->nm + p->e[y].name;
+    int r;
+
+    if ((a[0] == '.') != (b[0] == '.')) return a[0] == '.' ? -1 : 1;
+    r = ncmp(a, b, p->sort & SO_FOLD);
+    return p->sort & SO_REV ? -r : r;
+}
+
+/* Two entries by the panel's sort: the group first, then the field, reversed if
+ * SO_REV, then the name, unless the field is the inode. KEY holds the time or the
+ * inode of each entry for the atime, ctime and inode sorts; it is NULL when the
+ * entries have none, and those are then alike. */
+static int ecmp(const struct panel *p, const int64_t *key, uint16_t x, uint16_t y)
 {
     const struct ent *a = &p->e[x], *b = &p->e[y];
-    if (is_dir(a) != is_dir(b)) return is_dir(b) - is_dir(a);
-    return ncmp(p->nm + a->name, p->nm + b->name);
-}
+    int s = p->sort, f = s & SO_FIELD, r = 0;
 
-static int lc(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+    if (grp(a, s) != grp(b, s)) return grp(b, s) - grp(a, s);
+    switch (f) {
+    case SF_NAME:    return namecmp(p, x, y);
+#if VERSION_SORT
+    case SF_VERSION: r = filevercmp(p->nm + a->name, p->nm + b->name); break;
+#endif
+    case SF_EXT:     r = fcmp(ext_of(p->nm + a->name), ext_of(p->nm + b->name), s & SO_FOLD); break;
+    case SF_SIZE:    r = kcmp((int64_t)ent_size(a), (int64_t)ent_size(b)); break;
+    case SF_MTIME:   r = kcmp(ent_mtime(a), ent_mtime(b)); break;
+    case SF_ATIME:
+    case SF_CTIME:
+    case SF_INODE:   r = kcmp(key ? key[x] : 0, key ? key[y] : 0); break;
+    default:         return 0;
+    }
+    if (r) return s & SO_REV ? -r : r;
+    return f == SF_INODE ? 0 : namecmp(p, x, y);
+}
 
 /* Is EXT (no dot) one of the ';'-separated words in LIST? Case-insensitive. */
 static int ext_in(const char *list, const char *ext)
@@ -2120,19 +2322,20 @@ static void load_up(struct panel *p)
 }
 
 /* The list: "..." first (not in the root directory, and always inside an archive),
- * then the rest sorted. */
-static void sort_list(struct panel *p)
+ * then the rest in the panel's sort order, or as read if it is unsorted. */
+static void sort_list(struct panel *p, const int64_t *key)
 {
-    int up = p->arc[0] || !(p->path[0] == '/' && p->path[1] == 0), first = up ? 1 : 0;
+    int up = p->arc[0] || p->rem || !(p->path[0] == '/' && p->path[1] == 0), first = up ? 1 : 0;
 
     p->n = 0;
     if (up) p->ord[p->n++] = 0;
     for (int i = 1; i < p->ne; i++) p->ord[p->n++] = (uint16_t)i;
+    if ((p->sort & SO_FIELD) == SF_UNSORTED) return;
     /* insertion sort; plenty fast for ordinary directories */
     for (int i = first + 1; i < p->n; i++) {
         uint16_t v = p->ord[i];
         int j = i;
-        while (j > first && ecmp(p, p->ord[j - 1], v) > 0) {
+        while (j > first && ecmp(p, key, p->ord[j - 1], v) > 0) {
             p->ord[j] = p->ord[j - 1];
             j--;
         }
@@ -2140,27 +2343,356 @@ static void sort_list(struct panel *p)
     }
 }
 
-/* Read the panel's directory again: p->path, or the archive p->arc at the
- * directory p->sub. 0 on success; a negative errno if an archive cannot be read,
- * when the listing is only "...". */
-static int load(struct panel *p)
+/* A path that names a shell link, sh://... */
+static int is_link(const char *s) { return s[0] == 's' && s[1] == 'h' && s[2] == ':' && s[3] == '/' && s[4] == '/'; }
+
+/* ----------------------------------------------------------- shell links
+ *
+ * A shell link, sh://user@host/dir, shows a directory on another machine. It is
+ * reached by ssh: the shell there, started as "echo SHELL:;/bin/sh", reads commands
+ * from ssh's input and answers on its output, each answer ending with a "### NNN"
+ * line (the protocol of mc's helpers/README.shell). One link is open at a time, and
+ * a panel on it has rem set, its path being the directory there. The local directory
+ * the link was opened from is rorig: going up from the link's root goes back there. */
+
+
+/* The next line from ssh into L (MAX bytes, the newline dropped): its length, or -1
+ * at the end of its output. */
+static int rline(char *l, int max)
+{
+    int k = 0;
+
+    for (;;) {
+        char c;
+
+        if (rpos == rn) {
+            long r = read(rr, rb, sizeof rb);
+
+            if (r == -EINTR) continue;
+            if (r <= 0) return -1;
+            rn = (int)r;
+            rpos = 0;
+        }
+        c = rb[rpos++];
+        if (c == '\n') break;
+        if (k < max - 1) l[k++] = c;
+    }
+    l[k] = 0;
+    return k;
+}
+
+/* Writes S (N bytes) to ssh. 0, or a negative errno. */
+static int rsend(const char *s, size_t n)
+{
+    while (n) {
+        long w = write(rw, s, n);
+
+        if (w == -EINTR) continue;
+        if (w < 0) return (int)w;
+        s += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Sends the script CMD and reads its answer: each line but the last goes to FN, with
+ * X, if not NULL; the last, "### NNN", gives the code NNN. A negative errno if ssh
+ * is gone. */
+static int rrun(const char *cmd, void (*fn)(void *x, const char *line), void *x)
+{
+    char l[1024];
+    int r;
+
+    if (rr < 0) return -ENOTCONN;
+    r = rsend(cmd, strlen(cmd));
+    if (r == 0) r = rsend("\n", 1);
+    if (r) return r;
+    for (;;) {
+        int k = rline(l, sizeof l), c = 0;
+
+        if (k < 0) return -EIO;
+        if (l[0] == '#' && l[1] == '#' && l[2] == '#' && l[3] == ' ') {
+            for (const char *q = l + 4; *q >= '0' && *q <= '9'; q++) c = c * 10 + (*q - '0');
+            return c;
+        }
+        if (fn) fn(x, l);
+    }
+}
+
+/* Takes the link down: its input closes, ssh ends, and it is waited for. */
+static void rclose(void)
+{
+    int st;
+
+    if (rw >= 0) close(rw);
+    if (rr >= 0) close(rr);
+    if (rpid > 0)
+        while (wait4((int)rpid, &st, 0, NULL) == -EINTR)
+            ;
+    rw = rr = -1;
+    rpid = -1;
+    rhost[0] = 0;
+    rn = rpos = 0;
+}
+
+/* Takes the link down, when no panel is on it. */
+static void rdrop(void)
+{
+    struct panel *a = &P[0], *b = &P[1];
+
+    if (!a->rem && !b->rem) rclose();
+}
+
+/* Starts ssh to HOST (user@host), and reads the remote shell's answer, "SHELL:". 0,
+ * or a negative errno. */
+static int rconnect(const char *host)
+{
+    struct sigaction sa;
+    int a[2], b[2], dn;
+    long pid;
+    char *argv[8], l[256];
+
+    if (host[0] == '-') return -EINVAL;      /* no option: the host is an argument */
+    zero_block(&sa, sizeof sa);
+    sa._u._sa_handler = SIG_IGN;             /* ssh's end is not ours to stop on */
+    rt_sigaction(SIGPIPE, &sa, NULL, 8);
+    if (pipe2(a, O_CLOEXEC) < 0) return -EMFILE;
+    if (pipe2(b, O_CLOEXEC) < 0) {
+        close(a[0]);
+        close(a[1]);
+        return -EMFILE;
+    }
+    pid = clone(SIGCHLD, 0, 0, 0, 0);
+    if (pid < 0) {
+        close(a[0]);
+        close(a[1]);
+        close(b[0]);
+        close(b[1]);
+        return (int)pid;
+    }
+    if (pid == 0) {
+        dn = (int)open("/dev/null", O_RDWR, 0);
+        dup2(a[0], 0);
+        dup2(b[1], 1);
+        if (dn >= 0) dup2(dn, 2);
+        argv[0] = (char *)"ssh";
+        argv[1] = (char *)"-o";
+        argv[2] = (char *)"BatchMode=yes";
+        argv[3] = (char *)"-o";
+        argv[4] = (char *)"ConnectTimeout=20";
+        argv[5] = (char *)host;
+        argv[6] = (char *)"echo SHELL:;/bin/sh";
+        argv[7] = NULL;
+        exec_tool("ssh", argv);
+        exit(127);
+    }
+    close(a[0]);
+    close(b[1]);
+    rw = a[1];
+    rr = b[0];
+    rpid = pid;
+    rn = rpos = 0;
+    for (;;) {
+        int k = rline(l, sizeof l);
+
+        if (k < 0) {
+            rclose();
+            return -EIO;
+        }
+        if (scmp(l, "SHELL:") == 0) return 0;
+    }
+}
+
+/* S quoted for the shell, into Q: 'S', with each ' written as '\''. 0, or -1 if it
+ * does not fit. */
+static int rquote(char *q, size_t max, const char *s)
+{
+    size_t k = 0;
+
+    if (max < 3) return -1;
+    q[k++] = '\'';
+    for (; *s; s++) {
+        int esc = *s == '\'';
+
+        if (k + (esc ? 4 : 1) + 2 > max) return -1;
+        if (esc) {
+            q[k++] = '\'';
+            q[k++] = '\\';
+            q[k++] = '\'';
+            q[k++] = '\'';
+        } else {
+            q[k++] = *s;
+        }
+    }
+    q[k++] = '\'';
+    q[k] = 0;
+    return 0;
+}
+
+/* A number at *Q: its digits, which *Q moves past. */
+static long rnum(const char **q)
+{
+    long v = 0;
+
+    while (**q >= '0' && **q <= '9') v = v * 10 + (*(*q)++ - '0');
+    return v;
+}
+
+/* One line of find -printf '%y %Y %m %s %T@ %f': the type of the entry and of its
+ * target (for a link), the mode, size, time and name, as in the line. 0, or -1 if the
+ * line is not one. */
+struct rstat { const char *name; uint64_t size; long mtime; int y, Y; unsigned mode; };
+
+static int rfields(const char *l, struct rstat *r)
+{
+    const char *q = l + 4;
+
+    if (!l[0] || l[1] != ' ' || l[3] != ' ') return -1;
+    r->y = l[0];
+    r->Y = l[2];
+    r->mode = 0;
+    while (*q >= '0' && *q <= '7') r->mode = r->mode * 8 + (unsigned)(*q++ - '0');
+    if (*q++ != ' ') return -1;
+    r->size = (uint64_t)rnum(&q);
+    if (*q++ != ' ') return -1;
+    r->mtime = rnum(&q);
+    if (*q == '.') {
+        q++;
+        rnum(&q);
+    }
+    if (*q++ != ' ' || !*q) return -1;
+    r->name = q;
+    return 0;
+}
+
+/* One entry of the listing: appended to the panel P. A link is shown as its target
+ * is: a link to a directory with the directories, a link to a file with the files,
+ * a dangling one as stale. */
+static void rent(void *x, const char *l)
+{
+    struct panel *p = x;
+    struct rstat rs;
+    struct ent *e;
+    int at;
+
+    if (p->ne >= MAXE || rfields(l, &rs) != 0) return;
+    at = add_name(p, rs.name);
+    if (at < 0) return;
+    e = &p->e[p->ne++];
+    e->name = (uint32_t)at;
+    e->up = 0;
+    e->sel = 0;
+    e->link = rs.y == 'l';
+    if (rs.y == 'l') e->cls = rs.Y == 'd' ? CL_DIR : (rs.Y == 'N' || rs.Y == 'L') ? CL_STALE : CL_NORMAL;
+    else if (rs.y == 'd') e->cls = CL_DIR;
+    else e->cls = (rs.mode & 0111) ? CL_EXE : CL_NORMAL;
+    e->size = size_pack(rs.size);
+    e->mtime = (uint32_t)rs.mtime;
+}
+
+/* The time of ".." : the answer to stat on the parent directory, as the number of
+ * seconds. */
+static void rup(void *x, const char *l)
+{
+    struct panel *p = x;
+    const char *q = l;
+
+    if (*q >= '0' && *q <= '9') p->e[0].mtime = (uint32_t)rnum(&q);
+}
+
+/* Reads the directory of P on the link, with ls in long form, and lists it. 0, or a
+ * negative errno; the listing is then only "..". */
+static int rload(struct panel *p)
+{
+    char q[4096 + 64], cmd[4096 + 160];
+    struct ent *e = &p->e[0];
+    int rc;
+
+    p->nn = 0;
+    add_name(p, "..");
+    e->name = 0;
+    e->size = 0;
+    e->cls = CL_DIR;
+    e->up = 1;
+    e->sel = 0;
+    e->link = 0;
+    e->mtime = 0;
+    p->ne = 1;
+    p->free_kb = p->total_kb = 0;
+    if (rquote(q, sizeof q, p->path) < 0) return -ENAMETOOLONG;
+    strlcpy(cmd, "find -H ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " -mindepth 1 -maxdepth 1 -printf '%y %Y %m %s %T@ %f\\n' 2>/dev/null"
+                 " && echo '### 200' || echo '### 500'", sizeof cmd);
+    rc = rrun(cmd, rent, p);
+    if (rc == 200 && rquote(q, sizeof q, p->path) == 0) {    /* the time of ".." */
+        strlcpy(cmd, "stat -c %Y -- ", sizeof cmd);
+        strlcat(cmd, q, sizeof cmd);
+        cmd[strlen(cmd) - 1] = 0;                 /* the quote closes after the /.. */
+        strlcat(cmd, "/..' 2>/dev/null; echo '### 200'", sizeof cmd);
+        rrun(cmd, rup, p);
+    }
+    sort_list(p, NULL);
+    if (rc == 200) return 0;
+    if (rc == 500) return -ENOENT;
+    return rc < 0 ? rc : -EIO;
+}
+
+/* Connects for the link URL sh://user@host/dir, and gives the directory in DIR. A
+ * negative errno after an error box. One link at a time: a panel may not be on
+ * another machine than the link the other one is on. */
+static void set_error(const char *head, const char *shown, long e);
+
+static int shell_connect(struct panel *p, const char *url, char *dir, size_t max)
+{
+    const struct panel *o = &P[(p - P) ^ 1];
+    const char *h = url + 5, *d = h;
+    char host[256];
+    size_t hl;
+    int r;
+
+    while (*d && *d != '/') d++;
+    hl = (size_t)(d - h);
+    if (hl == 0 || hl >= sizeof host) {
+        set_error("Bad shell link", url, EINVAL);
+        return -EINVAL;
+    }
+    memcpy(host, h, hl);
+    host[hl] = 0;
+    strlcpy(dir, *d ? d : "/", max);
+    if (o->rem && scmp(rhost, host) != 0) {
+        set_error("One shell link at a time", url, EBUSY);
+        return -EBUSY;
+    }
+    if (rr < 0 || scmp(rhost, host) != 0) {
+        rclose();
+        r = rconnect(host);
+        if (r) {
+            set_error("Cannot connect to", host, -r);
+            return r;
+        }
+        strlcpy(rhost, host, sizeof rhost);
+    }
+    return 0;
+}
+
+/* The key of an entry for the sort: its atime, ctime or inode, as statx gives it. */
+static int64_t sort_key(int kf, const struct statx *sx)
+{
+    return kf == SF_ATIME ? sx->stx_atime.tv_sec : kf == SF_CTIME ? sx->stx_ctime.tv_sec
+                                                                   : (int64_t)sx->stx_ino;
+}
+
+/* Read the directory of P->path into its list, sorted; KEY, if not NULL, takes
+ * the key of each entry (see sort_key()). */
+static int read_dir(struct panel *p, int64_t *key)
 {
     long buf[1024];                 /* 8 KiB, aligned for dirent64 records */
     struct statx sx;
     struct linux_dirent64 *d = NULL;
     struct ent *e;
     long fd, r, off;
-
-    if (p->arc[0]) {
-        int rc = 0;
-
-        load_up(p);
-        if (!archive_fresh(p)) rc = archive_read(p);
-        if (rc == 0) archive_list(p);
-        sort_list(p);
-        p->free_kb = p->total_kb = 0;               /* as mc: an archive has no free space shown */
-        return rc;
-    }
+    int kf = p->sort & SO_FIELD;
 
     fd = open(p->path, O_RDONLY | O_DIRECTORY, 0);
 
@@ -2186,7 +2718,9 @@ static int load(struct panel *p)
             e->mtime = 0;
             e->cls = CL_NORMAL;
             e->link = 0;
+            if (key) key[p->ne] = 0;
             if (statx((int)fd, nm, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) == 0) {
+                if (key) key[p->ne] = sort_key(kf, &sx);
                 uint32_t type = sx.stx_mode & S_IFMT;
                 e->size = size_pack(sx.stx_size);      /* a link's own size and date */
                 e->mtime = (uint32_t)sx.stx_mtime.tv_sec;
@@ -2209,7 +2743,7 @@ static int load(struct panel *p)
     }
     if (fd >= 0) close((int)fd);
 
-    sort_list(p);
+    sort_list(p, key);
 
     {
         struct statfs f;
@@ -2220,6 +2754,38 @@ static int load(struct panel *p)
         }
     }
     return 0;
+}
+
+/* The key buffer of a sort by atime, ctime or inode, one entry of the directory
+ * after another: it is on the stack of this read, and gone when it returns. */
+static int load_keyed(struct panel *p)
+{
+    int64_t key[MAXE];
+
+    return read_dir(p, key);
+}
+
+/* Read the panel's directory again: p->path, or the archive p->arc at the
+ * directory p->sub. 0 on success; a negative errno if an archive cannot be read,
+ * when the listing is only "...". */
+static int load(struct panel *p)
+{
+    int kf = p->sort & SO_FIELD;
+
+    if (p->rem) return rload(p);
+
+    if (p->arc[0]) {
+        int rc = 0;
+
+        load_up(p);
+        if (!archive_fresh(p)) rc = archive_read(p);
+        if (rc == 0) archive_list(p);
+        sort_list(p, NULL);
+        p->free_kb = p->total_kb = 0;               /* as mc: an archive has no free space shown */
+        return rc;
+    }
+    if (kf == SF_ATIME || kf == SF_CTIME || kf == SF_INODE) return load_keyed(p);
+    return read_dir(p, NULL);
 }
 
 /* Keep the cursor visible. As in mc, crossing the bottom edge moves the list
@@ -2591,15 +3157,17 @@ static int has_utf8(const char *s)
     return 0;
 }
 
-static void emit_row(int y, int n)
+static void emit_row(int y, int x0, int n)
 {
     uint16_t cur = 0xFFFF;
     int dec = 0;
 
     outs("\x1b[");
     outu((unsigned long)y + 1);
-    outs(";1H");
-    for (int i = 0; i < n; i++) {
+    outs(";");
+    outu((unsigned long)x0 + 1);
+    outs("H");
+    for (int i = x0; i < n; i++) {
         uint16_t a = row[i].a;
         uint16_t key = a & ~DEC;
 
@@ -2783,6 +3351,8 @@ static void zero_block(void *p, size_t n);
 #define K_SUP    0x111
 #define K_SDOWN  0x112
 #define K_INS    0x113
+#define K_F9     0x114
+#define K_BTAB   0x115
 #define K_NONE   0x1ff
 #define K_ALT    0x200          /* Alt+x is K_ALT | x */
 
@@ -2842,6 +3412,7 @@ static int key_parse(const unsigned char *in, int n, int i, int *len)
     case 'H': return K_HOME;
     case 'F': return K_END;
     case 'R': return in[i + 1] == 'O' ? K_F3 : K_NONE;
+    case 'Z': return K_BTAB;
     case '~':
         switch (nums[0]) {
         case 1: case 7:  return K_HOME;
@@ -2854,6 +3425,7 @@ static int key_parse(const unsigned char *in, int n, int i, int *len)
         case 15:         return K_F5;
         case 17:         return K_F6;
         case 19:         return K_F8;
+        case 20:         return K_F9;
         case 21:         return K_F10;
         }
         return K_NONE;
@@ -3146,6 +3718,7 @@ static void put_prompt(void);
 
 static void tty_leave(void)
 {
+    rfull = 1;
     if (tty_ok) ioctl(0, TCSETS, &tty_saved);
     outs("\x1b[0m");
     if (on_alt) {
@@ -3157,6 +3730,7 @@ static void tty_leave(void)
 
 static void tty_enter(void)
 {
+    rfull = 1;
     if (tty_ok) ioctl(0, TCSETS, &tty_raw);
     if (!hidden && !on_alt) {
         outs("\x1b[?1049h");
@@ -3221,7 +3795,7 @@ static int sh_start(void)
         dup2((int)s, 1);
         dup2((int)s, 2);
         close((int)s);
-        chdir(P[act].path);
+        if (!P[act].rem) chdir(P[act].path);   /* a link's path is not one here */
         execve("/bin/sh", argv, envp);
         exit(127);
     }
@@ -3388,6 +3962,7 @@ static void toggle_hidden(void)
             return;
         }
         hidden = 0;
+        rfull = 1;
         sh_park();
         rescan_changed();
         tty_enter();
@@ -3395,6 +3970,7 @@ static void toggle_hidden(void)
     }
     if (sh_fd < 0 && sh_start() < 0) return;
     hidden = 1;
+    rfull = 1;
     if (on_alt) {
         outs("\x1b[?1049l");
         on_alt = 0;
@@ -3582,6 +4158,8 @@ static void enter_item(struct panel *p)
 }
 
 /* F3: a directory is entered; a file is shown with mcview. */
+static void remote_view(struct panel *p, const struct ent *e);
+
 static void view_item(struct panel *p)
 {
     const struct ent *e;
@@ -3595,6 +4173,10 @@ static void view_item(struct panel *p)
     }
     if (p->arc[0]) {
         vfs_view(p, e);
+        return;
+    }
+    if (p->rem) {
+        remote_view(p, e);
         return;
     }
     argv[0] = (char *)"mcview";
@@ -3682,7 +4264,7 @@ static void nav_key(struct panel *p, int key)
 
 /* Insert, and Shift+Up or Shift+Down: the highlighted item is marked (or unmarked,
  * if it was marked already), and the cursor moves one item: down for Insert and
- * Shift+Down, up for Shift+Up. \"..\" is never marked; the cursor stops at either end. */
+ * Shift+Down, up for Shift+Up. ".." is never marked; the cursor stops at either end. */
 static void sel_key(struct panel *p, int key)
 {
     if (p->n == 0) return;
@@ -3830,6 +4412,11 @@ static void quick_cd(const char *typed)
 {
     char res[4096], shown[512];
 
+    while (*typed == ' ') typed++;              /* "cd DIR": the space after cd */
+    if (is_link(typed)) {                       /* a shell link: a URL, not a path */
+        change_to(&P[act], typed, typed);
+        return;
+    }
     path_of(typed, P[act].path, res, sizeof res, shown, sizeof shown);
     change_to(&P[act], res, shown);
 }
@@ -3839,18 +4426,35 @@ static void quick_cd(const char *typed)
  * else starts at the top of the list. */
 static void change_to(struct panel *p, const char *res, const char *shown)
 {
-    char old[4096];
-    long fd = open(res, O_RDONLY | O_DIRECTORY, 0);
+    char old[4096], dir[4096];
+    int was = p->rem, rc;
 
-    if (fd < 0) {
-        set_error("Cannot change directory to", shown, -fd);
-        return;
+    if (is_link(res)) {                         /* a shell link: its directory is the path */
+        if (shell_connect(p, res, dir, sizeof dir) != 0) return;
+        if (!was && !P[(p - P) ^ 1].rem) strlcpy(rorig, p->path, sizeof rorig);
+        p->rem = 1;
+        res = shown = dir;
+    } else if (!p->rem) {
+        long fd = open(res, O_RDONLY | O_DIRECTORY, 0);
+
+        if (fd < 0) {
+            set_error("Cannot change directory to", shown, -fd);
+            return;
+        }
+        close((int)fd);
+        vfs_forget(p);                          /* a real directory: out of any archive */
     }
-    close((int)fd);
-    vfs_forget(p);                              /* a real directory: out of any archive */
     strlcpy(old, p->path, sizeof old);
     strlcpy(p->path, res, sizeof p->path);
-    load(p);
+    rc = load(p);
+    if (rc && p->rem) {                         /* the link has no such directory: stay */
+        strlcpy(p->path, old, sizeof p->path);
+        p->rem = (uint8_t)was;
+        load(p);
+        rdrop();
+        set_error("Cannot change directory to", shown, -rc);
+        return;
+    }
     p->cur = 0;
     p->top = 0;
     /* As mc: going up selects the directory we came from, and the window is
@@ -3967,6 +4571,16 @@ static void enter_dir(struct panel *p)
     if (!p->n) return;
     e = &p->e[p->ord[p->cur]];
     if (!is_dir(e)) return;
+    if (p->rem && e->up && p->path[0] == '/' && p->path[1] == 0) {
+        char back[4096];
+
+        strlcpy(back, rorig, sizeof back);
+        p->rem = 0;
+        change_to(p, back, back);
+        if (scmp(p->path, back) != 0) p->rem = 1;   /* that is gone: the link stays */
+        else rdrop();
+        return;
+    }
     if (p->arc[0]) {                                /* inside an archive */
         if (e->up) vfs_up(p);
         else vfs_enter(p, e);
@@ -4195,6 +4809,7 @@ static void qy_draw_row(int y)
  * job waits for its answer (modal_wait), so walking down a tree is plain recursion.
  * Esc, or Abort, stops the job at once: an item it has not finished keeps its mark. */
 enum { JOB_COPY, JOB_MOVE, JOB_DEL };
+static int job_cut;             /* the last job stopped before its items were all done */
 static struct {
     int kind;                   /* JOB_COPY, JOB_MOVE or JOB_DEL */
     int sel;                    /* the marked items, not just the highlighted one */
@@ -4302,6 +4917,7 @@ static void delete_open(struct panel *p)
         set_error("Read-only archive", p->arc, EROFS);
         return;
     }
+    strlcpy(job_base, p->path, sizeof job_base);    /* the items are in the panel's directory */
 
     job.sel = marked_any(p);
     if (job.sel) {
@@ -4399,6 +5015,10 @@ static int op_n1;
 static struct line dline;               /* the destination, as typed */
 static int opx, opy, opw, oph;          /* the box: column, row, width, height */
 static const char *op_title[2] = { " Copy ", " Move " };
+/* The progress of a job: the bytes done, out of the total the scans give, and the bytes done
+ * before the file in hand (see pg_draw). */
+static uint64_t pt_now, pt_total, pt_base;
+static int pt_tarish;                    /* a scan counts what a tar stream spends on an item */
 static const char *pg_src, *pg_dst;     /* the progress box: the source name, the destination */
 static int pg_pct;                      /* percentage the progress box shows, -1 before the first */
 
@@ -4415,6 +5035,7 @@ static void check_size(void)
         if (sh_fd >= 0) size_pty(sh_fd);
         scroll(&P[0]);
         scroll(&P[1]);
+        rfull = 1;
         if (!hidden) outs("\x1b[2J");
     }
 }
@@ -4440,17 +5061,27 @@ static void op_geom(void)
 {
     opw = cols - 4 < 64 ? cols - 4 : 64;
     if (opw < 8) opw = 8;
-    oph = (mode == MODE_PROG ? 9 : mode == MODE_CONFLICT ? CF_H : 6) + 2 * DIALOG_PAD;
+    oph = (mode == MODE_PROG ? 10 : mode == MODE_CONFLICT ? CF_H : 6) + 2 * DIALOG_PAD;
     opx = (cols - opw) / 2;
     opy = (rows - oph) / 3;
     if (opx < 0) opx = 0;
     if (opy < 0) opy = 0;
 }
 
-/* The progress bar: [=====     ] and the percentage, in W cells at X. */
-static void op_bar(int x, int w)
+/* A percentage of DONE out of TOTAL, at most 100 (0 while the total is not known). */
+static int pct_of(uint64_t done, uint64_t total)
 {
-    int bw = w - 9, pct = pg_pct > 0 ? pg_pct : 0, filled = pct * bw / 100;
+    uint64_t p;
+
+    if (!total) return 0;
+    p = udiv64(done * 100, total, NULL);     /* no 64-bit divide instruction on armhf or i386 */
+    return p > 100 ? 100 : (int)p;
+}
+
+/* The progress bar: [=====     ] and the percentage PCT, in W cells at X. */
+static void op_bar(int x, int w, int pct)
+{
+    int bw = w - 9, filled = pct * bw / 100;
     char pc[4];
 
     if (bw < 1) return;
@@ -4469,7 +5100,7 @@ static void op_row(int dy)
 {
     int prog = mode == MODE_PROG, fh = oph - 2 * DIALOG_PAD;
     int x0 = opx + DIALOG_PAD, r = opx + opw - 1 - DIALOG_PAD, in = OPFW - 4, x;
-    int sep = prog ? 6 : 3, btn = prog ? 7 : 4;
+    int sep = prog ? 7 : 3, btn = prog ? 8 : 4;
 
     if (dy < 0 || dy >= oph) return;
     for (x = opx; x < opx + opw; x++) setc(x, ' ', C_QCD);     /* the margin too */
@@ -4510,7 +5141,11 @@ static void op_row(int dy)
     if (dy == 2) show_tail(x0 + 2, pg_src, (int)strlen(pg_src), in, C_QCD);
     if (dy == 3) sets(x0 + 2, "Target", 6, C_QCD);
     if (dy == 4) show_tail(x0 + 2, pg_dst, (int)strlen(pg_dst), in, C_QCD);
-    if (dy == 5) op_bar(x0 + 2, in);
+    if (dy == 5) op_bar(x0 + 2, in, pg_pct > 0 ? pg_pct : 0);
+    if (dy == 6) {
+        sets(x0 + 2, "Total", 5, C_QCD);
+        op_bar(x0 + 8, in - 6, pct_of(pt_now, pt_total));
+    }
 }
 
 /* Whether Esc, or A (the Abort of the progress box), has been typed alone, without
@@ -4532,16 +5167,104 @@ static int esc_typed(void)
 
 /* A chunk of the copy is done: the progress box is drawn again if its
  * percentage has moved. */
-static void pg_update(uint64_t done, uint64_t total)
-{
-    int pct = total ? (int)udiv64(done * 100, total, NULL) : 100;
+/* The progress of a copy or move, as the box shows it: the file in hand, and the whole
+ * job (the Total bar), out of the bytes the job has as scanned before it starts. A
+ * transfer to or from a link counts the bytes that pass through mc (pump). The box is
+ * drawn at most every PG_MS, and only the rows that changed are written. */
+#define PG_MS 100
+static int64_t pg_ms;                        /* when the box was last drawn, in ms */
 
-    if (pct > 100) pct = 100;
-    if (pct == pg_pct) return;
-    pg_pct = pct;
+/* Draws the progress box, unless it was drawn less than PG_MS ago: then the next call
+ * draws it, or the end of the job. FORCE draws it at once. */
+static void pg_draw(int force)
+{
+    struct timespec ts;
+    int64_t t;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    t = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (!force && t >= pg_ms && t - pg_ms < PG_MS) return;
+    pg_ms = t;
     check_size();
     draw();
 }
+
+/* A chunk of the file in hand is done: DONE of its TOTAL bytes. */
+static void pg_update(uint64_t done, uint64_t total)
+{
+    pg_pct = total ? pct_of(done, total) : 100;
+    pt_now = pt_base + done;
+    pg_draw(0);
+}
+
+/* The bytes read from IN written to OUT, counted as the job's: the bytes of a transfer
+ * through mc. 0 at the end of IN, or -errno; -ECANCELED if Esc is typed. */
+static long pump(int in, int out)
+{
+    for (;;) {
+        long n = read(in, ob, sizeof ob), off = 0;
+
+        if (n == -EINTR) continue;
+        if (n <= 0) return n;
+        while (off < n) {
+            long w = write(out, ob + off, (size_t)(n - off));
+
+            if (w == -EINTR) continue;
+            if (w <= 0) return w < 0 ? w : -EIO;
+            off += w;
+        }
+        pt_now += (uint64_t)n;
+        pg_pct = pct_of(pt_now, pt_total);
+        pg_draw(0);
+        if (esc_typed()) return -ECANCELED;
+    }
+}
+
+/* The bytes of an item of a job, as a scan counts them: a file's size, or with
+ * pt_tarish what a tar stream spends on it (a header, and its blocks); 512 for a
+ * directory, which is then scanned in turn. */
+struct scan_ctx { const char *dir; };
+static long each_entry(const char *path, long (*fn)(const char *name, void *ctx), void *ctx);
+static void scan_path(const char *path);
+
+static long scan_child(const char *name, void *ctx)
+{
+    char c[4352];
+
+    if (join(c, sizeof c, ((struct scan_ctx *)ctx)->dir, name) == 0) scan_path(c);
+    return 0;
+}
+
+static void scan_path(const char *path)
+{
+    struct statx sx;
+    struct scan_ctx ctx;
+
+    if (statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) != 0) return;
+    if ((sx.stx_mode & S_IFMT) == S_IFDIR) {
+        ctx.dir = path;
+        if (pt_tarish) pt_total += 512;
+        each_entry(path, scan_child, &ctx);
+    } else if (pt_tarish) {
+        pt_total += 512 + ((sx.stx_size + 511) >> 9 << 9);
+    } else {
+        pt_total += sx.stx_size;
+    }
+}
+
+/* A job begins on the items of a source and a destination: the box shows it, with no
+ * bytes done yet. The scans that follow give its total. */
+static void job_begin(const char *src, const char *dst)
+{
+    pt_now = pt_base = pt_total = 0;
+    pt_tarish = 0;
+    pg_ms = 0;
+    pg_pct = -1;
+    pg_src = src;
+    pg_dst = dst;
+    mode = MODE_PROG;
+}
+
 
 /* Copy IN to OUT a chunk at a time, through ob: nothing else uses ob while the
  * copy runs, as draw() only runs once the chunk is written. Esc stops it, and
@@ -5053,7 +5776,7 @@ static long make_dir(const char *dst, int mode)
 /* One file, link or directory-less item of a copy or move, as the question has it:
  * the destination is asked about when it exists, and a failure of the write is asked
  * about. Returns 0, or -ECANCELED. */
-static long leaf(const char *src, const char *dst, int move)
+static long leaf_do(const char *src, const char *dst, int move)
 {
     int how;
     long r, a;
@@ -5073,6 +5796,22 @@ static long leaf(const char *src, const char *dst, int move)
         if (a < 0) return a;
         if (a == 0) return 0;
     }
+}
+
+/* One file of a job, with its bytes counted: the Total bar moves on past it. */
+static long leaf(const char *src, const char *dst, int move)
+{
+    struct statx sx;
+    uint64_t sz = 0;
+    long r;
+
+    if (statx(AT_FDCWD, src, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sx) == 0 &&
+        (sx.stx_mode & S_IFMT) != S_IFDIR)
+        sz = sx.stx_size;
+    pt_base = pt_now;
+    r = leaf_do(src, dst, move);
+    pt_now = pt_base + sz;
+    return r;
 }
 
 /* A copy of SRC to DST: a file, a link, or a directory made, and what is in it copied
@@ -5143,10 +5882,423 @@ static long move_tree(const char *src, const char *dst)
     return item_fail("Cannot remove directory", src, r);
 }
 
+/* Starts ARGV with its input from IN and its output to OUT (-1: /dev/null). Its pid,
+ * or -errno. */
+static long spawn_io(char *const argv[], int in, int out)
+{
+    long pid = clone(SIGCHLD, 0, 0, 0, 0);
+    int dn;
+
+    if (pid != 0) return pid;
+    dn = (int)open("/dev/null", O_RDWR, 0);
+    dup2(in >= 0 ? in : dn, 0);
+    dup2(out >= 0 ? out : dn, 1);
+    dup2(dn, 2);
+    exec_tool(argv[0], argv);
+    exit(127);
+}
+
+/* Waits for the process PID: its exit status, or -1 if it did not exit. */
+static int wait_pid(long pid)
+{
+    int st = 0;
+    long r;
+
+    do r = wait4((int)pid, &st, 0, NULL);
+    while (r == -EINTR);
+    return r < 0 || (st & 0x7f) ? -1 : (st >> 8) & 0xff;
+}
+
+/* One command of its own on the link, by ssh: its input from IN, its output to OUT
+ * (-1 for none). The exit status, or -1. */
+/* One command of its own on the link, by ssh, started: its input from IN and its output
+ * to OUT (-1 for none). Its pid, or -errno. */
+static long rssh_start(const char *cmd, int in, int out)
+{
+    char *argv[8];
+
+    argv[0] = (char *)"ssh";
+    argv[1] = (char *)"-o";
+    argv[2] = (char *)"BatchMode=yes";
+    argv[3] = (char *)"-o";
+    argv[4] = (char *)"ConnectTimeout=20";
+    argv[5] = rhost;
+    argv[6] = (char *)cmd;
+    argv[7] = NULL;
+    return spawn_io(argv, in, out);
+}
+
+/* The same, to its end: the exit status, or -1. */
+static int rssh(const char *cmd, int in, int out)
+{
+    long pid = rssh_start(cmd, in, out);
+
+    return pid < 0 ? -1 : wait_pid(pid);
+}
+
+/* A command on the link through the connection, and its answer code, as rrun gives it;
+ * the two answers the scripts below give: 200 when the test is true, 500 when not. */
+static int rtest(const char *test)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+
+    if (rquote(q, sizeof q, test) < 0) return -ENAMETOOLONG;
+    strlcpy(cmd, test, sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " && echo '### 200' || echo '### 500'", sizeof cmd);
+    return rrun(cmd, NULL, NULL);
+}
+
+/* Whether PATH is a directory on the link (1), not one (0), or an error (-1). */
+static int remote_isdir(const char *path)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+    int rc;
+
+    if (rr < 0 || rquote(q, sizeof q, path) < 0) return -1;
+    strlcpy(cmd, "test -d ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " && echo '### 200' || echo '### 500'", sizeof cmd);
+    rc = rrun(cmd, NULL, NULL);
+    return rc == 200 ? 1 : rc == 500 ? 0 : -1;
+}
+
+/* Whether PATH exists on the link: 1, 0, or -1 for an error. */
+static int remote_exists(const char *path)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+    int rc;
+
+    if (rr < 0 || rquote(q, sizeof q, path) < 0) return -1;
+    strlcpy(cmd, "test -e ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " && echo '### 200' || echo '### 500'", sizeof cmd);
+    rc = rrun(cmd, NULL, NULL);
+    return rc == 200 ? 1 : rc == 500 ? 0 : -1;
+}
+
+/* Removes PATH on the link: a file, or an empty directory. A directory that is not
+ * empty is an error, and nothing is removed from it: a recursive removal is not
+ * asked for here. 0, or -errno. */
+static long remote_rm(const char *path)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+    int rc;
+
+    if (rr < 0 || rquote(q, sizeof q, path) < 0) return -EIO;
+    strlcpy(cmd, "rm -- ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " 2>/dev/null || rmdir -- ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " 2>/dev/null && echo '### 200' || echo '### 500'", sizeof cmd);
+    rc = rrun(cmd, NULL, NULL);
+    return rc == 200 ? 0 : rc == 500 ? -ENOTEMPTY : -EIO;
+}
+
+/* The names of the items of P that a job works on (the marked ones, if SEL, else the
+ * highlighted one) as a list of NUL-terminated names, written to the file FD. */
+static long write_items(const struct panel *p, int sel, int fd)
+{
+    for (int d = 0; d < p->n; d++) {
+        const struct ent *e = &p->e[p->ord[d]];
+        const char *nm = p->nm + e->name;
+        size_t n;
+
+        if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+        n = strlen(nm) + 1;
+        if (write(fd, nm, n) != (long)n) return -EIO;
+    }
+    return 0;
+}
+
+/* Fetches the file PATH of the link into the open file FD: the bytes, as cat gives them.
+ * 0, or -errno. */
+static long remote_fetch(const char *path, int fd)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+
+    if (rquote(q, sizeof q, path) < 0) return -ENAMETOOLONG;
+    strlcpy(cmd, "cat -- ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    return rssh(cmd, -1, fd) == 0 ? 0 : -EIO;
+}
+
+/* F3 on a file of the link: the file is fetched into a staging directory of its own,
+ * and mcview runs on that copy. Nothing on this machine with the same path is read. */
+static void remote_view(struct panel *p, const struct ent *e)
+{
+    char remote[4352], local[4352], *argv[3];
+    long r = xtmp_make();
+    int fd;
+
+    if (!r) r = join(remote, sizeof remote, p->path, p->nm + e->name);
+    if (!r && join(local, sizeof local, xo.root, p->nm + e->name)) r = -ENAMETOOLONG;
+    if (!r) {
+        fd = (int)open(local, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        r = fd < 0 ? fd : remote_fetch(remote, fd);
+        if (fd >= 0) close(fd);
+    }
+    if (r) {
+        set_error("Cannot fetch", p->nm + e->name, -r);
+    } else {
+        argv[0] = (char *)"mcview";
+        argv[1] = local;
+        argv[2] = NULL;
+        run_child("mcview", argv, xo.root, RUN_SEARCH, NULL);
+    }
+    if (xo.root[0]) del_tree(xo.root, 1);
+    xo.root[0] = 0;
+}
+
+/* Downloads the items of the link panel P (the marked ones, else the highlighted) into
+ * the staging directory xo.root, as one tar stream: the stream comes through pump(),
+ * so the bytes count, and it is unpacked there by a local tar. 0, or -errno. */
+static long remote_stage(const struct panel *p, int sel)
+{
+    char list[4352], tar[4352], q[4096 + 64], cmd[4096 + 200], *argv[6];
+    long r = xtmp_make(), pid;
+    int lf = -1, tf = -1, fds[2];
+
+    if (r) return r;
+    if (join(list, sizeof list, xo.root, "list") || join(tar, sizeof tar, xo.root, "items.tar"))
+        return -ENAMETOOLONG;
+    lf = (int)open(list, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (lf < 0) return lf;
+    r = write_items(p, sel, lf);
+    close(lf);
+    if (r) return r;
+    if (rquote(q, sizeof q, p->path) < 0) return -ENAMETOOLONG;
+    strlcpy(cmd, "tar -C ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " -cf - --null -T -", sizeof cmd);
+    lf = (int)open(list, O_RDONLY | O_CLOEXEC, 0);
+    tf = (int)open(tar, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (lf < 0 || tf < 0) return -EIO;
+    if (pipe2(fds, O_CLOEXEC) < 0) return -EMFILE;
+    pid = rssh_start(cmd, lf, fds[1]);
+    close(fds[1]);
+    r = pid < 0 ? pid : pump(fds[0], tf);
+    close(fds[0]);
+    if (pid >= 0 && wait_pid(pid) != 0 && r == 0) r = -EIO;
+    close(lf);
+    close(tf);
+    if (!r) {
+        argv[0] = (char *)"tar";
+        argv[1] = (char *)"-xf";
+        argv[2] = tar;
+        argv[3] = (char *)"-C";
+        argv[4] = xo.root;
+        argv[5] = NULL;
+        pid = spawn_io(argv, -1, -1);
+        r = pid < 0 || wait_pid(pid) != 0 ? -EIO : 0;
+    }
+    unlinkat(AT_FDCWD, list, 0);
+    unlinkat(AT_FDCWD, tar, 0);
+    return r;
+}
+
+/* Uploads the items of the local panel P (the marked ones, else the highlighted) into
+ * the directory DST of the link: a local tar's stream, through pump(), into a tar on
+ * the link that unpacks it. Nothing that exists there is replaced; the items are then
+ * removed here, if MOVE. 0, or -errno. */
+static long local_upload(const struct panel *p, const char *dst, int sel, int move)
+{
+    char list[4352], q[4096 + 64], cmd[4096 + 200], *argv[10];
+    int lf, a[2], b[2];
+    long r = xtmp_make(), pt, ps;
+    int st1, st2;
+
+    if (r) return r;
+    if (join(list, sizeof list, xo.root, "list")) return -ENAMETOOLONG;
+    lf = (int)open(list, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (lf < 0) return lf;
+    r = write_items(p, sel, lf);
+    close(lf);
+    if (r) return r;
+    for (int d = 0; d < p->n && !r; d++) {
+        const struct ent *e = &p->e[p->ord[d]];
+        char target[4352];
+
+        if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+        if (join(target, sizeof target, dst, p->nm + e->name)) return -ENAMETOOLONG;
+        if (remote_exists(target) != 0) r = remote_exists(target) == 1 ? -EEXIST : -EIO;
+    }
+    if (r) return r;
+    if (rquote(q, sizeof q, dst) < 0) return -ENAMETOOLONG;
+    strlcpy(cmd, "tar -C ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " -xf -", sizeof cmd);
+    if (pipe2(a, O_CLOEXEC) < 0) return -EMFILE;
+    if (pipe2(b, O_CLOEXEC) < 0) {
+        close(a[0]);
+        close(a[1]);
+        return -EMFILE;
+    }
+    argv[0] = (char *)"tar";
+    argv[1] = (char *)"-C";
+    argv[2] = (char *)p->path;
+    argv[3] = (char *)"-cf";
+    argv[4] = (char *)"-";
+    argv[5] = (char *)"--null";
+    argv[6] = (char *)"-T";
+    argv[7] = list;
+    argv[8] = NULL;
+    pt = spawn_io(argv, -1, a[1]);
+    ps = rssh_start(cmd, b[0], -1);
+    close(a[1]);
+    close(b[0]);
+    r = pt < 0 || ps < 0 ? -EIO : pump(a[0], b[1]);
+    close(a[0]);
+    close(b[1]);
+    st1 = pt < 0 ? -1 : wait_pid(pt);
+    st2 = ps < 0 ? -1 : wait_pid(ps);
+    if (!r && (st1 != 0 || st2 != 0)) r = -EIO;
+    unlinkat(AT_FDCWD, list, 0);
+    if (!r && move)
+        for (int d = 0; d < p->n; d++) {
+            const struct ent *e = &p->e[p->ord[d]];
+            char from[4352];
+
+            if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+            if (join(from, sizeof from, p->path, p->nm + e->name)) return -ENAMETOOLONG;
+            del_tree(from, 1);
+        }
+    return r;
+}
+
+/* A string into a buffer: 0, or -1 if it does not fit. */
+static long str_fit(char *d, size_t max, const char *s)
+{
+    if (strlen(s) >= max) return -1;
+    strlcpy(d, s, max);
+    return 0;
+}
+
+/* The entry NAME of the directory SRC of the link, copied into the directory DST of the
+ * link: a tar on the link, its stream through pump(), into a tar on the link that
+ * unpacks it. 0, or -errno. */
+static long remote_pipe(const char *src, const char *nm, const char *dst)
+{
+    char qs[4096 + 64], qn[4096 + 64], qd[4096 + 64], c1[4096 + 200], c2[4096 + 200];
+    int a[2], b[2];
+    long p1, p2, r = 0;
+    int s1, s2;
+
+    if (rquote(qs, sizeof qs, src) < 0 || rquote(qn, sizeof qn, nm) < 0 || rquote(qd, sizeof qd, dst) < 0)
+        return -ENAMETOOLONG;
+    strlcpy(c1, "tar -C ", sizeof c1);
+    strlcat(c1, qs, sizeof c1);
+    strlcat(c1, " -cf - -- ", sizeof c1);
+    strlcat(c1, qn, sizeof c1);
+    strlcpy(c2, "tar -C ", sizeof c2);
+    strlcat(c2, qd, sizeof c2);
+    strlcat(c2, " -xf -", sizeof c2);
+    if (pipe2(a, O_CLOEXEC) < 0) return -EMFILE;
+    if (pipe2(b, O_CLOEXEC) < 0) {
+        close(a[0]);
+        close(a[1]);
+        return -EMFILE;
+    }
+    p1 = rssh_start(c1, -1, a[1]);
+    p2 = rssh_start(c2, b[0], -1);
+    close(a[1]);
+    close(b[0]);
+    r = p1 < 0 || p2 < 0 ? -EIO : pump(a[0], b[1]);
+    close(a[0]);
+    close(b[1]);
+    s1 = p1 < 0 ? -1 : wait_pid(p1);
+    s2 = p2 < 0 ? -1 : wait_pid(p2);
+    return !r && (s1 != 0 || s2 != 0) ? -EIO : r;
+}
+
+/* Copies (or moves, if MOVE) the items of the link panel P into DST on the link: a
+ * directory of them with its contents, and a single item to the name DST when it is not
+ * a directory. An existing name is not replaced. 0, or -errno. */
+static long remote_copy(const struct panel *p, const char *dst, int sel, int move, int isdir)
+{
+    char q[4096 + 64], cmd[4096 + 300], target[4352], from[4352];
+    long r = 0;
+
+    for (int d = 0; d < p->n && !r; d++) {
+        const struct ent *e = &p->e[p->ord[d]];
+        const char *nm = p->nm + e->name;
+
+        if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+        if (isdir ? join(target, sizeof target, dst, nm) : str_fit(target, sizeof target, dst))
+            return -ENAMETOOLONG;
+        if (remote_exists(target) != 0) return remote_exists(target) == 1 ? -EEXIST : -EIO;
+        if (move || !isdir) {                  /* a move, or a rename: one command on the link */
+            if (join(from, sizeof from, p->path, nm)) return -ENAMETOOLONG;
+            if (rquote(q, sizeof q, from) < 0) return -ENAMETOOLONG;
+            strlcpy(cmd, move ? "mv -- " : "cp -a -- ", sizeof cmd);
+            strlcat(cmd, q, sizeof cmd);
+            if (rquote(q, sizeof q, target) < 0) return -ENAMETOOLONG;
+            strlcat(cmd, " ", sizeof cmd);
+            strlcat(cmd, q, sizeof cmd);
+            strlcat(cmd, " 2>/dev/null && echo '### 200' || echo '### 500'", sizeof cmd);
+            r = rrun(cmd, NULL, NULL) == 200 ? 0 : -EIO;
+        } else {
+            r = remote_pipe(p->path, nm, dst);
+        }
+    }
+    return r;
+}
+
+/* The bytes of one line of find -printf '%y %s' on the link, as a scan counts them. */
+static void rscan_line(void *x, const char *l)
+{
+    const char *q = l + 2;
+    uint64_t n;
+
+    (void)x;
+    if (!l[0] || l[1] != ' ') return;
+    n = (uint64_t)rnum(&q);
+    if (l[0] == 'd') {
+        if (pt_tarish) pt_total += 512;
+    } else if (pt_tarish) {
+        pt_total += 512 + ((n + 511) >> 9 << 9);
+    } else {
+        pt_total += n;
+    }
+}
+
+/* The bytes of an item of the link, which may be a directory with all in it. */
+static void remote_scan(const char *path)
+{
+    char q[4096 + 64], cmd[4096 + 200];
+
+    if (rr < 0 || rquote(q, sizeof q, path) < 0) return;
+    strlcpy(cmd, "find -H ", sizeof cmd);
+    strlcat(cmd, q, sizeof cmd);
+    strlcat(cmd, " -printf '%y %s\\n' 2>/dev/null; echo '### 200'", sizeof cmd);
+    rrun(cmd, rscan_line, NULL);
+}
+
+/* The bytes of the items of P that a job works on, found under BASE (the panel's
+ * directory, or the staging one). REMOTE scans the link, else this machine. */
+static void scan_items(const struct panel *p, const char *base, int sel, int remote)
+{
+    for (int d = 0; d < p->n; d++) {
+        const struct ent *e = &p->e[p->ord[d]];
+        char path[4352];
+
+        if (e->up || (sel ? !e->sel : d != p->cur)) continue;
+        if (join(path, sizeof path, base, p->nm + e->name)) continue;
+        if (remote) remote_scan(path);
+        else scan_path(path);
+    }
+}
+
 /* One item of the job, at the top: SRC, and DST when copying or moving. */
 static long job_item(const char *src, const char *dst)
 {
-    if (job.kind == JOB_DEL) return del_tree(src, 0);
+    if (job.kind == JOB_DEL) {
+        long r;
+
+        if (!P[act].rem) return del_tree(src, 0);
+        r = remote_rm(src);
+        return r ? item_fail("Cannot delete", src, r) : 0;
+    }
     if (job.kind == JOB_COPY) return copy_tree(src, dst);
     return move_tree(src, dst);
 }
@@ -5202,6 +6354,7 @@ static void job_run(void)
 
     job.pos = 0;
     job.skip_err = 0;
+    job_cut = 0;
     dgrp = 0;
     cf_group = CF_ASK;
     cf_zero = 0;
@@ -5219,14 +6372,21 @@ static void job_run(void)
             else r = strlcpy(dst, job_dst, sizeof dst) < sizeof dst ? 0 : -ENAMETOOLONG;
         }
         if (r) {
-            if (item_fail("Cannot copy to", job_dst, r) == -ECANCELED) break;
+            if (item_fail("Cannot copy to", job_dst, r) == -ECANCELED) {
+                job_cut = 1;
+                break;
+            }
             p->e[p->ord[at]].sel = 0;
             continue;
         }
         r = job_item(src, dst);
-        if (r == -ECANCELED) break;
+        if (r == -ECANCELED) {
+            job_cut = 1;
+            break;
+        }
         p->e[p->ord[at]].sel = 0;
     }
+    if (kbuf_eof) job_cut = 1;
     job_end();
 }
 
@@ -5334,9 +6494,67 @@ static int take_key(void)
 /* Enter in the question: the job starts. A destination that is a directory takes
  * each item under its own name; marked items need a directory to go to. An empty
  * destination does nothing. */
+/* The job on a link, with the items of P and the destination JOB_DST, which is a
+ * directory if job.dir: a download (the items are staged, and the local job copies
+ * them from there), an upload into the link, or a copy on the link. A move removes the
+ * originals once they are all copied. A failure is an error box; Esc is not. */
+static void remote_job(struct panel *p, const struct panel *d)
+{
+    int kind = job.kind, isdir = job.dir;
+    long skips0 = job_skips, r = 0;
+
+    job_begin(p->path, job_dst);
+    if (p->rem && !d->rem) {
+        pt_tarish = 1;
+        scan_items(p, p->path, job.sel, 1);
+        pg_draw(1);
+        r = remote_stage(p, job.sel);
+        if (!r) {
+            pt_tarish = 0;
+            scan_items(p, xo.root, job.sel, 0);
+            pg_draw(1);
+            strlcpy(job_base, xo.root, sizeof job_base);
+            job.kind = JOB_COPY;
+            job_run();
+            job.kind = kind;
+            if (kind == JOB_MOVE && !job_cut && job_skips == skips0)
+                for (int i = 0; i < p->n && !r; i++) {
+                    const struct ent *e = &p->e[p->ord[i]];
+                    char from[4352];
+
+                    if (e->up || (job.sel ? !e->sel : i != p->cur)) continue;
+                    if (join(from, sizeof from, p->path, p->nm + e->name)) r = -ENAMETOOLONG;
+                    else r = remote_rm(from);
+                }
+        }
+        if (xo.root[0]) del_tree(xo.root, 1);
+        xo.root[0] = 0;
+    } else if (!p->rem && d->rem) {
+        if (!isdir) {
+            r = -ENOTDIR;
+        } else {
+            pt_tarish = 1;
+            scan_items(p, p->path, job.sel, 0);
+            pg_draw(1);
+            r = local_upload(p, job_dst, job.sel, kind == JOB_MOVE);
+        }
+    } else {
+        if (kind != JOB_MOVE && isdir) {
+            pt_tarish = 1;
+            scan_items(p, p->path, job.sel, 1);
+            pg_draw(1);
+        }
+        r = remote_copy(p, job_dst, job.sel, kind == JOB_MOVE, isdir);
+    }
+    mode = MODE_NORMAL;
+    if (r && r != -ECANCELED) set_error(kind == JOB_COPY ? "Cannot copy to" : "Cannot move to", job_dst, -r);
+    panel_rescan(p);
+    if (d->rem || p->rem) panel_rescan(&P[act ^ 1]);
+}
+
 static void op_confirm(void)
 {
-    struct panel *p = &P[act];
+    struct panel *p = &P[act], *d;
     char res[4096], shown[512];
     struct statx sx;
     int isdir;
@@ -5345,9 +6563,11 @@ static void op_confirm(void)
         mode = MODE_NORMAL;
         return;
     }
-    path_of(dline.buf, p->path, res, sizeof res, shown, sizeof shown);
-    isdir = statx(AT_FDCWD, res, 0, STATX_BASIC_STATS, &sx) == 0 &&
-            (sx.stx_mode & S_IFMT) == S_IFDIR;
+    d = &P[act ^ 1];
+    path_of(dline.buf, d->rem ? d->path : p->path, res, sizeof res, shown, sizeof shown);
+    if (d->rem) isdir = remote_isdir(res) == 1;
+    else isdir = statx(AT_FDCWD, res, 0, STATX_BASIC_STATS, &sx) == 0 &&
+                 (sx.stx_mode & S_IFMT) == S_IFDIR;
     if (job.sel && !isdir) {
         mode = MODE_NORMAL;
         set_error(job.kind == JOB_COPY ? "Cannot copy to" : "Cannot move to", res, ENOTDIR);
@@ -5366,12 +6586,24 @@ static void op_confirm(void)
             return;
         }
         strlcpy(job_base, xo.root, sizeof job_base);
+        job_begin(p->path, job_dst);
+        pt_tarish = 0;
+        scan_items(p, xo.root, job.sel, 0);
+        pg_draw(1);
         job_run();
         del_tree(xo.root, 1);
         xo.root[0] = 0;
         return;
     }
+    if (p->rem || d->rem) {
+        remote_job(p, d);
+        return;
+    }
     strlcpy(job_base, p->path, sizeof job_base);
+    job_begin(p->path, job_dst);
+    pt_tarish = 0;
+    scan_items(p, p->path, job.sel, 0);
+    pg_draw(1);
     job_run();
 }
 
@@ -5440,6 +6672,625 @@ static int op_handle(int key)
     return 0;
 }
 
+/* ----------------------------------------------------------- menu bar */
+
+/* The menu bar, up on F9 or ESC 9: mbt is the title it is on, and md whether that
+ * title's dropdown is down. The Left and Right menus hold the one entry, Sort
+ * order...; File, Command and Options are empty for now. Left and Right are the
+ * panels on the screen, not the active one: F9 starts on the side of the active
+ * panel. */
+enum { MT_LEFT, MT_FILE, MT_CMD, MT_OPT, MT_RIGHT, MT_N };
+static const char *const mt_text[MT_N] = { "&Left", "&File", "&Command", "&Options", "&Right" };
+static const char *const mt_item[] = { "&Sort order...", "S&hell link..." };
+static int mbt, md;
+static int mdx, mdw, mdh;                /* the dropdown's box, from md_geom() */
+
+static int mcur;                         /* the entry the dropdown highlights */
+
+static int menu_n(int t) { return t == MT_LEFT || t == MT_RIGHT ? 2 : 0; }
+
+/* The letter of a label's hotkey (the one after the &), in lower case, which is
+ * the key that picks it; 0 if none. */
+static int hot_key(const char *s)
+{
+    for (; *s; s++)
+        if (*s == '&') return lc((unsigned char)s[1]);
+    return 0;
+}
+
+/* The cells a label takes: its text, without the &. */
+static int hot_len(const char *s)
+{
+    int n = 0;
+
+    for (; *s; s++)
+        if (*s != '&') n++;
+    return n;
+}
+
+/* A label from X: its hotkey letter in colour h, the rest in colour a. */
+static void hot_put(int x, const char *s, uint16_t a, uint16_t h)
+{
+    int hot = 0;
+
+    for (; *s; s++) {
+        if (*s == '&') { hot = 1; continue; }
+        setc(x++, (unsigned char)*s, hot ? h : a);
+        hot = 0;
+    }
+}
+
+/* Where title T starts on the bar, as mc arranges them: each takes its text with a
+ * space either side, and the gaps between the titles are as wide as fit, from 1
+ * to 3. */
+static int mt_x(int t)
+{
+    int gap = cols - 2, x = 1;
+
+    for (int i = 0; i < MT_N; i++) gap -= hot_len(mt_text[i]) + 2;
+    gap /= MT_N - 1;
+    if (gap <= 0) gap = 1;
+    if (gap > 3) gap = 3;
+    for (int i = 0; i < t; i++) x += hot_len(mt_text[i]) + 2 + gap;
+    return x;
+}
+
+/* The bar, row 0: the titles, the one the menu is on in the selected colours. */
+static void menu_bar(void)
+{
+    for (int x = 0; x < cols; x++) setc(x, ' ', C_MENU);
+    for (int t = 0; t < MT_N; t++) {
+        int x0 = mt_x(t), w = hot_len(mt_text[t]) + 2;
+        uint16_t a = t == mbt ? C_MENUSEL : C_MENU;
+
+        for (int x = x0; x < x0 + w; x++) setc(x, ' ', a);
+        hot_put(x0 + 1, mt_text[t], a, t == mbt ? C_MENUSELHOT : C_MENUHOT);
+    }
+}
+
+/* The dropdown of the title: a box under the title, its frame two cells left of
+ * the title's text, as mc puts it; moved in if it would run past the edge. */
+static void md_geom(void)
+{
+    int hot = 0;
+
+    for (int i = 0; i < menu_n(mbt); i++)
+        if (hot_len(mt_item[i]) > hot) hot = hot_len(mt_item[i]);
+    mdw = hot + 3;                       /* the frame, a space, the text */
+    mdh = menu_n(mbt) + 2;
+    mdx = mt_x(mbt) - 1;
+    if (mdx + mdw > cols) mdx = cols - mdw;
+    if (mdx < 0) mdx = 0;
+}
+
+/* One row of the dropdown, row y (the top frame is row 1). The entry is the
+ * highlighted one, as it is when the dropdown is opened. */
+static void md_row(int y)
+{
+    int dy = y - 1, r = mdx + mdw - 1;
+
+    if (dy < 0 || dy >= mdh) return;
+    if (dy == 0) {
+        setc(mdx, 'l', C_MENU | DEC);
+        for (int x = mdx + 1; x < r; x++) setc(x, 'q', C_MENU | DEC);
+        setc(r, 'k', C_MENU | DEC);
+    } else if (dy == mdh - 1) {
+        setc(mdx, 'm', C_MENU | DEC);
+        for (int x = mdx + 1; x < r; x++) setc(x, 'q', C_MENU | DEC);
+        setc(r, 'j', C_MENU | DEC);
+    } else {
+        for (int x = mdx; x <= r; x++) setc(x, ' ', C_MENU);
+        setc(mdx, 'x', C_MENU | DEC);
+        setc(r, 'x', C_MENU | DEC);
+        {
+            int sel = dy - 1 == mcur;
+
+            for (int x = mdx + 1; x < r; x++) setc(x, ' ', sel ? C_MENUSEL : C_MENU);
+            hot_put(mdx + 2, mt_item[dy - 1], sel ? C_MENUSEL : C_MENU, sel ? C_MENUSELHOT : C_MENUHOT);
+        }
+    }
+}
+
+/* The menu's entry, Sort order...: the sort of the panel on the side of the
+ * title (Left is the left panel, Right the right one). */
+static void menu_run(int item);
+static void lk_open(int pi);
+
+/* F9 or ESC 9 with no dialog open: the bar, on the side of the active panel. */
+static void menu_open(void)
+{
+    mode = MODE_MENU;
+    mbt = act == lft ? MT_LEFT : MT_RIGHT;
+    md = 0;
+    mcur = 0;
+}
+
+/* The keys a shell link does not do yet: Enter on a file there (it would be run) and
+ * a command line (it would run here, not there). They are refused, with an error box;
+ * true if the key is refused. */
+static int remote_refused(const struct panel *p, int key)
+{
+    int enter = key == '\r' || key == '\n';
+    int onfile = enter && !cmdl.len && p->n && !is_dir(&p->e[p->ord[p->cur]]);
+    int cmd = enter && cmdl.len;
+
+    if (!((onfile || cmd) && p->rem)) return 0;
+    set_error("Running on a shell link is not done yet", p->path, EINVAL);
+    return 1;
+}
+
+/* Keys on the bar. Left and Right change the title, Up and Down and Enter open
+ * the dropdown, and Enter or the entry's letter (s) choose its entry. A title's
+ * letter goes to that title and opens its dropdown. Esc takes the menu away; F9
+ * does nothing. */
+static int menu_handle(int key)
+{
+    if (key == K_ESC) {
+        mode = MODE_NORMAL;
+        return 0;
+    }
+    if (key == K_F9 || key == (K_ALT | '9')) return 0;
+    if (key == K_LEFT || key == K_RIGHT) {
+        mbt = key == K_LEFT ? (mbt + MT_N - 1) % MT_N : (mbt + 1) % MT_N;
+        mcur = 0;
+        return 0;
+    }
+    if (key == K_UP || key == K_DOWN) {         /* opens the dropdown; then moves its highlight */
+        int n = menu_n(mbt);
+
+        if (!n) return 0;
+        if (!md) md = 1;
+        else mcur = key == K_UP ? (mcur + n - 1) % n : (mcur + 1) % n;
+        return 0;
+    }
+    if (key == '\r' || key == '\n') {
+        if (!menu_n(mbt)) return 0;
+        if (!md) md = 1;
+        else menu_run(mcur);
+        return 0;
+    }
+    if (md)
+        for (int i = 0; i < menu_n(mbt); i++)
+            if (key == hot_key(mt_item[i])) {   /* an entry's letter chooses it */
+                mcur = i;
+                menu_run(i);
+                return 0;
+            }
+    for (int t = 0; t < MT_N; t++)
+        if (key == hot_key(mt_text[t])) {       /* the title's letter opens its dropdown */
+            mbt = t;
+            mcur = 0;
+            md = 1;
+            return 0;
+        }
+    return 0;
+}
+
+/* ----------------------------------------------------------- sort order */
+
+/* The Sort order dialog, from the menu's entry: it is for the panel sd_p, and OK
+ * sets its sort. Its focus is one of the widgets in Tab's order: the group of
+ * fields (sd_fr is the field with the focus, sd_sel the one chosen), the three
+ * checkboxes, OK, Cancel. */
+enum { SD_RADIO, SD_EXEC, SD_CASE, SD_REV, SD_OK, SD_CANCEL, SD_N };
+#define SD_W  45                         /* the frame, 45 by 13 */
+#define SD_H  (SD_NF + 4)                /* the choices, and the rows round them */
+#define SD_RW 15                         /* a field's highlight: the widest, with its mark */
+static const struct { const char *text; int f; } sd_field[] = {
+    { "&Unsorted", SF_UNSORTED }, { "&Name", SF_NAME },
+#if VERSION_SORT
+    { "&Version", SF_VERSION },
+#endif
+    { "E&xtension", SF_EXT }, { "&Size", SF_SIZE }, { "&Modify time", SF_MTIME },
+    { "&Access time", SF_ATIME }, { "C&hange time", SF_CTIME }, { "&Inode", SF_INODE },
+};
+#if VERSION_SORT
+#define SD_NF 9                          /* the choices of fields */
+#else
+#define SD_NF 8
+#endif
+static const char *const sd_box[3] = { "Executable &first", "Cas&e sensitive", "&Reverse" };
+static const int sd_bit[3] = { SO_EXEC, SO_FOLD, SO_REV };   /* the flag a checkbox sets */
+static int sd_p;                         /* the panel */
+static int sd_w, sd_fr, sd_sel;          /* the focus, the field with it, the chosen field */
+static int sd_flags;                     /* the SO_ flags, as they are being set */
+static int sdx, sdy;                     /* the frame's corner, from sd_geom() */
+
+/* A checkbox is on when its flag is; Case sensitive is on when SO_FOLD is off. */
+static int sd_on(int k) { return ((sd_flags & sd_bit[k]) != 0) ^ (k == 1); }
+
+static void sd_geom(void)
+{
+    sdx = (cols - SD_W) / 2;
+    sdy = (rows - SD_H) / 3;
+    if (sdx < 0) sdx = 0;
+    if (sdy < 0) sdy = 0;
+}
+
+/* Open the dialog for panel PI, with its sort as the choice. */
+static void sd_open(int pi)
+{
+    sd_p = pi;
+    sd_flags = P[pi].sort & ~SO_FIELD;
+    for (sd_sel = 0; sd_sel < SD_NF - 1 && sd_field[sd_sel].f != (P[pi].sort & SO_FIELD); sd_sel++)
+        ;
+    sd_fr = sd_sel;
+    sd_w = SD_RADIO;
+    mode = MODE_SORT;
+    md = 0;
+}
+
+/* An entry of the dropdown: Sort order... for the panel on the side of the title, or
+ * the Shell link, which is for that panel too. */
+static void menu_run(int item)
+{
+    int pi = mbt == MT_LEFT ? lft : lft ^ 1;
+
+    if (item == 0) sd_open(pi);
+    else lk_open(pi);
+}
+
+/* OK sets the panel's sort, and reads the directory in it again, the highlight
+ * staying on its file. Cancel changes nothing. */
+static void sd_apply(void)
+{
+    P[sd_p].sort = (uint8_t)(sd_field[sd_sel].f | sd_flags);
+    mode = MODE_NORMAL;
+    panel_rescan(&P[sd_p]);
+}
+
+/* One choice: its prefix and label, drawn with the focus colours if FOC; the
+ * highlight is W cells wide, or the text's width if 0. */
+static void sd_item(int x, const char *pre, const char *label, int foc, int w)
+{
+    uint16_t a = foc ? C_FIELD : C_QCD, h = foc ? C_DHOTF : C_DHOT;
+    int tw = (int)strlen(pre) + hot_len(label);
+
+    if (w < tw) w = tw;
+    for (int i = 0; i < w; i++) setc(x + i, ' ', a);
+    for (int i = 0; pre[i]; i++) setc(x + i, (unsigned char)pre[i], a);
+    hot_put(x + (int)strlen(pre), label, a, h);
+}
+
+/* Keys in the dialog. Up and Down go through the fields of the group, then leave
+ * it; Tab, Right and Down go on to the next widget, Shift+Tab, Left and Up back to
+ * the one before. Space chooses a field or toggles a checkbox, Enter is OK (Cancel
+ * if it has the focus), Esc cancels, and each letter of a label picks its choice. */
+static int sd_handle(int key)
+{
+    if (key == K_ESC) {
+        mode = MODE_NORMAL;
+        return 0;
+    }
+    if (key == '\r' || key == '\n') {
+        if (sd_w == SD_CANCEL) mode = MODE_NORMAL;
+        else sd_apply();
+        return 0;
+    }
+    if (key == K_DOWN && sd_w == SD_RADIO && sd_fr < SD_NF - 1) { sd_fr++; return 0; }
+    if (key == K_UP && sd_w == SD_RADIO && sd_fr > 0) { sd_fr--; return 0; }
+    if (key == 9 || key == K_RIGHT || key == K_DOWN) sd_w = (sd_w + 1) % SD_N;
+    else if (key == K_BTAB || key == K_LEFT || key == K_UP) sd_w = (sd_w + SD_N - 1) % SD_N;
+    else if (key == ' ') {
+        if (sd_w == SD_RADIO) sd_sel = sd_fr;
+        else if (sd_w == SD_OK) sd_apply();
+        else if (sd_w == SD_CANCEL) mode = MODE_NORMAL;
+        else sd_flags ^= sd_bit[sd_w - SD_EXEC];
+    } else {
+        for (int i = 0; i < SD_NF; i++)
+            if (key == hot_key(sd_field[i].text)) {
+                sd_w = SD_RADIO;
+                sd_fr = sd_sel = i;
+                return 0;
+            }
+        for (int k = 0; k < 3; k++)
+            if (key == hot_key(sd_box[k])) {
+                sd_w = SD_EXEC + k;
+                sd_flags ^= sd_bit[k];
+                return 0;
+            }
+        if (key == hot_key("[< &OK >]")) sd_apply();
+        else if (key == hot_key("[ &Cancel ]")) mode = MODE_NORMAL;
+    }
+    return 0;
+}
+
+/* One row of the dialog, row y: its frame and margin, and the choices. */
+static void sd_row(int y)
+{
+    int dy = y - sdy, r = sdx + SD_W - 1, x;
+
+    if (y < sdy - DIALOG_PAD || y >= sdy + SD_H + DIALOG_PAD) return;
+    for (x = sdx - DIALOG_PAD; x <= r + DIALOG_PAD; x++) setc(x, ' ', C_QCD);
+    if (dy < 0 || dy >= SD_H) return;
+    if (dy == 0) {
+        setc(sdx, 'l', C_QCD | DEC);
+        for (x = sdx + 1; x < r; x++) setc(x, 'q', C_QCD | DEC);
+        setc(r, 'k', C_QCD | DEC);
+        sets(sdx + 1 + (SD_W - 2 - 12) / 2, " Sort order ", 12, C_QTITLE);
+    } else if (dy == SD_H - 1) {
+        setc(sdx, 'm', C_QCD | DEC);
+        for (x = sdx + 1; x < r; x++) setc(x, 'q', C_QCD | DEC);
+        setc(r, 'j', C_QCD | DEC);
+    } else if (dy == SD_NF + 1) {
+        setc(sdx, 't', C_QCD | DEC);
+        for (x = sdx + 1; x < r; x++) setc(x, 'q', C_QCD | DEC);
+        setc(r, 'u', C_QCD | DEC);
+    } else {
+        setc(sdx, 'x', C_QCD | DEC);
+        setc(r, 'x', C_QCD | DEC);
+        if (dy >= 1 && dy <= SD_NF)
+            sd_item(sdx + 2, sd_sel == dy - 1 ? "(*) " : "( ) ", sd_field[dy - 1].text,
+                    sd_w == SD_RADIO && sd_fr == dy - 1, SD_RW);
+        if (dy >= 1 && dy <= 3)
+            sd_item(sdx + 23, sd_on(dy - 1) ? "[x] " : "[ ] ", sd_box[dy - 1],
+                    sd_w == SD_EXEC + dy - 1, 0);
+        if (dy == SD_NF + 2) {
+            sd_item(sdx + 13, "", "[< &OK >]", sd_w == SD_OK, 0);
+            sd_item(sdx + 22, "", "[ &Cancel ]", sd_w == SD_CANCEL, 0);
+        }
+    }
+}
+
+/* ----------------------------------------------------------- shell link */
+
+/* The Shell link dialog, from the menu's entry: its input is user@host/dir, and OK
+ * opens that link in panel LK_P (the link's own sh:// is put in front). Tab takes the
+ * focus between the input and the buttons, Esc cancels. */
+#define LK_W  48                         /* the frame, 48 by 6 */
+#define LK_H  6
+#define LK_FW 41                         /* the input's width, the [^] after it */
+static struct line lline;
+static int lk_p, lk_f;                   /* the panel, the focus: the input, OK, Cancel */
+static int lkx, lky;                     /* the frame's corner, from lk_geom() */
+
+static void lk_geom(void)
+{
+    lkx = (cols - LK_W) / 2;
+    lky = (rows - LK_H) / 2 - 2;
+    if (lkx < 0) lkx = 0;
+    if (lky < 0) lky = 0;
+}
+
+static void lk_open(int pi)
+{
+    lk_p = pi;
+    lk_f = 0;
+    line_clear(&lline);
+    mode = MODE_LINK;
+    md = 0;
+}
+
+static void lk_apply(void)
+{
+    char url[320];
+
+    mode = MODE_NORMAL;
+    if (!lline.len) return;
+    strlcpy(url, "sh://", sizeof url);
+    strlcat(url, lline.buf, sizeof url);
+    change_to(&P[lk_p], url, url);
+}
+
+static void lk_handle(int key)
+{
+    if (key == K_ESC) {
+        mode = MODE_NORMAL;
+        return;
+    }
+    if (key == 9 || key == K_BTAB) {
+        lk_f = key == 9 ? (lk_f + 1) % 3 : (lk_f + 2) % 3;
+        return;
+    }
+    if (key == '\r' || key == '\n') {
+        if (lk_f == 2) mode = MODE_NORMAL;
+        else lk_apply();
+        return;
+    }
+    if (lk_f == 0) line_key(&lline, key, LK_FW, 3);
+}
+
+static void lk_row(int y)
+{
+    int fl = lkx, fr = lkx + LK_W - 1, x, dy = y - lky;
+
+    if (y < lky - DIALOG_PAD || y >= lky + LK_H + DIALOG_PAD) return;
+    for (x = fl - DIALOG_PAD; x <= fr + DIALOG_PAD; x++) setc(x, ' ', C_QCD);
+    if (dy < 0 || dy >= LK_H) return;
+    if (dy == 0) {
+        setc(fl, 'l', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'k', C_QCD | DEC);
+        sets(fl + 1 + (LK_W - 2 - 23) / 2, " Shell link to machine ", 23, C_QTITLE);
+    } else if (dy == 5) {
+        setc(fl, 'm', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'j', C_QCD | DEC);
+    } else if (dy == 3) {
+        setc(fl, 't', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'u', C_QCD | DEC);
+    } else {
+        setc(fl, 'x', C_QCD | DEC);
+        setc(fr, 'x', C_QCD | DEC);
+        if (dy == 1) sets(fl + 2, "Enter machine name (F1 for details):", 36, C_QCD);
+        if (dy == 2) {
+            line_view(&lline, LK_FW + 3, 3);
+            line_draw(&lline, fl + 2, LK_FW, C_FIELD);
+            sets(fl + 2 + LK_FW, "[^]", 3, C_HIST);
+        }
+        if (dy == 4) {
+            sd_item(fl + 14, "", "[< &OK >]", lk_f == 1, 0);
+            sd_item(fl + 23, "", "[ &Cancel ]", lk_f == 2, 0);
+        }
+    }
+}
+
+/* ----------------------------------------------------------- group selection */
+
+/* + and - ask for a shell pattern, and select or unselect every entry that matches it,
+ * directories too, but not "..": mc's defaults, case sensitive. * inverts the marks of
+ * the files, leaving the directories as they are. The dialog offers the last pattern. */
+static int glob_match(const char *p, const char *s);
+
+/* One bracket expression of a pattern, [..] at *P (after its [), matching C: 1 if it
+ * does, 0 if not; *P moves past it. A "!" or "^" first negates it. */
+static int glob_bracket(const char **p, int c)
+{
+    int neg = **p == '!' || **p == '^', hit = 0;
+
+    if (neg) (*p)++;
+    for (int first = 1; **p && (**p != ']' || first); first = 0) {
+        int lo = (unsigned char)*(*p)++, hi = lo;
+
+        if (**p == '-' && (*p)[1] && (*p)[1] != ']') {
+            (*p)++;
+            hi = (unsigned char)*(*p)++;
+        }
+        if (c >= lo && c <= hi) hit = 1;
+    }
+    if (**p == ']') (*p)++;
+    return hit != neg;
+}
+
+/* Whether the name S matches the shell pattern P: * any run, ? any one character,
+ * [..] one of a set, and anything else as itself. */
+static int glob_match(const char *p, const char *s)
+{
+    for (;;) {
+        if (*p == 0) return *s == 0;
+        if (*p == '*') {
+            while (p[1] == '*') p++;
+            for (;;) {
+                if (glob_match(p + 1, s)) return 1;
+                if (!*s) return 0;
+                s++;
+            }
+        }
+        if (*s == 0) return 0;
+        if (*p == '?') {
+            p++;
+            s++;
+            continue;
+        }
+        if (*p == '[') {
+            const char *q = p + 1;
+
+            if (*q == 0) return 0;
+            if (!glob_bracket(&q, (unsigned char)*s)) return 0;
+            p = q;
+            s++;
+            continue;
+        }
+        if (*p != *s) return 0;
+        p++;
+        s++;
+    }
+}
+
+#define GR_W  48                         /* the frame, 48 by 5: input, buttons */
+#define GR_H  5
+#define GR_FW 40                         /* the input's width */
+static struct line gline;
+static int  gfresh;                      /* the offered pattern is still whole: a key replaces it */
+static char gpat[64];                    /* the last pattern: offered again; none at first */
+static int  gsel;                        /* 1 to select, 0 to unselect */
+static int  grx, gry;                    /* the frame's corner */
+
+static void gr_geom(void)
+{
+    grx = (cols - GR_W) / 2;
+    gry = (rows - GR_H) / 2 - 2;
+    if (grx < 0) grx = 0;
+    if (gry < 0) gry = 0;
+}
+
+/* The dialog, for the active panel: + selects, - unselects. */
+static void gr_open(int sel)
+{
+    gsel = sel;
+    line_clear(&gline);
+    for (const char *c = gpat; *c; c++) line_key(&gline, (unsigned char)*c, GR_FW, 0);
+    gfresh = 1;
+    mode = MODE_GROUP;
+}
+
+/* Marks the entries of P whose names match the pattern: "..", never. */
+static void gr_apply(struct panel *p)
+{
+    for (int i = 0; i < p->ne; i++) {
+        struct ent *e = &p->e[i];
+
+        if (!e->up && glob_match(gpat, p->nm + e->name)) e->sel = (uint8_t)gsel;
+    }
+}
+
+/* * inverts the marks of the files of P: not the directories, not "..". */
+static void gr_invert(struct panel *p)
+{
+    for (int i = 0; i < p->ne; i++) {
+        struct ent *e = &p->e[i];
+
+        if (e->up || (e->cls == CL_DIR && !e->link)) continue;
+        e->sel ^= 1;
+    }
+}
+
+static void gr_handle(int key)
+{
+    if (key == K_ESC) {
+        mode = MODE_NORMAL;
+        return;
+    }
+    if (key == '\r' || key == '\n') {
+        mode = MODE_NORMAL;
+        if (!gline.len) return;
+        strlcpy(gpat, gline.buf, sizeof gpat);
+        gr_apply(&P[act]);
+        return;
+    }
+    if (gfresh && key >= 0x20 && key < 0x7f) line_clear(&gline);
+    gfresh = 0;
+    line_key(&gline, key, GR_FW, 0);
+}
+
+static void gr_row(int y)
+{
+    int fl = grx, fr = grx + GR_W - 1, x, dy = y - gry;
+
+    if (y < gry - DIALOG_PAD || y >= gry + GR_H + DIALOG_PAD) return;
+    for (x = fl - DIALOG_PAD; x <= fr + DIALOG_PAD; x++) setc(x, ' ', C_QCD);
+    if (dy < 0 || dy >= GR_H) return;
+    if (dy == 0) {
+        const char *t = gsel ? " Select " : " Unselect ";
+        int tl = (int)strlen(t);
+
+        setc(fl, 'l', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'k', C_QCD | DEC);
+        sets(fl + 1 + (GR_W - 2 - tl) / 2, t, tl, C_QTITLE);
+    } else if (dy == GR_H - 1) {
+        setc(fl, 'm', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'j', C_QCD | DEC);
+    } else if (dy == 2) {
+        setc(fl, 't', C_QCD | DEC);
+        for (x = fl + 1; x < fr; x++) setc(x, 'q', C_QCD | DEC);
+        setc(fr, 'u', C_QCD | DEC);
+    } else {
+        setc(fl, 'x', C_QCD | DEC);
+        setc(fr, 'x', C_QCD | DEC);
+        if (dy == 1) {
+            line_view(&gline, GR_FW, 0);
+            line_draw(&gline, fl + 2, GR_FW, C_FIELD);
+        }
+        if (dy == 3) {
+            sd_item(fl + 14, "", "[< &OK >]", 1, 0);
+            sd_item(fl + 23, "", "[ &Cancel ]", 0, 0);
+        }
+    }
+}
+
 static void draw(void)
 {
     int lw = cols / 2, ax = act == lft ? 0 : lw, aw = act == lft ? lw : cols - lw;
@@ -5449,10 +7300,16 @@ static void draw(void)
         flush();
         return;
     }
+    if (mode != rlast) rfull = 1;     /* a change of mode is a change of the whole screen */
+    rlast = mode;
 
     if (mode == MODE_ERR) err_geom(&ex, &ey);
     if (mode == MODE_QUERY) qy_geom();
     if (mode == MODE_OP || mode == MODE_PROG || mode == MODE_CONFLICT) op_geom();
+    if (mode == MODE_SORT) sd_geom();
+    if (mode == MODE_LINK) lk_geom();
+    if (mode == MODE_GROUP) gr_geom();
+    if (mode == MODE_MENU && md && menu_n(mbt)) md_geom();
     for (int y = 0; y < rows; y++) {
         for (int x = 0; x < cols; x++) {
             row[x].c = ' ';
@@ -5461,9 +7318,17 @@ static void draw(void)
         if (y == rows - 1) {
             prompt_row();
         } else if (!hidden) {
-            panel_row(&P[lft], y, 0, lw, act == lft);
-            panel_row(&P[lft ^ 1], y, lw, cols - lw, act == (lft ^ 1));
+            /* with the menu up, the active panel has no highlight, as mc has it */
+            panel_row(&P[lft], y, 0, lw, act == lft && mode != MODE_MENU);
+            panel_row(&P[lft ^ 1], y, lw, cols - lw, act == (lft ^ 1) && mode != MODE_MENU);
         }
+        if (mode == MODE_MENU) {
+            if (y == 0) menu_bar();
+            if (md && menu_n(mbt)) md_row(y);
+        }
+        if (mode == MODE_SORT) sd_row(y);
+        if (mode == MODE_LINK) lk_row(y);
+        if (mode == MODE_GROUP) gr_row(y);
         if (mode == MODE_QCD) qcd_draw_row(y, ax, aw);
         if (mode == MODE_ERR) err_draw_row(y, ex, ey);
         if (mode == MODE_QUERY) qy_draw_row(y);
@@ -5488,8 +7353,27 @@ static void draw(void)
             if (y >= ey + 1 && y <= ey + ERR_H) shade(ex + ewidth, ex + ewidth + 1);
             if (y == ey + ERR_H) shade(ex + 2, ex + ewidth + 1);
         }
-        emit_row(y, cols);
+        if (mode == MODE_SORT) {
+            if (y >= sdy - DIALOG_PAD + 1 && y <= sdy + SD_H + DIALOG_PAD)
+                shade(sdx + SD_W + DIALOG_PAD, sdx + SD_W + DIALOG_PAD + 1);
+            if (y == sdy + SD_H + DIALOG_PAD) shade(sdx - DIALOG_PAD + 2, sdx + SD_W + DIALOG_PAD + 1);
+        }
+        if (mode == MODE_LINK) {
+            if (y >= lky - DIALOG_PAD + 1 && y <= lky + LK_H + DIALOG_PAD)
+                shade(lkx + LK_W + DIALOG_PAD, lkx + LK_W + DIALOG_PAD + 1);
+            if (y == lky + LK_H + DIALOG_PAD) shade(lkx - DIALOG_PAD + 2, lkx + LK_W + DIALOG_PAD + 1);
+        }
+        if (mode == MODE_MENU && md && menu_n(mbt)) {
+            if (y >= 2 && y <= mdh + 1) shade(mdx + mdw, mdx + mdw + 1);
+            if (y == mdh + 1) shade(mdx + 2, mdx + mdw + 1);
+        }
+        /* While a progress box is up, and nothing else has changed, only its columns are
+         * written: its place and size are fixed for the whole job. Any other draw, or
+         * the first after a change of mode, writes every row. */
+        if (rfull || mode != MODE_PROG) emit_row(y, 0, cols);
+        else if (y >= opy && y <= opy + oph) emit_row(y, opx, opx + opw + 2 < cols ? opx + opw + 2 : cols);
     }
+    rfull = 0;
 
     /* cursor: in the quick cd field, otherwise on the command line */
     if (mode == MODE_QCD) {
@@ -5515,6 +7399,20 @@ static void draw(void)
 /* ----------------------------------------------------------- start-up */
 
 
+/* The directory to start in: getcwd() gives it with symbolic links resolved, but
+ * the shell's PWD keeps the link the user came by. PWD is taken when it is an
+ * absolute path to the same directory; otherwise the getcwd() path stays. */
+static void start_dir(char *cwd, size_t max)
+{
+    const char *pwd = genv("PWD");
+    struct statx a, b;
+
+    if (!pwd || pwd[0] != '/' || strlen(pwd) >= max) return;
+    if (statx(AT_FDCWD, pwd, 0, STATX_BASIC_STATS, &a) != 0) return;
+    if (statx(AT_FDCWD, ".", 0, STATX_BASIC_STATS, &b) != 0) return;
+    if (same_file(&a, &b)) strlcpy(cwd, pwd, max);
+}
+
 static void init(void)
 {
     struct winsz ws;
@@ -5530,6 +7428,8 @@ static void init(void)
 
     if (getcwd(P[0].path, sizeof P[0].path) < 0)
         strlcpy(P[0].path, "/", sizeof P[0].path);
+    else
+        start_dir(P[0].path, sizeof P[0].path);
     strlcpy(P[1].path, P[0].path, sizeof P[1].path);
 
     strlcpy(host, "localhost", sizeof host);
@@ -5698,6 +7598,16 @@ static int handle_key(int key)
         mode = MODE_NORMAL;
         return 0;
     }
+    if (mode == MODE_MENU) return menu_handle(key);
+    if (mode == MODE_SORT) return sd_handle(key);
+    if (mode == MODE_LINK) {
+        lk_handle(key);
+        return 0;
+    }
+    if (mode == MODE_GROUP) {
+        gr_handle(key);
+        return 0;
+    }
     if (mode == MODE_QCD) {
         qcd_handle(key);
         return 0;
@@ -5706,6 +7616,10 @@ static int handle_key(int key)
     if (mode == MODE_OP) return op_handle(key);
     if (mode == MODE_QUERY) return qy_handle(key);
     if (mode == MODE_QSEARCH) return qs_handle(key);
+    if (key == K_F9 || key == (K_ALT | '9')) {
+        menu_open();
+        return 0;
+    }
     if (key == (K_ALT | '0') || key == K_F10) return 1;
     if (key == (K_ALT | '3') || key == K_F3) {
         view_item(p);
@@ -5726,6 +7640,7 @@ static int handle_key(int key)
         put_name(p);
         return 0;
     }
+    if (remote_refused(p, key)) return 0;
     if (key == '\r' || key == '\n') {
         if (cmdl.len) run_command();
         else enter_item(p);
@@ -5739,6 +7654,8 @@ static int handle_key(int key)
     else if (key == K_F6 || key == (K_ALT | '6')) op_open(OP_MOVE);
     else if (key == 21) lft ^= 1;                  /* Ctrl+U */
     else if (key == K_INS || key == K_SUP || key == K_SDOWN) sel_key(p, key);
+    else if (cmdl.len == 0 && (key == '+' || key == '-')) gr_open(key == '+');
+    else if (cmdl.len == 0 && key == '*') gr_invert(p);
     else if (key == K_UP || key == K_DOWN || key == K_PGUP || key == K_PGDN ||
              key == K_HOME || key == K_END)
         nav_key(p, key);
