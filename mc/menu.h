@@ -1,19 +1,24 @@
 /* ----------------------------------------------------------- menu bar */
 
 /* The menu bar, up on F9 or ESC 9: mbt is the title it is on, and md whether that
- * title's dropdown is down. The Left and Right menus hold the one entry, Sort
- * order...; File, Command and Options are empty for now. Left and Right are the
- * panels on the screen, not the active one: F9 starts on the side of the active
- * panel. */
+ * title's dropdown is down. The Left and Right menus hold Sort order... and Shell
+ * link...; Command holds Compare directories...; File and Options are empty for
+ * now. Left and Right are the panels on the screen, not the active one: F9 starts
+ * on the side of the active panel. */
 enum { MT_LEFT, MT_FILE, MT_CMD, MT_OPT, MT_RIGHT, MT_N };
 static const char *const mt_text[MT_N] = { "&Left", "&File", "&Command", "&Options", "&Right" };
-static const char *const mt_item[] = { "&Sort order...", "S&hell link..." };
+/* The entries of each title's dropdown: menu_n() of them, the rest unused. */
+static const char *const mt_item[MT_N][2] = {
+    { "&Sort order...", "S&hell link..." }, { NULL },
+    { "&Compare directories" }, { NULL },
+    { "&Sort order...", "S&hell link..." },
+};
 static int mbt, md;
 static int mdx, mdw, mdh;                /* the dropdown's box, from md_geom() */
 
 static int mcur;                         /* the entry the dropdown highlights */
 
-static int menu_n(int t) { return t == MT_LEFT || t == MT_RIGHT ? 2 : 0; }
+static int menu_n(int t) { return t == MT_LEFT || t == MT_RIGHT ? 2 : t == MT_CMD ? 1 : 0; }
 
 /* The letter of a label's hotkey (the one after the &), in lower case, which is
  * the key that picks it; 0 if none. */
@@ -81,7 +86,7 @@ static void md_geom(void)
     int hot = 0;
 
     for (int i = 0; i < menu_n(mbt); i++)
-        if (hot_len(mt_item[i]) > hot) hot = hot_len(mt_item[i]);
+        if (hot_len(mt_item[mbt][i]) > hot) hot = hot_len(mt_item[mbt][i]);
     mdw = hot + 3;                       /* the frame, a space, the text */
     mdh = menu_n(mbt) + 2;
     mdx = mt_x(mbt) - 1;
@@ -112,7 +117,8 @@ static void md_row(int y)
             int sel = dy - 1 == mcur;
 
             for (int x = mdx + 1; x < r; x++) setc(x, ' ', sel ? C_MENUSEL : C_MENU);
-            hot_put(mdx + 2, mt_item[dy - 1], sel ? C_MENUSEL : C_MENU, sel ? C_MENUSELHOT : C_MENUHOT);
+            hot_put(mdx + 2, mt_item[mbt][dy - 1], sel ? C_MENUSEL : C_MENU,
+                    sel ? C_MENUSELHOT : C_MENUHOT);
         }
     }
 }
@@ -121,6 +127,7 @@ static void md_row(int y)
  * title (Left is the left panel, Right the right one). */
 static void menu_run(int item);
 static void lk_open(int pi);
+static void cmp_open(void);
 
 /* F9 or ESC 9 with no dialog open: the bar, on the side of the active panel. */
 static void menu_open(void)
@@ -163,7 +170,7 @@ static int menu_handle(int key)
     }
     if (md)
         for (int i = 0; i < menu_n(mbt); i++)
-            if (key == hot_key(mt_item[i])) {   /* an entry's letter chooses it */
+            if (key == hot_key(mt_item[mbt][i])) {  /* an entry's letter chooses it */
                 mcur = i;
                 menu_run(i);
                 return 0;
@@ -233,12 +240,13 @@ static void sd_open(int pi)
 }
 
 /* An entry of the dropdown: Sort order... for the panel on the side of the title, or
- * the Shell link, which is for that panel too. */
+ * the Shell link, which is for that panel too. Compare directories is for both. */
 static void menu_run(int item)
 {
     int pi = mbt == MT_LEFT ? lft : lft ^ 1;
 
-    if (item == 0) sd_open(pi);
+    if (mbt == MT_CMD) cmp_open();
+    else if (item == 0) sd_open(pi);
     else lk_open(pi);
 }
 

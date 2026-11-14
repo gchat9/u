@@ -67,7 +67,12 @@
  *                      VERSION_SORT in config.h is 1), reversed or not,
  *                      case sensitive or not, with executables after directories
  *                      or not; the directory is read again, the highlight staying
- *                      on its file. File, Command and Options are empty for now.
+ *                      on its file. Command has Compare directories (or its letter,
+ *                      c): a question asks for the method, Quick (size and date),
+ *                      Size only, or Thorough (the bytes too, for directories on
+ *                      this machine), and then the marks of both panels are set to
+ *                      the files that differ from the other panel's, see compare.h.
+ *                      File and Options are empty for now.
  *                      The Left and Right dropdowns also have Shell link... (h),
  *                      which opens a directory on another machine, sh://user@host/dir,
  *                      over ssh; "cd sh://user@host/dir" does the same on the command
@@ -137,6 +142,7 @@
  *   fileop_ui.h  the boxes of a job: Delete, Copy, Move, Overwrite, progress
  *   menu.h       the menu bar, Sort order, Shell link
  *   select.h     + - * on the marks
+ *   compare.h    Compare directories: the marks of both panels, by method
  *   draw.h       the panels, and the whole frame
  */
 
@@ -170,6 +176,7 @@
 #include "fileop_ui.h"
 #include "menu.h"
 #include "select.h"
+#include "compare.h"
 #include "draw.h"
 
 /* ----------------------------------------------------------- start-up */

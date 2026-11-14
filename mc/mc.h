@@ -121,8 +121,10 @@ static int  rw = -1, rr = -1;           /* ssh's input and output */
 static char rb[1024];                   /* read from ssh, not yet taken */
 static int  rn, rpos;
 
-/* Called before they are defined: the main loop's key handler, the screen redraw
- * and the check of the terminal's size. */
+/* Called before they are defined: the main loop's key handler, the screen redraw,
+ * the check of the terminal's size, and the comparison that the question of
+ * Compare directories starts. */
 static int handle_key(int key);
 static void draw(void);
 static void check_size(void);
+static void cmp_run(int how);

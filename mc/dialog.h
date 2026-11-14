@@ -1,5 +1,6 @@
 /* dialog.h - the boxes that are drawn over the panels: the error box, the quick
- * cd box, and the question of a job (Yes/No, a failure, a directory). */
+ * cd box, and the question box (Yes/No of a job, a failure, a directory, and the
+ * method of Compare directories). */
 
 /* ------------------------------------------------------------ error box */
 
@@ -106,13 +107,15 @@ static void qcd_draw_row(int y, int x0, int pw)
  * screen with a title, two lines of text and buttons, one of them selected.  The
  * question is Yes or No; a failure is Skip, Skip all, Retry or Abort.  Only
  * files are deleted: F8 on a directory does nothing. */
-enum { QY_ASK, QY_ERR, QY_DIR };
+enum { QY_ASK, QY_ERR, QY_DIR, QY_CMP };
 struct qy_button { const char *label; int hot; };   /* hot: the index of the hotkey in the label */
 static const struct qy_button qy_yesno[2] = { { "[ Yes ]", 2 }, { "[ No ]", 2 } };
 static const struct qy_button qy_recurse[5] = { { "[ Yes ]", 2 }, { "[ No ]", 2 }, { "[ All ]", 3 },
                                                  { "[ None ]", 5 }, { "[ Abort ]", 2 } };
 static const struct qy_button qy_failed[4] = { { "[ Skip ]", 2 }, { "[ Skip all ]", 5 },
                                                { "[ Retry ]", 2 }, { "[ Abort ]", 2 } };
+static const struct qy_button qy_compare[4] = { { "[ Quick ]", 2 }, { "[ Size only ]", 2 },
+                                                 { "[ Thorough ]", 2 }, { "[ Cancel ]", 2 } };
 static int  qy_kind;
 static char qy_t1[320], qy_t2[320];     /* the two lines of text */
 static int  qy_n1, qy_n2;
@@ -122,7 +125,8 @@ static int  qrx, qry, qrw, qrh;         /* the box, with its margin of one cell 
 static const struct qy_button *qy_buttons(int *n)
 {
     *n = qy_kind == QY_ASK ? 2 : qy_kind == QY_DIR ? 5 : 4;
-    return qy_kind == QY_ASK ? qy_yesno : qy_kind == QY_DIR ? qy_recurse : qy_failed;
+    return qy_kind == QY_ASK ? qy_yesno : qy_kind == QY_DIR ? qy_recurse
+         : qy_kind == QY_CMP ? qy_compare : qy_failed;
 }
 
 /* The box, and where it goes.  Its width is that of the widest of the title, the
@@ -137,11 +141,13 @@ static void qy_geom(void)
 
     for (int i = 0; i < nb; i++) win += (int)strlen(b[i].label) + 2;
     m = win;
-    if (6 > m) m = 6;                   /* the title: "Delete", 5 for "Error" */
+    if (6 > m) m = 6;                   /* the title: "Delete", 5 for "Error"; the compare
+                                         * title is narrower than its buttons */
     if (t1 > m) m = t1;
     if (t2 > m) m = t2;
     qrw = m + 4 + 2 * DIALOG_PAD;
-    qrh = 6 + 2 * DIALOG_PAD;          /* two lines of text, and the frame, with the margin */
+    /* two lines of text, and the frame, with the margin; the method has one line */
+    qrh = (qy_kind == QY_CMP ? 5 : 6) + 2 * DIALOG_PAD;
     qrx = (cols - qrw + 1) / 2;
     qry = qy_kind != QY_ERR ? (rows - 6) / 3 : (rows - 4) / 2;
     if (qrx < 0) qrx = 0;
@@ -157,26 +163,30 @@ static void qy_label(int x, const char *label, int hot, uint16_t base, uint16_t 
 
 static void qy_draw_row(int y)
 {
-    int fx = qrx + DIALOG_PAD, fw = qrw - 2 * DIALOG_PAD, fh = 6, in = fw - 2;
+    int fx = qrx + DIALOG_PAD, fw = qrw - 2 * DIALOG_PAD, fh = qrh - 2 * DIALOG_PAD, in = fw - 2;
+    int sep = qy_kind == QY_CMP ? 2 : 3, bot = fh - 1;   /* the rule under the text, the bottom */
     int dy = y - (qry + DIALOG_PAD), x, nb;
     const struct qy_button *b;
+    int cmp = qy_kind == QY_CMP;     /* the method is in the dialog colours, as mc's */
+    uint16_t bg = cmp ? C_QCD : C_ERR, hd = cmp ? C_QTITLE : C_ERRHEAD;
 
     if (y < qry || y >= qry + qrh) return;
-    for (x = qrx; x < qrx + qrw; x++) setc(x, ' ', C_ERR);
+    for (x = qrx; x < qrx + qrw; x++) setc(x, ' ', bg);
     if (dy < 0 || dy >= fh) return;
-    setc(fx, dy == 0 ? 'l' : dy == 5 ? 'm' : dy == 3 ? 't' : 'x', C_ERR | DEC);
-    setc(fx + fw - 1, dy == 0 ? 'k' : dy == 5 ? 'j' : dy == 3 ? 'u' : 'x', C_ERR | DEC);
-    if (dy == 0 || dy == 3 || dy == 5)
-        for (x = fx + 1; x < fx + fw - 1; x++) setc(x, 'q', C_ERR | DEC);
+    setc(fx, dy == 0 ? 'l' : dy == bot ? 'm' : dy == sep ? 't' : 'x', bg | DEC);
+    setc(fx + fw - 1, dy == 0 ? 'k' : dy == bot ? 'j' : dy == sep ? 'u' : 'x', bg | DEC);
+    if (dy == 0 || dy == sep || dy == bot)
+        for (x = fx + 1; x < fx + fw - 1; x++) setc(x, 'q', bg | DEC);
     if (dy == 0) {
-        const char *title = qy_kind != QY_ERR ? " Delete " : " Error ";
+        const char *title = qy_kind == QY_ERR ? " Error "
+                          : qy_kind == QY_CMP ? " Compare directories " : " Delete ";
         int tl = (int)strlen(title);
 
-        sets(fx + 1 + (in - tl) / 2, title, tl, C_ERRHEAD);
+        sets(fx + 1 + (in - tl) / 2, title, tl, hd);
     }
-    if (dy == 1) sets(fx + 1 + (in - tcols(qy_t1, qy_n1)) / 2, qy_t1, qy_n1, C_ERR);
-    if (dy == 2) sets(fx + 1 + (in - tcols(qy_t2, qy_n2)) / 2, qy_t2, qy_n2, C_ERR);
-    if (dy == 4) {
+    if (dy == 1) sets(fx + 1 + (in - tcols(qy_t1, qy_n1)) / 2, qy_t1, qy_n1, bg);
+    if (dy == 2) sets(fx + 1 + (in - tcols(qy_t2, qy_n2)) / 2, qy_t2, qy_n2, bg);
+    if (dy == sep + 1) {
         int block = 0, at;
 
         b = qy_buttons(&nb);
@@ -184,8 +194,8 @@ static void qy_draw_row(int y)
         at = fx + 1 + (in - block) / 2;
         for (int i = 0; i < nb; i++) {
             int sel = qy_sel == i;
-            uint16_t base = sel ? C_TITLE : C_ERR;
-            uint16_t key = sel ? ATTR(BROWN, WHITE, 1) : C_ERRHEAD;
+            uint16_t base = cmp ? (sel ? C_FIELD : C_QCD) : sel ? C_TITLE : C_ERR;
+            uint16_t key = cmp ? (sel ? C_DHOTF : C_DHOT) : sel ? ATTR(BROWN, WHITE, 1) : C_ERRHEAD;
 
             qy_label(at, b[i].label, b[i].hot, base, key);
             at += (int)strlen(b[i].label) + 2;

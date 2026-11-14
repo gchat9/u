@@ -71,6 +71,11 @@ static void qy_choose(int b)
         }
         return;
     }
+    if (qy_kind == QY_CMP) {                /* the first three buttons are the methods */
+        mode = MODE_NORMAL;
+        if (b < 3) cmp_run(b);
+        return;
+    }
     qy_ans = b;
     mode = MODE_NORMAL;
 }
