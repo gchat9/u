@@ -157,6 +157,11 @@ typedef struct {
     /* Set when child asks for cursor-position report (CSI 6 n) */
     bool     cpr_requested;
 
+    /* Set by a BEL (0x07) in the ground state: the program rang the bell.
+     * The caller rings its own bell, or asks for attention, and clears it.
+     * A BEL that ends an OSC or DCS string is not a bell, and does not set it. */
+    bool     bell;
+
     /* The last graphic character printed, repeated by REP (CSI Ps b);
      * 0 until something has been printed. */
     uint32_t last_graphic;

@@ -3,6 +3,7 @@
  * vt_test.py (built with ASan/UBSan).  Usage:
  *   vt_fuzz repro            the screen shrink that left the saved cursor out of range
  *   vt_fuzz dec              DEC special graphics (ESC ( 0) and its reset (ESC ( B, RIS)
+ *   vt_fuzz bell             BEL sets VTParser.bell, except where it ends an OSC or DCS
  *   vt_fuzz SEED ITERATIONS  random escape-heavy traffic, split at random points,
  *                            with resizes; exit status 0 if nothing went wrong
  */
@@ -85,10 +86,29 @@ static int dec(void) {
     return 0;
 }
 
+/* A BEL in the ground state is a bell (VTParser.bell, cleared by the caller
+ * after each feed here); a BEL that ends an OSC (BEL or ST) or a DCS string is
+ * not. */
+static int bell(void) {
+    static const char *const in[] = { "x\a", "\x1b]0;t\a", "\x1b]0;t\x1b\\", "\x1bPq\a" };
+    VTParser *p = calloc(1, sizeof *p);
+    vt_init(p, 4, 20);
+    printf("bell:");
+    for (unsigned i = 0; i < sizeof in / sizeof *in; i++) {
+        vt_feed(p, (const uint8_t *)in[i], strlen(in[i]));
+        printf(" %d", (int)p->bell);
+        p->bell = false;
+    }
+    printf("\n");
+    vt_free(p); free(p);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "repro")) return repro();
     if (argc == 2 && !strcmp(argv[1], "dec")) return dec();
+    if (argc == 2 && !strcmp(argv[1], "bell")) return bell();
     if (argc == 3) return fuzz((unsigned)atoi(argv[1]), atol(argv[2]));
-    fprintf(stderr, "usage: vt_fuzz repro | dec | vt_fuzz SEED ITERATIONS\n");
+    fprintf(stderr, "usage: vt_fuzz repro | dec | bell | vt_fuzz SEED ITERATIONS\n");
     return 2;
 }

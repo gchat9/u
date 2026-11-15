@@ -573,7 +573,8 @@ static void handle_c0(VTParser *p, uint8_t c)
 {
     Screen *s = &p->scr;
     switch (c) {
-    case 0x07: /* BEL */
+    case 0x07: /* BEL: reported to the caller, see VTParser.bell */
+        p->bell = true;
         break;
     case 0x08: /* BS */
         if (s->cur_col > 0) { s->cur_col--; s->pending_wrap = false; }

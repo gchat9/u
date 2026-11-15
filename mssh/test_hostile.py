@@ -181,6 +181,10 @@ def sc_hello(c, hk):  # the baseline: a well-behaved session
     handshake(c, hk); ch = serve_session(c)
     chan_data(c, ch, b"hello from test server\n"); close_with(c, ch, 7)
 
+def sc_bell(c, hk):           # BELs in the output reach the terminal unchanged
+    handshake(c, hk); ch = serve_session(c)
+    chan_data(c, ch, b"ring\x07 twice\x07\x07 end\n"); close_with(c, ch, 0)
+
 def sc_hello_nonstrict(c, hk):
     handshake(c, hk, strict_on=False); ch = serve_session(c)
     chan_data(c, ch, b"hello from test server\n"); close_with(c, ch, 0)
@@ -360,6 +364,7 @@ def run(cmd, stdin_data=None, timeout=20, new_session=False):
 # name -> (server scenario, expected rc, expected text in stdout+stderr, stdin for the prompt)
 SERVER_TESTS = [
     ("hello",                           sc_hello,                         7,    "hello from test server", None),
+    ("BEL passes through to the terminal", sc_bell,                        0,    "ring\x07 twice\x07\x07 end", None),
     ("hello, non-strict server",        sc_hello_nonstrict,               0,    "hello from test server", None),
     ("junk lines before the banner",    sc_junk_banner,                   0,    "hello from test server", {"prefix": b"welcome\r\nto nothing\r\n"}),
     ("bad MAC",                         sc_bad_mac,                       1,    "MAC verification FAILED", None),

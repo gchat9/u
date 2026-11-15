@@ -13,6 +13,7 @@
  *     uint8_t   exists   0 = empty, skip; 1 = window present
  *     --- if exists:
  *     uint8_t   alive
+ *     uint8_t   bell     1 = rang the bell while not current (Window.bell)
  *     uint16_t  argc     number of argv strings (0 = default shell)
  *       for each arg:
  *         uint16_t  len
@@ -56,7 +57,7 @@
 #include <errno.h>
 
 #define PROTO_MAGIC   0x55544D58u
-#define PROTO_VERSION 1u
+#define PROTO_VERSION 2u
 
 /* ------------------------------------------------------------------ */
 /* I/O helpers                                                          */
@@ -189,6 +190,8 @@ static int send_session(int fd, Window *wins[], int cur)
 
         uint8_t alive = w->alive ? 1 : 0;
         if (write_all(fd, &alive, 1) < 0) return -1;
+        uint8_t bell = w->bell ? 1 : 0;
+        if (write_all(fd, &bell, 1) < 0) return -1;
 
         /* Child PID — needed by the new process for /proc/<pid>/comm */
         int32_t cpid = (int32_t)w->pty.child;
@@ -250,6 +253,10 @@ static int recv_session(int fd, Window *wins[], int *cur_out)
         uint8_t alive;
         if (read_all(fd, &alive, 1) < 0) return -1;
         w->alive = alive;
+
+        uint8_t bell;
+        if (read_all(fd, &bell, 1) < 0) return -1;
+        w->bell = bell != 0;
 
         int32_t cpid;
         if (read_all(fd, &cpid, 4) < 0) return -1;
@@ -617,6 +624,7 @@ int session_observer_push(int obs_fd, const Screen *s,
         pids[i]   = (wins[i] && wins[i]->alive) ? wins[i]->pty.child : 0;
         if (exists[i]) h.win_exists_mask |= (uint16_t)(1u << i);
         if (alive[i])  h.win_alive_mask  |= (uint16_t)(1u << i);
+        if (wins[i] && wins[i]->bell) h.win_bell_mask |= (uint16_t)(1u << i);
         if (i < 10)    h.win_pids[i]      = (int32_t)pids[i];
     }
 
@@ -759,7 +767,7 @@ static void obs_pointer_sink(const uint8_t *b, size_t n, void *ctx)
  * labels are read from /proc, so it is built again only when the window
  * table changes or a second has passed, not on every frame. */
 typedef struct {
-    uint16_t exists, alive;
+    uint16_t exists, alive, bell;
     uint8_t  cur;
     int32_t  pids[10];
     time_t   at;
@@ -770,7 +778,8 @@ typedef struct {
 #ifndef X11_BACKEND
 static bool obs_key_same(const ObsStatusKey *a, const ObsStatusKey *b)
 {
-    return a->exists == b->exists && a->alive == b->alive && a->cur == b->cur
+    return a->exists == b->exists && a->alive == b->alive && a->bell == b->bell
+        && a->cur == b->cur
         && memcmp(a->pids, b->pids, sizeof a->pids) == 0;
 }
 #endif
@@ -789,23 +798,25 @@ static void obs_draw(RenderState *rs, Screen *scr, Cell **local,
     scr->cur_visible = h->cur_visible;
 
     pid_t pids[MAX_WINDOWS] = {0};
-    bool  exists[MAX_WINDOWS] = {false}, alive[MAX_WINDOWS] = {false};
+    bool  exists[MAX_WINDOWS] = {false}, alive[MAX_WINDOWS] = {false}, marked[MAX_WINDOWS] = {false};
     for (int i = 0; i < MAX_WINDOWS && i < 10; i++) {
         exists[i] = (h->win_exists_mask >> i) & 1;
         alive[i]  = (h->win_alive_mask  >> i) & 1;
+        marked[i] = (h->win_bell_mask   >> i) & 1;
         pids[i]   = (pid_t)h->win_pids[i];
     }
 #ifdef X11_BACKEND
     (void)key;
     render_screen(rs, scr);
-    status_draw(our_rows, our_cols, h->cur_win, pids, exists, alive);
+    status_draw(our_rows, our_cols, h->cur_win, pids, exists, alive, marked);
 #else
     (void)our_rows; (void)our_cols;
-    ObsStatusKey now = { h->win_exists_mask, h->win_alive_mask, h->cur_win, {0}, time(NULL) };
+    ObsStatusKey now = { h->win_exists_mask, h->win_alive_mask, h->win_bell_mask,
+                         h->cur_win, {0}, time(NULL) };
     for (int i = 0; i < 10; i++) now.pids[i] = h->win_pids[i];
     if (rs->status_row < 0 || now.at != key->at || !obs_key_same(&now, key)) {
         Cell *row = render_status_row(rs, scr->rows);
-        if (row) status_cells(row, scr->cols, h->cur_win, pids, exists, alive);
+        if (row) status_cells(row, scr->cols, h->cur_win, pids, exists, alive, marked);
         *key = now;
     }
     render_screen(rs, scr);

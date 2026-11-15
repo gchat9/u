@@ -17,7 +17,8 @@
 typedef void (*StatusEmit)(void *ctx, const char *s, int n, Style style);
 
 void status_layout(StatusEmit emit, void *ctx, int cols, int active,
-                   pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+                   pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                   bool marked[]);
 
 /*
  * Fill row (cols cells) with the status bar: the same content, as cells, to
@@ -25,7 +26,8 @@ void status_layout(StatusEmit emit, void *ctx, int cols, int active,
  * changed since the last time.
  */
 void status_cells(Cell *row, int cols, int active,
-                  pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+                  pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                   bool marked[]);
 
 /* Write text into row at column x, in style st; returns the column after
  * it.  Anything but printable ASCII is written as '?'. */
@@ -34,5 +36,6 @@ int status_put(Cell *row, int cols, int x, const char *s, int n, Style st);
 #ifdef X11_BACKEND
 /* The X11 build draws the bar itself (x11_backend.c). */
 void status_draw(int rows, int cols, int active,
-                 pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+                 pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                   bool marked[]);
 #endif

@@ -9,6 +9,7 @@ typedef struct {
     VTParser  vt;
     bool      alive;
     bool      pristine; /* default shell, no input yet → auto-close on switch-away */
+    bool      bell;     /* rang the bell while not current; cleared when made current */
     char    **argv;   /* NULL = default shell; else exec argv (owned copy) */
 } Window;
 

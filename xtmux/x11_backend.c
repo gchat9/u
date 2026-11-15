@@ -28,6 +28,7 @@ int x11_backend_close_requested(void) { return xterm_close_requested(); }
 int x11_backend_lost(void) { return xterm_lost(); }
 void x11_backend_shutdown(void) { xterm_disconnect(); }
 void x11_backend_mouse_select(int level) { xterm_mouse_select(level); }
+void x11_backend_bell(void) { xterm_bell(); }
 /* Nonzero (once) after a paste shortcut was pressed. */
 int x11_backend_paste_key(void) { return xterm_paste_key(); }
 
@@ -55,7 +56,8 @@ static void x11_emit(void *vctx, const char *s, int n, Style style)
 }
 
 void x11_backend_status(int row, int cols, int active,
-                        pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+                        pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                        bool marked[])
 {
     int xcols = xterm_columns();
     int xrows = xterm_rows();
@@ -77,7 +79,7 @@ void x11_backend_status(int row, int cols, int active,
         ctx.fb[i] = (uint8_t)xscr_glyph_slot(0); ctx.fgb[i] = XTERM_FG_DEFAULT; ctx.bgb[i] = XTERM_BG_DEFAULT; ctx.atb[i] = 0;
     }
 
-    status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive);
+    status_layout(x11_emit, &ctx, cols, active, child_pids, wins_exist, wins_alive, marked);
     xterm_render();
 }
 

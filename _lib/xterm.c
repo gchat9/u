@@ -31,7 +31,7 @@ extern char *getenv(const char *name);
 #define AF_UNIX 1
 
 /* Events always selected on our window (more are added for the pointer). */
-#define EMASK_BASE ((1u<<17)|(1u<<15)|(1u<<0)|(1u<<4)) /* StructureNotify|Exposure|KeyPress|EnterWindow */
+#define EMASK_BASE ((1u<<21)|(1u<<17)|(1u<<15)|(1u<<0)|(1u<<4)) /* FocusChange|StructureNotify|Exposure|KeyPress|EnterWindow */
 
 struct sockaddr_un {
     uint16_t sun_family;
@@ -1521,6 +1521,27 @@ static void change_property(uint32_t win, uint32_t prop, uint32_t type,
     xreq(r, 24); xwrite(data, nbytes); xwrite(zeros, pad);
 }
 
+/* ── Bell ────────────────────────────────────────────────────────────
+ * A BEL asks the window manager for the window's attention: the ICCCM urgency
+ * hint in WM_HINTS (4.1.2.4), which taskbars and docks mark.  Only while the
+ * window lacks the keyboard focus, and taken back when the focus comes: ICCCM
+ * requires the client to clear it.  InputHint is left unset, so the window
+ * manager's focus policy is unchanged. */
+static uint8_t has_focus, urgent;
+
+static void set_urgency(uint32_t flags)
+{
+    uint32_t h[9] = { flags };     /* WM_HINTS: flags, then nine CARD32 fields, rest 0 */
+    change_property(xterm_win, 35, 35, 32, h, 9);   /* atoms WM_HINTS (35), type WM_HINTS */
+}
+
+void xterm_bell(void)
+{
+    if (has_focus || urgent) return;
+    urgent = 1;
+    set_urgency(1u << 8);          /* UrgencyHint */
+}
+
 /* Another client wants our selection (event 30: time 4, owner 8,
  * requestor 12, selection 16, target 20, property 24).  Answer with a
  * property on its window and a SelectionNotify (via SendEvent, opcode 25);
@@ -1649,6 +1670,11 @@ static void handle_event(const uint8_t *ev)
         /* EnterNotify: pointer entered the window. Re-assert focus so
          * typing works regardless of the WM's own focus policy. */
         grab_focus();
+    } else if (etype == 9 || etype == 10) {
+        /* FocusIn / FocusOut.  Coming to the window takes back its attention
+         * mark (see xterm_bell). */
+        has_focus = etype == 9;
+        if (has_focus && urgent) { urgent = 0; set_urgency(0); }
     } else if (etype == 33) {
         /* ClientMessage: check for a WM_DELETE_WINDOW close request. */
         uint32_t mtype; memcpy(&mtype, ev + 8, 4);

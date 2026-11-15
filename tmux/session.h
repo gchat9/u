@@ -41,6 +41,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  mouse;          /* mouse_mode | mouse_enc << 2 of the shown window */
     uint16_t win_exists_mask;
     uint16_t win_alive_mask;
+    uint16_t win_bell_mask;  /* windows marked by a bell (Window.bell) */
     int32_t  win_pids[10];
     uint16_t status_len;
 } ObsHeader;

@@ -125,12 +125,13 @@ static int child_rows(void) { return g_rows > 1 ? g_rows - 1 : 1; }
 static void render_scrollback_view(void);
 #endif
 
-static void status_table(pid_t pids[], bool exist[], bool alive[])
+static void status_table(pid_t pids[], bool exist[], bool alive[], bool marked[])
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *w = g_wins[i];
         exist[i]  = (w != NULL);
         alive[i]  = (w != NULL && w->alive);
+        marked[i] = (w != NULL && w->bell);
         pids[i]   = (w && w->alive) ? w->pty.child : 0;
     }
 }
@@ -141,10 +142,10 @@ static void status_table(pid_t pids[], bool exist[], bool alive[])
 static void set_status(void)
 {
     if (g_rows < 2) return;               /* no room for one */
-    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS];
-    status_table(pids, exist, alive);
+    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS], marked[MAX_WINDOWS];
+    status_table(pids, exist, alive, marked);
     Cell *row = render_status_row(&g_rs, child_rows());
-    if (row) status_cells(row, g_cols, g_cur, pids, exist, alive);
+    if (row) status_cells(row, g_cols, g_cur, pids, exist, alive, marked);
 }
 #endif
 
@@ -159,9 +160,9 @@ static void redraw_status(void)
     /* The cursor is kept current by xscr_render() itself (see render.c /
      * x11_backend.c); it fires on every content update, whereas this
      * status-bar redraw deliberately doesn't. */
-    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS];
-    status_table(pids, exist, alive);
-    status_draw(g_rows, g_cols, g_cur, pids, exist, alive);
+    pid_t pids[MAX_WINDOWS]; bool exist[MAX_WINDOWS], alive[MAX_WINDOWS], marked[MAX_WINDOWS];
+    status_table(pids, exist, alive, marked);
+    status_draw(g_rows, g_cols, g_cur, pids, exist, alive, marked);
 #else
     /* The status row is drawn with the screen: a changed cell or two is a
      * few bytes, nothing changed is nothing, and the cursor is parked by
@@ -680,6 +681,7 @@ static void switch_to(int idx)
         window_free(prev);
 
     g_cur = idx;
+    if (g_wins[idx]) g_wins[idx]->bell = false;   /* seen: the mark goes */
 
     /* Exit scrollback mode when switching windows */
     g_scrollback_mode = false;
@@ -707,6 +709,19 @@ static bool drain_pty(Window *w)
 
     /* Answered here, for any window, not by whoever is displaying it. */
     window_answer_cpr(w);
+
+    /* A bell in any window rings ours, as tmux's bell-action "any" does;
+     * several in one read make one.  A bell in a window that is not the
+     * current one also marks it, until it is made current (switch_to). */
+    if (w->vt.bell) {
+        w->vt.bell = false;
+        if (w != g_wins[g_cur]) { w->bell = true; redraw_status(); }
+#ifdef X11_BACKEND
+        x11_backend_bell();
+#else
+        (void)write(STDOUT_FILENO, "\a", 1);
+#endif
+    }
 
     return got_data;
 }

@@ -34,7 +34,8 @@ int  xtty_open(const char *title);
 int  xtty_fd(void);
 
 /* Terminal output: escape sequences and text, as to any terminal.  Shown at
- * the next xtty_flush() or xtty_poll(). */
+ * the next xtty_flush() or xtty_poll().  A BEL in it asks the window manager
+ * for the window's attention (see xterm_bell in xterm.h). */
 void xtty_write(const void *buf, size_t n);
 void xtty_flush(void);
 

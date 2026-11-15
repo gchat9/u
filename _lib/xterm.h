@@ -144,6 +144,11 @@ void xterm_set_cursor(int row, int col);
 /* Set WM_NAME (window title / taskbar label). */
 void xterm_set_title(const char *name, int len);
 
+/* The program rang the bell (BEL): asks the window manager for the window's
+ * attention (ICCCM's urgency hint), unless the window already has the keyboard
+ * focus.  The request is taken back when the window gets the focus. */
+void xterm_bell(void);
+
 /* Nonzero once the window manager has sent a WM_DELETE_WINDOW request
  * (the user closed the window). Sticky — stays set once seen. */
 int xterm_close_requested(void);

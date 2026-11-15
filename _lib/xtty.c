@@ -24,7 +24,12 @@ void xtty_close(void) { vt_free(&vt); xterm_disconnect(); }
 void xtty_size(int *rows, int *cols) { *rows = vt.scr.rows; *cols = vt.scr.cols; }
 int  xtty_resized(void) { int r = resized; resized = 0; return r; }
 
-void xtty_write(const void *buf, size_t n) { vt_feed(&vt, buf, n); dirty = 1; }
+void xtty_write(const void *buf, size_t n)
+{
+    vt_feed(&vt, buf, n);
+    dirty = 1;
+    if (vt.bell) { vt.bell = false; xterm_bell(); }
+}
 
 void xtty_flush(void)
 {

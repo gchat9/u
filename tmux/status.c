@@ -36,7 +36,8 @@ static void proc_name(pid_t pid, char *buf, size_t buflen)
 /* ================================================================== */
 
 void status_layout(StatusEmit emit, void *ctx, int cols, int active,
-                   pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+                   pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                   bool marked[])
 {
     /* ---- hostname (cached - won't change during a session) ---- */
     static char hostname[64] = "";
@@ -84,7 +85,8 @@ void status_layout(StatusEmit emit, void *ctx, int cols, int active,
         if (!wins_exist[i]) continue;
         emit(ctx, " ", 1, STATUS_BAR_COLOR);        /* unhighlighted gap */
         Style st = (i == active) ? WINDOW_STATUS_CURRENT_COLOR :
-                   !wins_alive[i] ? WINDOW_STATUS_ACTIVITY_COLOR :
+                   marked[i]     ? WINDOW_STATUS_ACTIVITY_COLOR :
+                   !wins_alive[i] ? WINDOW_STATUS_DEAD_COLOR :
                                     WINDOW_STATUS_COLOR;
         emit(ctx, tab_text[i], tab_w[i], st);
         printed += tab_w[i] + 1;                    /* label + separator */
@@ -136,10 +138,11 @@ static void cell_emit(void *ctx, const char *s, int n, Style st)
 }
 
 void status_cells(Cell *row, int cols, int active,
-                  pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+                  pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                  bool marked[])
 {
     CellFill f = { row, cols, 0 };
-    status_layout(cell_emit, &f, cols, active, child_pids, wins_exist, wins_alive);
+    status_layout(cell_emit, &f, cols, active, child_pids, wins_exist, wins_alive, marked);
     for (; f.x < cols; f.x++) {           /* a layout that came out short */
         memset(&row[f.x], 0, sizeof row[f.x]);
         row[f.x].ch = ' ';
@@ -150,8 +153,9 @@ void status_cells(Cell *row, int cols, int active,
 
 #ifdef X11_BACKEND
 void status_draw(int rows, int cols, int active,
-                 pid_t child_pids[], bool wins_exist[], bool wins_alive[])
+                 pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                 bool marked[])
 {
-    x11_backend_status(rows - 1, cols, active, child_pids, wins_exist, wins_alive);
+    x11_backend_status(rows - 1, cols, active, child_pids, wins_exist, wins_alive, marked);
 }
 #endif

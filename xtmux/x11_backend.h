@@ -23,7 +23,8 @@ int  x11_backend_lost(void);
  * the detached daemon, which would otherwise keep the window on screen. */
 void x11_backend_shutdown(void);
 void x11_backend_status(int row, int cols, int active,
-                        pid_t child_pids[], bool wins_exist[], bool wins_alive[]);
+                        pid_t child_pids[], bool wins_exist[], bool wins_alive[],
+                        bool marked[]);
 
 /* Plain-text view, used by the scrollback viewer: UTF-8 drawn into the
  * window like output to a terminal.  _begin blanks the screen and homes
@@ -39,6 +40,9 @@ void x11_backend_text_fill(int row, Style st);
 void x11_backend_text_at(int row, int col, const char *utf8, int n, Style st);
 void x11_backend_text_end(void);
 const Screen *x11_backend_text_screen(void);
+
+/* The program rang the bell: asks for the window's attention (xterm_bell). */
+void x11_backend_bell(void);
 
 /* Mouse and clipboard: the pointer (xscr_pointer, ...) is in
  * ../_lib/xterm_screen.h.  _select says how much pointer traffic is wanted

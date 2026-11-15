@@ -139,14 +139,23 @@ typedef struct { uint8_t fg, bg; } Style;
 #define WINDOW_STATUS_CURRENT_COLOR \
     ((Style){ WINDOW_STATUS_CURRENT_FG, WINDOW_STATUS_CURRENT_BG })
 
-/* Dead/exited window tab  (tmux calls this "activity" but we use it   *
- * for zombie windows since we don't implement real activity flags yet) */
-#define WINDOW_STATUS_ACTIVITY_FG 240
-#define WINDOW_STATUS_ACTIVITY_BG 236
+/* Background window that rang the bell, until it is made current.  As tmux's
+ * window-status-activity-style: set-window-option -g
+ * window-status-activity-style fg=colour235,bg=colour78                    */
+#define WINDOW_STATUS_ACTIVITY_FG 235
+#define WINDOW_STATUS_ACTIVITY_BG 78
 #define WINDOW_STATUS_ACTIVITY_STYLE \
     _FG(WINDOW_STATUS_ACTIVITY_FG) _BG(WINDOW_STATUS_ACTIVITY_BG)
 #define WINDOW_STATUS_ACTIVITY_COLOR \
     ((Style){ WINDOW_STATUS_ACTIVITY_FG, WINDOW_STATUS_ACTIVITY_BG })
+
+/* Dead/exited window tab */
+#define WINDOW_STATUS_DEAD_FG 240
+#define WINDOW_STATUS_DEAD_BG 236
+#define WINDOW_STATUS_DEAD_STYLE \
+    _FG(WINDOW_STATUS_DEAD_FG) _BG(WINDOW_STATUS_DEAD_BG)
+#define WINDOW_STATUS_DEAD_COLOR \
+    ((Style){ WINDOW_STATUS_DEAD_FG, WINDOW_STATUS_DEAD_BG })
 
 /* ================================================================== */
 /* Window lifecycle                                                     */
