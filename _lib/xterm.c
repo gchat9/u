@@ -130,6 +130,7 @@ static void xwrite(const void *buf, size_t n)
 static uint16_t xseq;
 static void xreq(const void *buf, size_t n) { xseq++; xwrite(buf, n); }
 static int  await_reply(uint8_t r[32]);
+static void xkb_init(void);
 
 static void xdrain(size_t n)
 {
@@ -1232,33 +1233,35 @@ int xterm_init(void)
     /* Close-on-exec (SOCK_CLOEXEC has O_CLOEXEC's value): the shells and
      * programs we start must not inherit the connection.  They would keep
      * it, and so the window, alive after we have detached or exited. */
-    xfd = socket(AF_UNIX, SOCK_STREAM | O_CLOEXEC, 0);
-    struct sockaddr_un sa;
-    sa.sun_family = AF_UNIX;
-    strlcpy(sa.sun_path, "/tmp/.X11-unix/X", sizeof sa.sun_path);
-    /* $DISPLAY is ":N" or ":NN" (optionally ".screen", which we don't
-     * need -- only the display number selects the socket). Assume N is
-     * 0-99 (true of any real X display) and copy its 1-2 digit
-     * characters straight out of the environment string; there's
-     * nothing to compute, so no atoi()/snprintf() round-trip. Falls
-     * back to display 2 (the old hardcoded default) if $DISPLAY is
-     * unset or doesn't look like ":<digits>". */
-    size_t plen = strlen(sa.sun_path);
+    /* $DISPLAY is ":N" or ":NN" (optionally ".screen", which we don't need:
+     * only the display number selects the socket).  N is copied straight out
+     * of the environment string.  Falls back to display 2 if $DISPLAY is unset
+     * or doesn't look like ":<digits>". */
+    char num[3] = { '2', 0, 0 };
 #ifdef X11_BACKEND
     const char *disp = getenv("DISPLAY");
 #else
     const char *disp = NULL;  /* standalone demo: no libc, no $DISPLAY */
 #endif
     if (disp && disp[0] == ':' && disp[1] >= '0' && disp[1] <= '9') {
-        sa.sun_path[plen++] = disp[1];
-        if (disp[2] >= '0' && disp[2] <= '9') sa.sun_path[plen++] = disp[2];
-        sa.sun_path[plen] = '\0';
-    } else {
-        sa.sun_path[plen]   = '2';
-        sa.sun_path[plen+1] = '\0';
+        num[0] = disp[1];
+        if (disp[2] >= '0' && disp[2] <= '9') num[1] = disp[2];
     }
-    int sa_len = (int)(sizeof sa.sun_family + strlen(sa.sun_path) + 1);
-    if (connect(xfd, (struct sockaddr *)&sa, sa_len) < 0)
+    /* The server's socket is in /tmp/.X11-unix on most systems and in
+     * /run/.X11-unix on others: try both, a fresh socket for each. */
+    static const char *const dirs[2] = { "/tmp/.X11-unix/X", "/run/.X11-unix/X" };
+    struct sockaddr_un sa;
+    int connected = 0;
+    for (unsigned k = 0; k < 2 && !connected; k++) {
+        xfd = socket(AF_UNIX, SOCK_STREAM | O_CLOEXEC, 0);
+        sa.sun_family = AF_UNIX;
+        strlcpy(sa.sun_path, dirs[k], sizeof sa.sun_path);
+        memcpy(sa.sun_path + strlen(sa.sun_path), num, sizeof num);
+        int sa_len = (int)(sizeof sa.sun_family + strlen(sa.sun_path) + 1);
+        connected = connect(xfd, (struct sockaddr *)&sa, sa_len) == 0;
+        if (!connected) close(xfd);
+    }
+    if (!connected)
         die("could not connect to X11\n");
 
     uint8_t sreq[12] = { 'l',0, 11,0, 0,0, 0,0, 0,0, 0,0 };
@@ -1293,6 +1296,7 @@ int xterm_init(void)
     min_keycode = d[26];
     max_keycode = d[27];
     load_keyboard_mapping();
+    xkb_init();
     grid_init(screen_w, screen_h, screen_storage, sizeof screen_storage);
 
     xterm_win = new_xid(); xterm_gc = new_xid();
@@ -1535,8 +1539,45 @@ static void set_urgency(uint32_t flags)
     change_property(xterm_win, 35, 35, 32, h, 9);   /* atoms WM_HINTS (35), type WM_HINTS */
 }
 
+/* XKEYBOARD major opcode, 0 if the server has no XKB or setup failed. */
+static uint8_t xkb_major;
+
+/* QueryExtension("XKEYBOARD") and XkbUseExtension 1.0, which the server
+ * requires before any other XKB request. */
+static void xkb_init(void)
+{
+    uint8_t q[20] = { 98, 0, 5, 0, 9, 0, 0, 0 };       /* QueryExtension, 9-char name */
+    memcpy(q + 8, "XKEYBOARD", 9);
+    xreq(q, sizeof q);
+    uint8_t r[32];
+    if (!await_reply(r) || !r[8]) return;               /* not present */
+    uint8_t major = r[9];
+    uint8_t use[8] = { major, 0, 2, 0, 1, 0, 0, 0 };    /* XkbUseExtension, 1.0 */
+    xreq(use, sizeof use);
+    if (!await_reply(r) || !r[1]) return;               /* not supported */
+    xkb_major = major;
+}
+
+/* XkbBell with eventOnly set: the server reports the bell to clients that
+ * select BellNotify, and makes no sound.  Sent on every BEL, focused or not:
+ * a window manager only sees the bell of an unfocused window (through the
+ * urgency hint), but a client that listens for bell notifications sees both. */
+static void xkb_bell_notify(void)
+{
+    if (!xkb_major) return;
+    uint8_t b[28] = { 0 };
+    b[0] = xkb_major; b[1] = 3; b[2] = 7;               /* X_kbBell, 7 words */
+    b[5] = 1;                                           /* deviceSpec: XkbUseCoreKbd (0x0100) */
+    b[7] = 3;                                           /* bellClass: XkbDfltXIClass (0x0300) */
+    b[9] = 4;                                           /* bellID:    XkbDfltXIId (0x0400) */
+    b[12] = 1;                                          /* eventOnly */
+    memcpy(b + 24, &xterm_win, 4);                      /* window */
+    xreq(b, sizeof b);
+}
+
 void xterm_bell(void)
 {
+    xkb_bell_notify();
     if (has_focus || urgent) return;
     urgent = 1;
     set_urgency(1u << 8);          /* UrgencyHint */
