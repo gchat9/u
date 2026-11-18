@@ -98,3 +98,30 @@
 #ifndef XTERM_NUMLOCK
 #define XTERM_NUMLOCK 0
 #endif
+
+/* Keyboard layout groups held: the layouts of "setxkbmap -layout us,gr" (each
+ * takes 2 KB).  1, 2 or 4.  A key from a group beyond these is typed from the
+ * group its number wraps to. */
+#ifndef XTERM_GROUPS
+#define XTERM_GROUPS 2
+#endif
+
+/* The unaccented Greek letters, for the gr layout.  Off by default: the code
+ * for them is only compiled in with -DXTERM_GREEK=1 (about 100 bytes). */
+#ifndef XTERM_GREEK
+#define XTERM_GREEK 0
+#endif
+
+/* Latin-2 letters (Polish, Czech, Slovak, Hungarian, Romanian, Croatian, ...)
+ * and the Turkish letters of Latin-3.  Off by default: the table and its
+ * lookup are only compiled in with -DXTERM_LATIN2=1 (about 150 bytes). */
+#ifndef XTERM_LATIN2
+#define XTERM_LATIN2 0
+#endif
+
+/* Cyrillic letters (Russian, Ukrainian, Bulgarian, Serbian, ...).  Off by
+ * default: the table and its lookup are only compiled in with
+ * -DXTERM_CYRILLIC=1 (about 150 bytes). */
+#ifndef XTERM_CYRILLIC
+#define XTERM_CYRILLIC 0
+#endif

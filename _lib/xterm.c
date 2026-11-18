@@ -185,78 +185,111 @@ static void put_image(uint32_t draw, uint32_t gc,
  * Keyboard
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* GetKeyboardMapping (opcode 101): fixed reply header is 32 bytes, then
- * keysyms_per_keycode * count KEYSYMs (4 bytes each) follow.
- *
- * keysyms_per_keycode is chosen by the server, not us, and grows with
- * every extra shift level or layout group the system has configured
- * (AltGr, a second language group, compose, ...) -- a real desktop's
- * XKB config routinely reports 6-8+ where a bare test server reports
- * 2. This translator only looks at the first four columns of any
- * keycode's row -- the standard 4-level model (base, shift, AltGr,
- * AltGr+shift) that covers every plain accented-letter layout -- so
- * rather than sizing a table for the server's worst case (and
- * silently losing all keyboard input for the rest of the run if some
- * system's config exceeds it -- the previous bug here), stream the
- * reply one keycode-row at a time and keep just those four columns.
- * Table size is then a fixed 256*4 regardless of what the server
- * actually sends. Levels beyond 4 (further layout groups, 5th-level
- * shift, ...) aren't reachable through this translator. */
-static uint8_t  min_keycode, max_keycode, keysyms_per_kc;
-static uint32_t keysym_table[256][4];
+/* What the keyboard table keeps of a key's symbol: 16 bits.  A character is
+ * its code point (below 0xFE00); the keys that are not characters (Return,
+ * the arrows, the keypad, ISO_Left_Tab, ...) keep their keysym, which is
+ * 0xFE00-0xFFFF.  A keysym with no character and no use here is 0. */
+static uint32_t keysym_cp(uint32_t ks);   /* the character a keysym types */
 
+static uint16_t key_code(uint32_t ks)
+{
+    if (ks >= 0xFE00 && ks <= 0xFFFF) return (uint16_t)ks;
+    uint32_t cp = keysym_cp(ks);
+    return cp < 0xFE00 ? (uint16_t)cp : 0;
+}
+
+/* The table: for each keycode, each XKB layout group (XTERM_GROUPS of them;
+ * the layouts of "setxkbmap -layout us,ru"), the symbol at 4 levels: base,
+ * Shift, AltGr, AltGr+Shift.  All groups are loaded at start, so a key is
+ * looked up in the group its event says, with no reload when the layout is
+ * switched.  Indexed by keycode, 0 (nothing) where the keymap has no key. */
+static uint8_t  min_keycode, max_keycode;
+static uint16_t keymap[256][XTERM_GROUPS][4];
+
+/* GetKeyboardMapping (opcode 101), for a server without XKB: the first four
+ * columns of each keycode's row are taken as the four levels of the first
+ * group, which is all the core protocol says.  The reply is streamed one row
+ * at a time, whatever keysyms_per_keycode the server chose, so that no
+ * configuration can overflow a buffer or throw off the wire format. */
 static void load_keyboard_mapping(void)
 {
     int count = (int)max_keycode - (int)min_keycode + 1;
-    if (count < 1) return;
-
-    uint8_t req[8] = {0};
-    uint16_t len = 2;
-    req[0] = 101;
-    memcpy(req+2, &len, 2);
-    req[4] = min_keycode;
-    req[5] = (uint8_t)count;
+    uint8_t req[8] = { 101, 0, 2, 0, min_keycode, (uint8_t)count };
     xreq(req, 8);
 
     uint8_t hdr[32];
-    if (!await_reply(hdr)) return;   /* it failed: leave keysyms_per_kc == 0 */
-    uint8_t kspc = hdr[1];
-    if (!kspc) return;
-
-    uint8_t row[4 * 32];  /* 32 keysyms/keycode is already far more than
-                            * any real config uses; if some server still
-                            * exceeds it, drain the rest of that row
-                            * rather than losing wire-format sync. */
-    size_t rowbytes = (size_t)kspc * 4;
-    for (int i = 0; i < count; i++) {
-        if (rowbytes <= sizeof row) {
-            xread(row, rowbytes);
-        } else {
-            xread(row, sizeof row);
-            xdrain(rowbytes - sizeof row);
+    if (!await_reply(hdr)) return;
+    for (int i = 0; i < count; i++)
+        for (int col = 0; col < hdr[1]; col++) {
+            uint32_t ks; xread(&ks, 4);
+            if (col < 4) keymap[min_keycode + i][0][col] = key_code(ks);
         }
-        uint32_t v[4] = {0, 0, 0, 0};
-        for (int col = 0; col < kspc && col < 4; col++)
-            memcpy(&v[col], row + col * 4, 4);
-        if (kspc == 1) v[1] = v[0];  /* no distinct shift level: mirror base,
-                                       * matching the pre-AltGr behaviour */
-        keysym_table[i][0] = v[0]; keysym_table[i][1] = v[1];
-        keysym_table[i][2] = v[2]; keysym_table[i][3] = v[3];
-    }
-    keysyms_per_kc = kspc;
 }
 
-/* level: 0=base, 1=shift, 2=AltGr, 3=AltGr+shift. Returns 0 (NoSymbol)
- * if the keymap doesn't define that level for this key -- e.g. any
- * layout with no AltGr configured at all simply never populated
- * columns 2/3, so keysym_for(kc, 2) is already a safe, silent no-op. */
-static uint32_t keysym_for(uint8_t keycode, int level)
+/* XKEYBOARD major opcode, 0 if the server has no XKB or setup failed. */
+static uint8_t xkb_major;
+
+/* The level each key type picks, for c = Shift + 2 * AltGr (see
+ * xkb_load_keymap); the types are numbered as the server has them. */
+#define XKB_TYPES_MAX 32
+static uint8_t xkb_level[XKB_TYPES_MAX][4];
+
+/* XkbGetMap (minor 8), for the real thing.  The reply has the key types
+ * first, so that AltGr is the level the keymap says (a key type maps
+ * modifiers to levels; it is not always the third column), then the symbols
+ * of every key, group after group.  Returns 0 if the server will not say.
+ * Wire layout (xcb/xkb.h): 40 bytes of fixed header, then the types (an
+ * 8-byte record, its 8-byte map entries, and 4-byte preserve entries if it
+ * has any), then per key an 8-byte record followed by nSyms keysyms. */
+static int xkb_load_keymap(void)
 {
-    if (!keysyms_per_kc || keycode < min_keycode || keycode > max_keycode)
-        return 0;
-    if (level < 0) level = 0;
-    if (level > 3) level = 3;
-    return keysym_table[keycode - min_keycode][level];
+    int count = (int)max_keycode - (int)min_keycode + 1;
+    /* XkbGetMap, 28 bytes: the core keyboard; all key types ("full"), the
+     * symbols of the keycode range ("partial"). */
+    uint8_t req[28] = { xkb_major, 8, 7, 0, 0, 1, 1, 0, 2, 0, 0, 0, min_keycode, (uint8_t)count };
+    xreq(req, sizeof req);
+    uint8_t hdr[32];
+    if (!await_reply(hdr)) return 0;
+    xdrain(8);                                       /* the rest of the fixed header */
+
+    for (int t = 0; t < hdr[15]; t++) {              /* nTypes */
+        uint8_t th[8], me[8], spare[4];
+        xread(th, 8);                                /* mask, ..., nMapEntries, hasPreserve */
+        uint8_t *lv = t < XKB_TYPES_MAX ? xkb_level[t] : spare;
+        for (int e = 0; e < th[5]; e++) {
+            xread(me, 8);                            /* active, mods, level, ... */
+            for (int c = 0; c < 4; c++) {
+                /* The modifiers the column stands for: Shift (Mod bit 0), or
+                 * for a type that selects on NumLock (the keypad's) NumLock
+                 * (Mod2), whose second level is the digit, as in the core
+                 * table; and AltGr, taken to be Mod5 as in handle_keypress. */
+                uint8_t m = (uint8_t)(((c & 1) ? (th[0] & 0x10 ? 0x10 : 1) : 0) | ((c & 2) << 6));
+                if (me[0] && me[1] == (m & th[0])) lv[c] = me[2];
+            }
+        }
+        if (th[6]) xdrain((size_t)th[5] * 4);
+    }
+
+    for (int i = 0; i < count; i++) {
+        uint8_t kh[8];
+        xread(kh, 8);                    /* key type of each group, groupInfo, width, nSyms */
+        uint8_t ng = kh[4] & 0x0F, width = kh[5];
+        uint16_t nsyms; memcpy(&nsyms, kh+6, 2);
+        uint16_t take = nsyms < 32 ? nsyms : 32;
+        uint32_t s[32];
+        xread(s, (size_t)take * 4);      /* group after group, width levels each */
+        xdrain((size_t)(nsyms - take) * 4);
+        for (int g = 0; g < XTERM_GROUPS && ng; g++) {
+            uint8_t gi = g % ng;         /* fewer groups than we hold: wrap */
+            uint8_t kt = kh[gi];
+            for (int c = 0; c < 4; c++) {
+                uint8_t lvl = kt < XKB_TYPES_MAX ? xkb_level[kt][c] : 0;
+                unsigned at = (unsigned)gi * width + lvl;
+                keymap[min_keycode + i][g][c] = (lvl < width && at < take) ? key_code(s[at]) : 0;
+            }
+        }
+    }
+    return 1;
 }
 
 /* The keypad keysyms: X's range 0xFF80-0xFFBD. */
@@ -280,9 +313,9 @@ static int is_letter(uint32_t ks)
  * as a modifier of that key (see handle_keypress): Shift+KP_1 is ESC [ 1 ; 2 F.
  * With XTERM_CAPSLOCK, CapsLock reverses Shift for a letter.  0 if the key gives
  * no symbol. */
-static uint32_t keysym_of(uint8_t keycode, int shift, int altgr, int numlock, int capslock)
+static uint32_t keysym_of(const uint16_t *row, int shift, int altgr, int numlock, int capslock)
 {
-    uint32_t base = keysym_for(keycode, 0);
+    uint32_t base = row[0];
     int lvl = (altgr ? 2 : 0) + (shift ? 1 : 0);
 #if XTERM_NUMLOCK
     if (is_keypad(base)) lvl = (altgr ? 2 : 0) + (numlock && !shift ? 1 : 0);
@@ -295,9 +328,9 @@ static uint32_t keysym_of(uint8_t keycode, int shift, int altgr, int numlock, in
 #else
     (void)capslock;
 #endif
-    uint32_t ks = keysym_for(keycode, lvl);
-    if (!ks && (lvl & 1)) ks = keysym_for(keycode, lvl & ~1);   /* shift level empty */
-    if (!ks && (lvl & 2)) ks = keysym_for(keycode, 0);          /* AltGr level empty */
+    uint32_t ks = row[lvl];
+    if (!ks && (lvl & 1)) ks = row[lvl & ~1];   /* shift level empty */
+    if (!ks && (lvl & 2)) ks = row[0];          /* AltGr level empty */
     return ks;
 }
 
@@ -419,7 +452,118 @@ static uint32_t keypad_char(uint32_t ks)
     }
 }
 
-/* The bytes a typed key sends: printable Latin-1 (ASCII as-is, 0xA0-0xFF
+/* Keysyms that are not their code point, in pairs (keysym, code point): the
+ * characters us-intl types beyond Latin-1 (AltGr+5 is EuroSign, AltGr+9 and
+ * AltGr+0 the single quotes, and so on). */
+static const uint16_t cp_pairs[] = {
+    0x20ac, 0x20ac,   /* EuroSign */
+    0x0ac9, 0x2122,   /* trademark */
+    0x0ad0, 0x2018,   /* leftsinglequotemark */
+    0x0ad1, 0x2019,   /* rightsinglequotemark */
+    0x0ad2, 0x201c,   /* leftdoublequotemark */
+    0x0ad3, 0x201d,   /* rightdoublequotemark */
+    0x13bc, 0x0152,   /* OE */
+    0x13bd, 0x0153,   /* oe */
+#if XTERM_LATIN2
+    0x02a9, 0x0130,   /* Iabovedot: capital dotted I (the Turkish letters of Latin-3) */
+    0x02ab, 0x011e,   /* Gbreve */
+    0x02b9, 0x0131,   /* idotless: small dotless i */
+    0x02bb, 0x011f,   /* gbreve */
+#endif
+};
+
+#if XTERM_GREEK
+/* Greek letters (X11 keysyms 0x7c1-0x7f9, without the accented ones) to their
+ * code points.  The capitals run on from ALPHA, skipping the unassigned
+ * U+03A2; the small letters run on from alpha, except that the keysyms put
+ * sigma (0x7f2) before the final sigma (0x7f3) and Unicode the other way. */
+static uint32_t greek_cp(uint32_t ks)
+{
+    if (ks >= 0x7c1 && ks <= 0x7d8) return 0x391 + (ks - 0x7c1) + (ks >= 0x7d2);
+    if (ks >= 0x7e1 && ks <= 0x7f9) return (0x3b1 + (ks - 0x7e1)) ^ (ks == 0x7f2 || ks == 0x7f3);
+    return 0;
+}
+#endif
+
+#if XTERM_LATIN2
+/* Latin-2 letters (keysyms 0x1a1-0x1ff) to their code points, 0 for the
+ * unassigned slots; from the U+ comments in keysymdef.h.  The table runs from
+ * 0x1a1 to 0x1df, the capitals; the small letters of 0x1e0-0x1fe are the
+ * capitals of 0x1c0-0x1de plus one, and 0x1ff is the dot above. */
+static const uint16_t lat2_tab[] = {
+    0x0104, 0x02d8, 0x0141, 0x0000, 0x013d, 0x015a, 0x0000, 0x0000,
+    0x0160, 0x015e, 0x0164, 0x0179, 0x0000, 0x017d, 0x017b, 0x0000,
+    0x0105, 0x02db, 0x0142, 0x0000, 0x013e, 0x015b, 0x02c7, 0x0000,
+    0x0161, 0x015f, 0x0165, 0x017a, 0x02dd, 0x017e, 0x017c, 0x0154,
+    0x0000, 0x0000, 0x0102, 0x0000, 0x0139, 0x0106, 0x0000, 0x010c,
+    0x0000, 0x0118, 0x0000, 0x011a, 0x0000, 0x0000, 0x010e, 0x0110,
+    0x0143, 0x0147, 0x0000, 0x0000, 0x0150, 0x0000, 0x0000, 0x0158,
+    0x016e, 0x0000, 0x0170, 0x0000, 0x0000, 0x0162, 0x0000,
+};
+
+static uint32_t latin2_cp(uint32_t ks)
+{
+    if (ks < 0x1a1) return 0;                 /* ks < 0x200: see keysym_cp */
+    if (ks == 0x1ff) return 0x2d9;
+    if (ks < 0x1e0) return lat2_tab[ks - 0x1a1];
+    uint32_t cp = lat2_tab[ks - 0x1c1];
+    return cp ? cp + 1 : 0;
+}
+#endif
+
+#if XTERM_CYRILLIC
+/* Cyrillic letters (keysyms 0x6a1-0x6ff) to their code points, from the U+
+ * comments in keysymdef.h (every slot is assigned).  The table runs from
+ * 0x6a1 to 0x6df; the capitals of 0x6e0-0x6ff are the small letters of
+ * 0x6c0-0x6df less 0x20. */
+static const uint16_t cyr_tab[] = {
+    0x0452, 0x0453, 0x0451, 0x0454, 0x0455, 0x0456, 0x0457, 0x0458,
+    0x0459, 0x045a, 0x045b, 0x045c, 0x0491, 0x045e, 0x045f, 0x2116,
+    0x0402, 0x0403, 0x0401, 0x0404, 0x0405, 0x0406, 0x0407, 0x0408,
+    0x0409, 0x040a, 0x040b, 0x040c, 0x0490, 0x040e, 0x040f, 0x044e,
+    0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433, 0x0445,
+    0x0438, 0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f,
+    0x044f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432, 0x044c,
+    0x044b, 0x0437, 0x0448, 0x044d, 0x0449, 0x0447, 0x044a,
+};
+
+static uint32_t cyrillic_cp(uint32_t ks)
+{
+    if (ks < 0x6a1) return 0;                 /* ks < 0x700: see keysym_cp */
+    if (ks < 0x6e0) return cyr_tab[ks - 0x6a1];
+    return cyr_tab[ks - 0x6c1] - 0x20;
+}
+#endif
+
+/* The code point of a keysym that types a character, 0 if it types none.
+ * X11's Latin-1 keysyms (0x20-0x7e, 0xA0-0xFF) are the code points.  So are
+ * the Unicode keysyms, 0x01000000 plus the code point: how the XKB files give
+ * the characters that have no legacy keysym (ro's comma-below letters, de's
+ * sharp capital, ua's hryvnia, ...). */
+static uint32_t keysym_cp(uint32_t ks)
+{
+    if ((ks & 0xFF000000) == 0x01000000) {
+        ks &= 0xFFFFFF;
+        /* not a control character, a surrogate, or one of the UTF-8 that a
+         * keyboard table of 16 bits (see key_code) has no room for */
+        return (ks - 0x20 < 0x5F || ks - 0xA0 < 0xD760 || ks - 0xE000 < 0x1E00) ? ks : 0;
+    }
+    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) return ks;
+    for (unsigned i = 0; i < sizeof cp_pairs / sizeof *cp_pairs; i += 2)
+        if (ks == cp_pairs[i]) return cp_pairs[i + 1];
+#if XTERM_GREEK
+    if (ks >> 8 == 7) return greek_cp(ks);
+#endif
+#if XTERM_LATIN2
+    if (ks >> 8 == 1) return latin2_cp(ks);
+#endif
+#if XTERM_CYRILLIC
+    if (ks >> 8 == 6) return cyrillic_cp(ks);
+#endif
+    return 0;
+}
+
+/* The bytes a typed key sends: characters (ASCII as-is, the rest
  * UTF-8-encoded), Ctrl-letter control codes and the few control keys.  Built
  * in a buffer, so that handle_keypress() can decide about an Alt ESC prefix
  * knowing whether the key sends anything at all (a bare modifier does not). */
@@ -443,11 +587,15 @@ static void key_bytes(KeyOut *o, uint32_t ks, int ctrl)
         if (up == ' ') { o->b[o->n++] = 0; return; }
     }
 
-    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xA0 && ks <= 0xFF)) {
-        if (ks <= 0x7F) {
+    if (ks >= 0x20 && ks < 0xFE00) {            /* a character: UTF-8 */
+        if (ks < 0x80) {
             o->b[o->n++] = (uint8_t)ks;
-        } else {
+        } else if (ks < 0x800) {
             o->b[o->n++] = (uint8_t)(0xC0 | (ks >> 6));
+            o->b[o->n++] = (uint8_t)(0x80 | (ks & 0x3F));
+        } else {
+            o->b[o->n++] = (uint8_t)(0xE0 | (ks >> 12));
+            o->b[o->n++] = (uint8_t)(0x80 | ((ks >> 6) & 0x3F));
             o->b[o->n++] = (uint8_t)(0x80 | (ks & 0x3F));
         }
         return;
@@ -472,15 +620,14 @@ static void key_bytes(KeyOut *o, uint32_t ks, int ctrl)
  *   - the Ctrl+font-size keys, which are the multiplexer's own;
  *   - cursor, editing and function keys (nav_code, kp_nav): their sequences,
  *     with xterm's modifier parameter when any modifier is held (push_nav);
- *   - typed keys (key_bytes): printable Latin-1 (ASCII as-is, 0xA0-0xFF
+ *   - typed keys (key_bytes): characters (ASCII as-is, the rest
  *     UTF-8-encoded, as everything downstream expects on the wire), Ctrl-
  *     letter control codes, and the few control keys.  An Alt ESC prefix
  *     goes only before a key that sends something.
  * Anything else is silently ignored.
  *
- * X11's Latin-1 keysyms (0x020-0x0FF) are numerically identical to their
- * Unicode code points, so ks doubles as the code point with no translation
- * table needed. */
+ * What keysym_of() returns is the table's 16-bit key code (see key_code): a
+ * character is its code point, any other key its keysym. */
 /* Paste shortcuts: Shift+Insert, and Ctrl+V with no other modifier (not
  * Shift, Alt, Super...: those reach the program, as plain Ctrl+V if
  * nothing else is bound to them).  They are not typed to the program; the
@@ -504,8 +651,9 @@ int xterm_paste_key(void)
 
 static void handle_keypress(const uint8_t *ev)
 {
-    uint8_t keycode = ev[1];
     uint16_t state; memcpy(&state, ev+28, 2);
+    /* The layout group is in bits 13-14 of the state. */
+    const uint16_t *row = keymap[ev[1]][(state >> 13) & (XTERM_GROUPS - 1)];
     int shift = (state & 0x0001) != 0;
     int ctrl  = (state & 0x0004) != 0;
     int alt   = (state & 0x0008) != 0;  /* Mod1: conventional "Alt" binding */
@@ -516,11 +664,16 @@ static void handle_keypress(const uint8_t *ev)
                                           * produced by e.g. xkb option
                                           * "lv3:ralt_switch" */
 
-    uint32_t ks = keysym_of(keycode, shift, altgr, numlock, capslock);
+    uint32_t ks = keysym_of(row, shift, altgr, numlock, capslock);
+    /* Control is about Latin letters: in a group of Cyrillic or Greek ones,
+     * Ctrl+<the key> is Ctrl+<the letter the first group has on it>, for the
+     * control codes and for the shortcuts below alike (Ctrl+V pastes). */
+    uint16_t latin = keymap[ev[1]][0][0];
+    if (ctrl && ks >= 0x80 && ks < 0xFE00 && latin > 0x20 && latin < 0x7F) ks = latin;
     /* Insert usually has nothing in its shifted column, so Shift+Insert has
      * to be recognized by the unshifted one. */
     int insert = ks == 0xFF63 ||
-                 (shift && keysym_for(keycode, altgr ? 2 : 0) == 0xFF63);
+                 (shift && row[altgr ? 2 : 0] == 0xFF63);
     if ((shift && !ctrl && !alt && insert) ||                              /* Shift+Insert */
         (XTERM_PASTE_CTRL_V && ctrl && !(state & 0xE9) &&   /* Ctrl+V, and of the other modifier bits */
          (ks == 'v' || ks == 'V'))) {                       /* only CapsLock/NumLock (0x02, 0x10) */
@@ -552,7 +705,7 @@ static void handle_keypress(const uint8_t *ev)
 
     /* A keypad key that types something sends just its character, whatever
      * the modifiers (xterm: Ctrl+KP_Divide is "/", not ^_). */
-    if (is_keypad(keysym_for(keycode, 0))) { ctrl = 0; alt = 0; }
+    if (is_keypad(row[0])) { ctrl = 0; alt = 0; }
 
     /* Meta-prefix: makes Alt+key reach the multiplexer's own shortcuts
      * (e.g. Alt+2 -> ESC '2' -> input.c's FSM_ESC -> CMD_SELECT_WINDOW)
@@ -1295,8 +1448,8 @@ int xterm_init(void)
     if (batch < 1) die("font cell is too large\n");
     min_keycode = d[26];
     max_keycode = d[27];
-    load_keyboard_mapping();
     xkb_init();
+    if (!xkb_major || !xkb_load_keymap()) load_keyboard_mapping();
     grid_init(screen_w, screen_h, screen_storage, sizeof screen_storage);
 
     xterm_win = new_xid(); xterm_gc = new_xid();
@@ -1538,9 +1691,6 @@ static void set_urgency(uint32_t flags)
     uint32_t h[9] = { flags };     /* WM_HINTS: flags, then nine CARD32 fields, rest 0 */
     change_property(xterm_win, 35, 35, 32, h, 9);   /* atoms WM_HINTS (35), type WM_HINTS */
 }
-
-/* XKEYBOARD major opcode, 0 if the server has no XKB or setup failed. */
-static uint8_t xkb_major;
 
 /* QueryExtension("XKEYBOARD") and XkbUseExtension 1.0, which the server
  * requires before any other XKB request. */
