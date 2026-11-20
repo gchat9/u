@@ -219,12 +219,26 @@ static void alt_swap(Screen *s)
     s->in_alt_screen = !s->in_alt_screen;
 }
 
-static void alt_enter(Screen *s)
+/* Returns 0, and stays on the primary screen, if there is no memory for the
+ * alternate one. */
+static int alt_enter(Screen *s)
 {
     if (!s->alt_cells)      s->alt_cells      = alloc_cells(s->rows, s->cols);
     if (!s->alt_row_flags)  s->alt_row_flags  = calloc((size_t)s->rows, 1);
+    if (!s->alt_cells || !s->alt_row_flags) return 0;
     alt_swap(s);
-    if (s->row_flags) memset(s->row_flags, 0, (size_t)s->rows);
+    memset(s->row_flags, 0, (size_t)s->rows);
+    return 1;
+}
+
+/* Free the grid in alt_cells (after alt_swap that is the alternate screen's,
+ * once it is left).  The flags stay: they are one byte a row. */
+static void alt_release(Screen *s)
+{
+    if (!s->alt_cells) return;
+    cells_dontneed(s->alt_cells, s->rows, s->cols);
+    free_cells(s->alt_cells, s->rows);
+    s->alt_cells = NULL;
 }
 
 static void scr_free(Screen *s)
@@ -908,31 +922,14 @@ static void dispatch_csi(VTParser *p, char final)
                 case 7:  s->auto_wrap   = true;  break;
                 case 12: /* blinking cursor – ignore */  break;
                 case 25: s->cur_visible = true;  break;
-                case 47: case 1047: /* alt screen (simple) */
+                case 47: case 1047: case 1049: /* alt screen (we do not tell them apart) */
                     if (!s->in_alt_screen) {
                         s->alt_saved_row   = s->cur_row;
                         s->alt_saved_col   = s->cur_col;
                         s->alt_saved_fg    = s->cur_fg;
                         s->alt_saved_bg    = s->cur_bg;
                         s->alt_saved_attrs = s->cur_attrs;
-                        alt_enter(s);
-                        /* Primary grid (now in alt_cells) is no longer hot;
-                         * let the kernel demote its pages in the LRU. */
-                        cells_cold(s->alt_cells, s->rows, s->cols);
-                        for (int r = 0; r < s->rows; r++)
-                            clear_row_range(s, s->cells[r], 0, s->cols - 1);
-                        s->cur_row = 0; s->cur_col = 0;
-                        s->scroll_top = 0; s->scroll_bottom = s->rows - 1;
-                    }
-                    break;
-                case 1049: /* alt screen + save/restore cursor */
-                    if (!s->in_alt_screen) {
-                        s->alt_saved_row   = s->cur_row;
-                        s->alt_saved_col   = s->cur_col;
-                        s->alt_saved_fg    = s->cur_fg;
-                        s->alt_saved_bg    = s->cur_bg;
-                        s->alt_saved_attrs = s->cur_attrs;
-                        alt_enter(s);
+                        if (!alt_enter(s)) break;
                         /* Primary grid (now in alt_cells) is no longer hot;
                          * let the kernel demote its pages in the LRU. */
                         cells_cold(s->alt_cells, s->rows, s->cols);
@@ -967,25 +964,13 @@ static void dispatch_csi(VTParser *p, char final)
                 case 7:  s->auto_wrap   = false; break;
                 case 12: break;
                 case 25: s->cur_visible = false; break;
-                case 47: case 1047:
+                case 47: case 1047: case 1049:
                     if (s->in_alt_screen) {
                         alt_swap(s);
-                        /* Alt grid (now in alt_cells) will be cold until
-                         * next alt-screen entry; hint the kernel. */
-                        cells_cold(s->alt_cells, s->rows, s->cols);
-                        s->cur_row  = s->alt_saved_row;
-                        s->cur_col  = s->alt_saved_col;
-                        s->cur_fg   = s->alt_saved_fg;
-                        s->cur_bg   = s->alt_saved_bg;
-                        s->cur_attrs = s->alt_saved_attrs;
-                    }
-                    break;
-                case 1049:
-                    if (s->in_alt_screen) {
-                        alt_swap(s);
-                        /* Alt grid (now in alt_cells) will be cold until
-                         * next alt-screen entry; hint the kernel. */
-                        cells_cold(s->alt_cells, s->rows, s->cols);
+                        /* The alt grid (now in alt_cells) is dead: the next
+                         * entry starts from a blank one, so give it back
+                         * rather than keep its pages resident. */
+                        alt_release(s);
                         s->cur_row  = s->alt_saved_row;
                         s->cur_col  = s->alt_saved_col;
                         s->cur_fg   = s->alt_saved_fg;

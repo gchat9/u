@@ -880,30 +880,37 @@ int xterm_emoji_index(uint32_t cp)
  * Terminal state
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* The per-cell planes -- glyph slot, fg, bg and attributes, a byte each --
+ * live in one anonymous mapping, sized for the grid in use (4 bytes a cell),
+ * so no memory is set aside for a grid larger than the window.  GRID_MAX_CELLS
+ * only bounds how large a grid may get. */
 static uint8_t *scr;
 static uint8_t *fgb, *bgb, *atb;
-static uint8_t fg_storage[GRID_MAX_CELLS];   /* xterm 256-colour index per cell */
-static uint8_t bg_storage[GRID_MAX_CELLS];
-static uint8_t attr_storage[GRID_MAX_CELLS]; /* XTERM_ATTR_* bitmask per cell    */
+static uint8_t *planes;
+static size_t   planes_len;
 
-static void grid_init(uint16_t screen_w, uint16_t screen_h,
-                      uint8_t *screen, size_t capacity)
+/* Make a grid of (screen_w / cell_w) x (screen_h / cell_h) cells the current
+ * one, with fresh planes: blank glyphs, default colours, no attributes.
+ * Returns 0, and changes nothing, if the grid has no cell or is too large for
+ * the limit, or the planes cannot be mapped. */
+static int grid_init(uint16_t screen_w, uint16_t screen_h)
 {
-    cols = screen_w / cell_w;
-    rows = screen_h / cell_h;
-    if (cols < 1 || rows < 1) {
-        die("screen is smaller than one font cell\n");
-    }
+    int c = screen_w / cell_w, r = screen_h / cell_h;
+    if (c < 1 || r < 1 || (size_t)c * r > GRID_MAX_CELLS) return 0;
+    size_t cells = (size_t)c * r;
+    uint8_t *m = mmap(0, 4 * cells, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return 0;
+    if (planes) munmap(planes, planes_len);
+    planes = m; planes_len = 4 * cells;
+    cols = c; rows = r;
     WIN_W = cols * cell_w;
     WIN_H = rows * cell_h;
-    size_t cells = (size_t)cols * rows;
-    if (cells > capacity) die("terminal grid is too large\n");
-    scr = screen;
-    memset(scr, 0, cells);
-    fgb = fg_storage; bgb = bg_storage; atb = attr_storage;
+    /* a fresh mapping is all zero: that is the blank glyph, bg slot 0 (which
+     * is XTERM_BG_DEFAULT) and no attributes; only the fg needs filling */
+    scr = m; bgb = m + cells; atb = m + 2 * cells; fgb = m + 3 * cells;
     memset(fgb, XTERM_FG_DEFAULT, cells);
-    memset(bgb, XTERM_BG_DEFAULT, cells);
-    memset(atb, 0,  cells);
+    return 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1151,7 +1158,6 @@ static void render_all(uint32_t draw, uint32_t gc, uint8_t depth)
 
 
 /* Library-owned state and backing storage. */
-static uint8_t screen_storage[GRID_MAX_CELLS];
 static uint32_t xterm_win, xterm_gc;
 
 /* Re-derive the grid from a window size in pixels.  Unlike the initial
@@ -1165,10 +1171,10 @@ static int regrid(int w, int h)
     if (w < cell_w) w = cell_w;
     if (h < cell_h) h = cell_h;
     int c = w / cell_w, r = h / cell_h;
-    if ((size_t)c * r > sizeof screen_storage) r = (int)(sizeof screen_storage) / c;
+    if ((size_t)c * r > GRID_MAX_CELLS) r = GRID_MAX_CELLS / c;
     if (c == cols && r == rows) return 0;
-    grid_init((uint16_t)(c * cell_w), (uint16_t)(r * cell_h),
-              screen_storage, sizeof screen_storage);
+    if (!grid_init((uint16_t)(c * cell_w), (uint16_t)(r * cell_h)))
+        return 0;                       /* out of memory: the old grid stays */
     synced = 0;
     return 1;
 }
@@ -1450,7 +1456,7 @@ int xterm_init(void)
     max_keycode = d[27];
     xkb_init();
     if (!xkb_major || !xkb_load_keymap()) load_keyboard_mapping();
-    grid_init(screen_w, screen_h, screen_storage, sizeof screen_storage);
+    if (!grid_init(screen_w, screen_h)) die("terminal grid is too large or too small\n");
 
     xterm_win = new_xid(); xterm_gc = new_xid();
     uint8_t r[40] = {0};

@@ -9,8 +9,14 @@
 # from ../tmux into its own directory, so each build's objects stay apart.
 
 CC      := diet gcc
-CFLAGS  = -Wall -Wextra -Wno-unused-result -g -O2 -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
-LDFLAGS = -lutil -static
+# Size is the point of this project, so -Os (xterm.c's draw_glyph opts back in to
+# -O2 for itself), one section per function and datum for --gc-sections, and no
+# stack protector or unwind tables: nothing here unwinds, and .eh_frame alone was
+# 7K of the binary.
+CFLAGS  = -Wall -Wextra -Wno-unused-result -g -Os -ffunction-sections -fdata-sections \
+          -fno-stack-protector -fno-asynchronous-unwind-tables \
+          -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
+LDFLAGS = -lutil -static -Wl,--gc-sections
 
 SRCS ?= main.c pty.c vt.c render.c input.c status.c session.c
 

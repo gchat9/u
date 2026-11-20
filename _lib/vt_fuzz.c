@@ -104,11 +104,35 @@ static int bell(void) {
     return 0;
 }
 
+/* The alternate screen: what is on the primary screen comes back after each
+ * visit, the alt screen starts blank every time, and its grid is given back on
+ * leaving (alt_cells NULL), also across a resize while in it. */
+static int alt(void) {
+    VTParser *p = calloc(1, sizeof *p);
+    vt_init(p, 4, 20);
+    const char *a = "P\x1b[?1049hAAA\x1b[?1049l";
+    int freed = 0, blank = 1;
+    vt_feed(p, (const uint8_t *)a, strlen(a));
+    freed += p->scr.alt_cells == NULL;
+    const char *b = "\x1b[?1049h";
+    vt_feed(p, (const uint8_t *)b, strlen(b));
+    blank = p->scr.cells[0][0].ch == ' ' && p->scr.in_alt_screen;
+    vt_resize(p, 6, 30);
+    const char *c = "Z\x1b[?1049lQ";
+    vt_feed(p, (const uint8_t *)c, strlen(c));
+    freed += p->scr.alt_cells == NULL;
+    printf("alt: primary %c%c blank %d freed %d in_alt %d\n", p->scr.cells[0][0].ch,
+           p->scr.cells[0][1].ch, blank, freed, (int)p->scr.in_alt_screen);
+    vt_free(p); free(p);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "repro")) return repro();
     if (argc == 2 && !strcmp(argv[1], "dec")) return dec();
     if (argc == 2 && !strcmp(argv[1], "bell")) return bell();
+    if (argc == 2 && !strcmp(argv[1], "alt")) return alt();
     if (argc == 3) return fuzz((unsigned)atoi(argv[1]), atol(argv[2]));
-    fprintf(stderr, "usage: vt_fuzz repro | dec | bell | vt_fuzz SEED ITERATIONS\n");
+    fprintf(stderr, "usage: vt_fuzz repro | dec | bell | alt | vt_fuzz SEED ITERATIONS\n");
     return 2;
 }
