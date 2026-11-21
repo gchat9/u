@@ -22,10 +22,10 @@
 #   make distclean   clean, plus the downloaded stb_*.h and generated *.bfnt
 #
 # The glyphs of the keyboard options of _lib/xterm_conf.h (Greek, Latin-2 and
-# Cyrillic letters) are in the fonts if they are asked for here, as for the
-# programs: make XTERM_GREEK=1 XTERM_LATIN2=1 XTERM_CYRILLIC=1.  (Programs built
-# without them still show the characters, but a window that has some costs more
-# memory; see charset.h.)  Changing them rebuilds the fonts.
+# Cyrillic letters) are in the fonts if they are set there, as for the programs:
+# edit that file, then make here.  (Programs built without them still show the
+# characters, but a window that has some costs more memory; see charset.h.)
+# Changing xterm_conf.h rebuilds the fonts.
 #
 # Inputs from outside the repo: a monospace TTF (TTF=..., default DejaVu
 # Sans Mono; Debian/Ubuntu: fonts-dejavu-core), a TTF/TTC for the
@@ -45,9 +45,6 @@ STB_REF ?= 2c980bb59875b0d32144a71867fbdebb2f77cd20
 STB_URL  = https://raw.githubusercontent.com/nothings/stb/$(STB_REF)
 STB     := stb_image.h stb_truetype.h
 
-# the options given on the command line, as -D flags for mkfont
-OPTINS := $(foreach o,XTERM_GREEK XTERM_LATIN2 XTERM_CYRILLIC,$(if $($(o)),-D$(o)=$($(o))))
-
 SIZES  := 0 1 2 3 4 5 6 7           # keep equal to FONT_SIZES in mkfont.c and xterm.c
 FONTS  := $(SIZES:%=font%.bfnt)
 
@@ -61,12 +58,8 @@ font%.bfnt: mkfont mkemoji $(TTF) $(WTTF) $(wildcard emoji_src/*.png)
 	./mkemoji $@.base $@
 	rm -f $@.base
 
-# .optins holds the options mkfont was built with, and changes only when they do
-.optins: FORCE
-	@echo '$(OPTINS)' | cmp -s - $@ || echo '$(OPTINS)' > $@
-
-mkfont: mkfont.c charset.h ../_lib/xterm_conf.h stb_truetype.h .optins
-	$(HOSTCC) $(CFLAGS) $(OPTINS) -o $@ mkfont.c -lm
+mkfont: mkfont.c charset.h ../_lib/xterm_conf.h stb_truetype.h
+	$(HOSTCC) $(CFLAGS) -o $@ mkfont.c -lm
 
 mkemoji: mkemoji.c emoji_charset.h ../_lib/width.h stb_image.h
 	$(HOSTCC) $(CFLAGS) -o $@ mkemoji.c -lm
@@ -91,7 +84,7 @@ check:
 	python3 check_charset.py
 
 clean:
-	rm -f mkfont mkemoji .optins
+	rm -f mkfont mkemoji
 
 distclean: clean
 	rm -f $(STB) *.bfnt *.base
@@ -99,5 +92,4 @@ distclean: clean
 # A failed or interrupted curl must not leave a truncated stb_*.h behind
 # for the next run to treat as a valid cached copy.
 .DELETE_ON_ERROR:
-.PHONY: all install check clean distclean FORCE
-FORCE:
+.PHONY: all install check clean distclean

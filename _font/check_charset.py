@@ -3,8 +3,10 @@
 # options XTERM_GREEK, XTERM_LATIN2 and XTERM_CYRILLIC, every character that a
 # key can type with it (the keysym tables of xterm.c) is a glyph of the font made
 # with it, and nothing is there twice; and that the font without options is what it
-# was (the slots of the base set do not move).  Run as:  python3 _font/check_charset.py
-import os, re, subprocess, sys, tempfile
+# was (the slots of the base set do not move).  Finally it checks the options as
+# _lib/xterm_conf.h has them, which are the ones the fonts and the programs get.
+# Run as:  python3 _font/check_charset.py   (make -C _font check)
+import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 src = open(os.path.join(HERE, "..", "_lib", "xterm.c")).read()
 
@@ -34,19 +36,38 @@ typed = {
 for v in typed.values(): v.discard(0)
 
 def glyphs(opts):
+    """The codepoints of the narrow glyphs of charset.h with exactly the options opts on
+    (None: with the options as _lib/xterm_conf.h has them, which is what the fonts get).
+    xterm_conf.h has no -D overrides, so a copy of the tree's two headers is edited."""
     c = r'''#include "charset.h"
 #include <stdio.h>
 int main(void){ for (int i = 0; i < CHARSET_COUNT; i++) printf("%x\n", charset_codepoint(i)); return 0; }'''
     with tempfile.TemporaryDirectory() as d:
-        open(d + "/c.c", "w").write(c)
-        subprocess.run(["cc", "-I" + HERE, "-o", d + "/c", d + "/c.c"] + ["-D%s=1" % o for o in opts], check=True)
+        os.mkdir(d + "/_font"); os.mkdir(d + "/_lib")
+        shutil.copy(HERE + "/charset.h", d + "/_font")
+        conf = open(HERE + "/../_lib/xterm_conf.h").read()
+        if opts is not None:
+            for o in typed:
+                conf, n = re.subn(r"(?m)^#define %s \d+" % o, "#define %s %d" % (o, o in opts), conf)
+                assert n == 1, o
+        open(d + "/_lib/xterm_conf.h", "w").write(conf)
+        open(d + "/_font/c.c", "w").write(c)
+        subprocess.run(["cc", "-o", d + "/c", d + "/_font/c.c"], check=True)
         return [int(x, 16) for x in subprocess.run([d + "/c"], capture_output=True, text=True, check=True).stdout.split()]
+
+def configured():
+    """The language options that xterm_conf.h turns on."""
+    conf = open(HERE + "/../_lib/xterm_conf.h").read()
+    return [o for o in typed if re.search(r"(?m)^#define %s [1-9]" % o, conf)]
 
 bad = 0
 base = glyphs([])
-for opts in ([], *[[o] for o in typed], list(typed)):
+conf_opts = configured()
+for opts in ([], *[[o] for o in typed], list(typed), None):
     g = glyphs(opts)
+    if opts is None: opts = conf_opts    # the file as it is: what the fonts and the programs get
     name = "+".join(o[6:] for o in opts) or "base"
+    if opts is conf_opts: name = "xterm_conf.h: " + (name if opts else "none")
     problems = []
     if len(set(g)) != len(g): problems.append("duplicate codepoints")
     if len(g) > 511: problems.append("%d glyphs: more than 511" % len(g))

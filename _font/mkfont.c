@@ -17,8 +17,8 @@
  * The font holds up to 511 narrow glyphs (slots 0..510), 256 wide ones and 255
  * colour emoji; what xterm.c accepts (font_valid) and vt.c's small cells can
  * number (see charset.h).  Which glyphs there are depends on the options of
- * xterm_conf.h (XTERM_GREEK, XTERM_LATIN2, XTERM_CYRILLIC): pass them as -D on
- * the command line, or to the Makefile here as make XTERM_GREEK=1 ...
+ * xterm_conf.h (XTERM_GREEK, XTERM_LATIN2, XTERM_CYRILLIC), which the programs
+ * read too: set them there.
  *
  * font<STEP>.bfnt layout, all little-endian:
  *   "BFN3", cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji

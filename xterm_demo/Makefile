@@ -4,5 +4,5 @@ EXTRA_OBJS := xterm.o
 DEPS := ../_lib/xterm.h
 include ../_mk/common.mk
 
-xterm.o: ../_lib/xterm.c ../_lib/xterm.h
+xterm.o: ../_lib/xterm.c ../_lib/xterm.h ../_lib/xterm_conf.h
 	$(CC) $(CFLAGS) -DXTERM_LIB_ONLY -c -o $@ ../_lib/xterm.c

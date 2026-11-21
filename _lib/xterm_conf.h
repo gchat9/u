@@ -2,9 +2,13 @@
  * xterm_conf.h — compile-time options of the xterm layer: the VT parser
  * (vt.c), and the screen, mouse and clipboard handling that sits between
  * it and the X11 window (xterm.c).  Shared by everything built on them
- * (xtmux, xterm_demo, ...); every option is #ifndef-guarded, so it can be
- * overridden with -D on the compiler command line.  (tmux's own options
- * are in tmux/config.h.)
+ * (xtmux, xterm_demo, ..., and the font generator _font/mkfont.c).  (tmux's
+ * own options are in tmux/config.h.)
+ *
+ * This is the one place to configure them: edit the values below, and see
+ * what is not default with "git diff".  After a change run make (the
+ * programs) and, if it is a keyboard language, make -C _font install (the
+ * fonts, which take the glyphs of the languages from here too).
  */
 #pragma once
 
@@ -29,9 +33,7 @@
  * instead -- unless this modifier is held, which keeps the mouse for
  * copy and paste: 4 Shift, 8 Alt, 16 Control (add them to need several);
  * 0 leaves the mouse to the program for good. */
-#ifndef MOUSE_SELECT_MOD
 #define MOUSE_SELECT_MOD 4
-#endif
 
 /* ================================================================== */
 /* Font size                                                            */
@@ -43,16 +45,12 @@
  * and the other shifted forms reach the program.  Like the paste keys, these
  * keys are not typed to the program.  Define this to 0 to leave them to it; the
  * size is then the start size alone. */
-#ifndef XTERM_FONT_KEYS
 #define XTERM_FONT_KEYS 1
-#endif
 
 /* At start, the font size is the one whose grid is nearest this many lines on
  * the screen (by the screen's pixel height).  Which size that is depends on the
  * screen, as the sizes are fixed steps, so the line count is only close. */
-#ifndef XTERM_START_LINES
 #define XTERM_START_LINES 25
-#endif
 
 /* ================================================================== */
 /* Scrollback                                                           */
@@ -63,18 +61,14 @@
  * inject them into the parent terminal's own scrollback on window switch.
  * Set to 0 to disable entirely (saves SCROLLBACK_BYTES per window).
  */
-#ifndef SCROLLBACK_ENABLED
 #define SCROLLBACK_ENABLED  1
-#endif
 
 /*
  * Size of the per-window scrollback buffer in bytes.
  * Lines are stored as plain UTF-8 with trailing whitespace stripped and
  * a newline appended.  When the buffer is full the oldest line is dropped.
  */
-#ifndef SCROLLBACK_BYTES
 #define SCROLLBACK_BYTES    32768
-#endif
 
 /* ================================================================== */
 /* Cell grids                                                           */
@@ -104,9 +98,7 @@
  * small format, for about 3K of code.  Set to 0 to always use the full-size
  * cells.
  */
-#ifndef VT_CELL_COMPACT
 #define VT_CELL_COMPACT     1
-#endif
 
 /* ================================================================== */
 /* Keyboard (xterm.c)                                                   */
@@ -114,11 +106,9 @@
 
 /* CapsLock shifts letters, as on a real keyboard (and as xterm and st do).  Off
  * by default: the lock state is then ignored and none of the code for it is
- * compiled in, so the default build is no bigger for it.  -DXTERM_CAPSLOCK=1
- * turns it on (about 90 bytes). */
-#ifndef XTERM_CAPSLOCK
+ * compiled in, so the default build is no bigger for it.  1 turns it on (about
+ * 90 bytes). */
 #define XTERM_CAPSLOCK 0
-#endif
 
 /* NumLock and the keypad, as xterm has them: with NumLock on and no Shift, the
  * keypad types its digits, operators and Return; otherwise it is the editing
@@ -126,43 +116,34 @@
  * editing key with a modifier (Shift+KP_1 is ESC [ 1 ; 2 F).  Off by default: a
  * keypad key then always types what it types with NumLock on and no modifier
  * (KP_1 is "1", KP_Home is "7"), and no NumLock or keypad-editing code is compiled
- * in.  -DXTERM_NUMLOCK=1 turns the full behaviour on (about 300 bytes). */
-#ifndef XTERM_NUMLOCK
+ * in.  1 turns the full behaviour on (about 300 bytes). */
 #define XTERM_NUMLOCK 0
-#endif
 
 /* Keyboard layout groups held: the layouts of "setxkbmap -layout us,gr" (each
  * takes 2 KB).  1, 2 or 4.  A key from a group beyond these is typed from the
  * group its number wraps to. */
-#ifndef XTERM_GROUPS
 #define XTERM_GROUPS 2
-#endif
 
 /* The next three options each add a script: the keys that type it (here) and
  * its glyphs (_font/charset.h, 49 to 95 of the font's 511 narrow slots, and in
- * the programs' small cells, see VT_CELL_COMPACT).  Give the same options to
- * the fonts as to the programs: make -C _font install XTERM_GREEK=1 ...
- * (_font/check_charset.py checks that every key has its glyph).  A program
- * without an option still shows what it is sent from a font with the glyphs,
- * but a window that has such characters on it costs full-size cells. */
+ * the programs' small cells, see VT_CELL_COMPACT).  The fonts read these too,
+ * so build both after a change.  _font/check_charset.py checks that every key
+ * has its glyph.  A program without an option still shows what it is sent from
+ * a font with the glyphs, but a window that has such characters on it costs
+ * full-size cells. */
 
 /* The unaccented Greek letters, for the gr layout.  Off by default: the code
- * for them is only compiled in with -DXTERM_GREEK=1 (about 100 bytes). */
-#ifndef XTERM_GREEK
+ * for them is only compiled in when this is 1 (about 100 bytes). */
 #define XTERM_GREEK 0
-#endif
 
 /* Latin-2 letters (Polish, Czech, Slovak, Hungarian, Romanian, Croatian, ...)
- * and the Turkish letters of Latin-3 (the glyphs also have the Latin-1 letters
- * that those languages need, and the Romanian comma-below ones).  Off by default: the table and its
- * lookup are only compiled in with -DXTERM_LATIN2=1 (about 150 bytes). */
-#ifndef XTERM_LATIN2
+ * and the Turkish letters of Latin-3 (the glyphs also have the Romanian
+ * comma-below ones; the Latin-1 letters are in every font).  Off by default:
+ * the table and its lookup are only compiled in when this is 1 (about 150
+ * bytes). */
 #define XTERM_LATIN2 0
-#endif
 
 /* Cyrillic letters (Russian, Ukrainian, Bulgarian, Serbian, ...).  Off by
- * default: the table and its lookup are only compiled in with
- * -DXTERM_CYRILLIC=1 (about 150 bytes). */
-#ifndef XTERM_CYRILLIC
+ * default: the table and its lookup are only compiled in when this is 1 (about
+ * 150 bytes). */
 #define XTERM_CYRILLIC 0
-#endif

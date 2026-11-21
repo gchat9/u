@@ -34,9 +34,9 @@
  *     (check marks, em dash) and the horizontal ellipsis;
  *   - what command-line programs print besides (typographic quotes, bullets,
  *     arrows, triangles, circles, crosses and the minus sign);
- *   - and then, each only if its option is set (xterm_conf.h; for the fonts:
- *     make -C _font XTERM_GREEK=1 ..., and the same -D for the programs, which
- *     is what makes the keyboard layouts of those options useful):
+ *   - and then, each only if its option is set in xterm_conf.h (the fonts and
+ *     the programs both read it; that is what makes the keyboard layouts of
+ *     those options work):
  *       XTERM_GREEK     the unaccented Greek letters (49)
  *       XTERM_LATIN2    the letters of Latin-2 and the Turkish and Romanian
  *                       ones (65; the Latin-1 letters of those languages
