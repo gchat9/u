@@ -83,10 +83,11 @@
  * cleared or resized and everything fits again.
  *
  * A small cell is a glyph number (9 bits) and a style number (7 bits).  The
- * glyph numbers are those of _font/charset.h: ASCII, then the characters the
- * font has besides it, 511 glyphs at most.  The glyph number 511 stands for a
- * double-width character: the cell after it holds all 16 bits of the glyph's
- * index among the double-width glyphs (256) and the emoji (255).  The styles are the
+ * glyph numbers are those of _font/charset.h: ASCII and Latin-1, then the
+ * characters the font has besides them, 511 glyphs at most.  The glyph number
+ * 511 stands for a double-width character: the cell after it holds all 16 bits
+ * of the glyph's index among the double-width glyphs (256) and the emoji (255).
+ * The styles are the
  * fg/bg/attribute combinations on the grid, up to 128 of them: the programs we
  * know use a dozen or two, and the ones that are no longer on the screen are
  * dropped when the table fills up.  A character the font does not have (it is
@@ -147,3 +148,8 @@
  * default: the table and its lookup are only compiled in when this is 1 (about
  * 150 bytes). */
 #define XTERM_CYRILLIC 0
+
+/* The three options as bits.  The font records in its header which of them it
+ * has the glyphs for (mkfont.c), and a program refuses a font that lacks one of
+ * its own (xterm_init). */
+#define XTERM_LANGS (!!XTERM_GREEK | !!XTERM_LATIN2 << 1 | !!XTERM_CYRILLIC << 2)

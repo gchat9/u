@@ -2,9 +2,11 @@
 # Checks charset.h against the keyboard tables of _lib/xterm.c: for each of the
 # options XTERM_GREEK, XTERM_LATIN2 and XTERM_CYRILLIC, every character that a
 # key can type with it (the keysym tables of xterm.c) is a glyph of the font made
-# with it, and nothing is there twice; and that the font without options is what it
-# was (the slots of the base set do not move).  Finally it checks the options as
-# _lib/xterm_conf.h has them, which are the ones the fonts and the programs get.
+# with it, and nothing is there twice; that the font without options is what it
+# was (the slots of the base set do not move), and that its first slots are the
+# ASCII range and the Latin-1 range, which have no table (xterm.c, vt.c).
+# Finally it checks the options as _lib/xterm_conf.h has them, which are the ones
+# the fonts and the programs get.
 # Run as:  python3 _font/check_charset.py   (make -C _font check)
 import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +62,8 @@ def configured():
     conf = open(HERE + "/../_lib/xterm_conf.h").read()
     return [o for o in typed if re.search(r"(?m)^#define %s [1-9]" % o, conf)]
 
+implicit = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))   # slots 0..190, no table
+
 bad = 0
 base = glyphs([])
 conf_opts = configured()
@@ -72,6 +76,7 @@ for opts in ([], *[[o] for o in typed], list(typed), None):
     if len(set(g)) != len(g): problems.append("duplicate codepoints")
     if len(g) > 511: problems.append("%d glyphs: more than 511" % len(g))
     if g[:len(base)] != base: problems.append("the base slots moved")
+    if g[:len(implicit)] != implicit: problems.append("the first slots are not U+0020..U+007E, U+00A0..U+00FF")
     for o in opts:
         missing = sorted(typed[o] - set(g))
         if missing: problems.append("%s: no glyph for %s" % (o, " ".join("U+%04X" % c for c in missing)))

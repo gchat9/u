@@ -21,11 +21,14 @@
  * read too: set them there.
  *
  * font<STEP>.bfnt layout, all little-endian:
- *   "BFN3", cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji
- *                                                        (16 bytes)
- *   codepoints of narrow glyphs CHARSET_ASCII_COUNT..num_glyphs-1: u32 each
- *                (the glyphs before those are U+0020..U+007E in order: the
- *                 ASCII range has no table, see charset.h)
+ *   "BFN4", cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji,
+ *   languages                                            (18 bytes)
+ *                (languages: XTERM_LANGS of xterm_conf.h, the bits of the
+ *                 keyboard languages that the glyphs here include)
+ *   codepoints of narrow glyphs CHARSET_EXTRA_BASE..num_glyphs-1: u32 each
+ *                (the glyphs before those are U+0020..U+007E, then U+00A0..
+ *                 U+00FF, in order: those two ranges have no table, see
+ *                 charset.h)
  *   codepoints of the wide glyphs: num_wide x u32
  *   num_glyphs   narrow glyphs, cell_w x cell_h bytes of alpha each
  *   num_wide     wide glyphs, (2*cell_w) x cell_h bytes of alpha each
@@ -164,16 +167,17 @@ int main(int argc, char **argv)
     FILE *out = fopen(out_path, "wb");
     if (!out) { perror(out_path); return 1; }
 
-    fwrite("BFN3", 1, 4, out);
+    fwrite("BFN4", 1, 4, out);
     w16(out, cell_w);
     w16(out, cell_h);
     w16(out, baseline);
     w16(out, NUM_GLYPHS);
     w16(out, NUM_WIDE);
     w16(out, 0);              /* num_emoji: mkemoji fills it in and appends them */
+    w16(out, XTERM_LANGS);    /* the languages the glyphs above include */
 
     /* ── codepoint tables (see the layout above) ───────────────────── */
-    for (int slot = CHARSET_ASCII_COUNT; slot < NUM_GLYPHS; slot++)
+    for (int slot = CHARSET_EXTRA_BASE; slot < NUM_GLYPHS; slot++)
         w32(out, charset_codepoint(slot));
     for (int slot = 0; slot < NUM_WIDE; slot++)
         w32(out, charset_wide_codepoint(slot));
@@ -181,8 +185,8 @@ int main(int argc, char **argv)
     /* ── render glyphs ────────────────────────────────────────────── */
     /*
      * For each glyph slot (0..NUM_GLYPHS-1) we look up which Unicode
-     * codepoint it holds (see charset.h -- ASCII, then accented
-     * letters, then box-drawing/block/arrow extras) and produce a
+     * codepoint it holds (see charset.h -- ASCII, then Latin-1, then
+     * box-drawing/block/arrow extras) and produce a
      * cell_w × cell_h alpha bitmap for it. A slot with a codepoint of
      * 0 stays all-zero. We use "max" blending so glyphs
      * that overflow their cell edge don't just get clipped — the
@@ -228,7 +232,7 @@ int main(int argc, char **argv)
 
     free(wcell); free(wttf); free(ttf); fclose(out);
 
-    unsigned total = 16 + 4 * (NUM_GLYPHS - CHARSET_ASCII_COUNT) + 4 * NUM_WIDE
+    unsigned total = 18 + 4 * (NUM_GLYPHS - CHARSET_EXTRA_BASE) + 4 * NUM_WIDE
                    + NUM_GLYPHS * cell_w * cell_h + NUM_WIDE * ww * cell_h;
     fprintf(stderr, "wrote %s  (%d narrow + %d wide glyphs, %u bytes)\n",
             out_path, NUM_GLYPHS, NUM_WIDE, total);

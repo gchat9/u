@@ -3,12 +3,12 @@
  *
  *   - Pure libc, zero X11 libraries
  *   - Raw X11 wire protocol over Unix socket
- *   - BFN3 bitmap font, one file per size: the glyphs and the colour emoji,
+ *   - BFN4 bitmap font, one file per size: the glyphs and the colour emoji,
  *     with the codepoint of each in the file (produced by _font/)
  *   - File-backed font mapping; protocol buffers supplied by main's stack frame
  *   - One PutImage per tile of cells (no full-screen framebuffer)
  *
- * The font is loaded from /etc/bfnt/font2 (see BFN3 font).  xterm_init() creates the
+ * The font is loaded from /etc/bfnt/font2 (see BFN4 font).  xterm_init() creates the
  * surface; callers update xterm_framebuffer() and call xterm_render().
  *
  * Assumes: little-endian host; supports 16-bit RGB565 and 32-bpp TrueColor.
@@ -727,7 +727,7 @@ static void handle_keypress(const uint8_t *ev)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * BFN3 font
+ * BFN4 font
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define GRID_MAX_CELLS (32 * 1024)
@@ -743,15 +743,18 @@ static void handle_keypress(const uint8_t *ev)
 #define FONT_SIZES     8
 #define BASE_SIZE      2
 #define BFNT_DIR       "/etc/bfnt/"
-#define FONT_HDR       16     /* bytes before the tables: magic, cell, counts */
-/* Narrow glyph slots 0..ASCII_N-1 are U+0020..U+007E in every font (see
- * _font/charset.h): a character in that range needs no table lookup. */
-#define ASCII_N        95
+#define FONT_HDR       18     /* bytes before the tables: magic, cell, counts, languages */
+/* Narrow glyph slots 0..FIXED_N-1 are U+0020..U+007E (slots 0..94) and
+ * U+00A0..U+00FF (slots 95..190) in every font (see _font/charset.h): a
+ * character in those ranges needs no table lookup. */
+#define LATIN1_SLOT    95
+#define FIXED_N        (LATIN1_SLOT + 96)
 
 static uint8_t  *font_data;     /* the font in use, mapped; NULL until one is loaded */
 static size_t    font_len;
 static uint16_t  cell_w, cell_h, baseline, num_glyphs, num_wide, num_emoji;
-static const uint8_t *ncp_tab;  /* codepoints (u32) of the narrow glyphs past ASCII */
+static uint16_t  font_langs;    /* the XTERM_LANGS bits the font has glyphs for */
+static const uint8_t *ncp_tab;  /* codepoints (u32) of the narrow glyphs past ASCII and Latin-1 */
 static const uint8_t *wcp_tab;  /* codepoints (u32) of the wide glyphs */
 static const uint8_t *emoji_cps;   /* codepoints (u32) of the emoji */
 static const uint8_t *glyph_data;
@@ -768,7 +771,7 @@ static char      font_path[]  = BFNT_DIR "font2";     /* the digit is the size: 
 #define SEEK_END 2
 #endif
 
-/* A 16-bit and a 32-bit little-endian field of a BFN3 file. */
+/* A 16-bit and a 32-bit little-endian field of a BFN4 file. */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)rd16(p) | (uint32_t)rd16(p+2) << 16; }
 
@@ -793,21 +796,22 @@ static uint8_t *map_file(const char *path, size_t *len)
  * use, so nothing is read past the mapping. */
 static int font_valid(const uint8_t *m, size_t n)
 {
-    if (n < FONT_HDR || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != '3')
+    if (n < FONT_HDR || m[0] != 'B' || m[1] != 'F' || m[2] != 'N' || m[3] != '4')
         return 0;
     size_t w = rd16(m+4), h = rd16(m+6);
     size_t ng = rd16(m+10), nw = rd16(m+12), ne = rd16(m+14);
     if (w == 0 || h == 0) return 0;
-    /* ASCII, then the table's narrow glyphs, up to the 511 slots (0..510) that
-     * 9 bits name besides vt.c's wide-character mark; the wide ones within the
-     * 256 a byte names; the emoji too (255 is the "none" index) */
-    if (ng < ASCII_N || ng > 511 || nw > 256 || ne > 255) return 0;
+    /* ASCII and Latin-1, then the table's narrow glyphs, up to the 511 slots
+     * (0..510) that 9 bits name besides vt.c's wide-character mark; the wide
+     * ones within the 256 a byte names; the emoji too (255 is the "none"
+     * index) */
+    if (ng < FIXED_N || ng > 511 || nw > 256 || ne > 255) return 0;
     /* the bitmaps: (n-FONT_HDR) / h / w is the number of cells the file has
      * room for, with no overflow -- checked before anything multiplies */
     if ((n - FONT_HDR) / h / w < ng + 2 * nw) return 0;
     /* the codepoint tables of the narrow and wide glyphs, 4 bytes each */
-    if (4 * (ng - ASCII_N + nw) > n - FONT_HDR - w * h * (ng + 2 * nw)) return 0;
-    size_t rest = n - FONT_HDR - w * h * (ng + 2 * nw) - 4 * (ng - ASCII_N + nw);
+    if (4 * (ng - FIXED_N + nw) > n - FONT_HDR - w * h * (ng + 2 * nw)) return 0;
+    size_t rest = n - FONT_HDR - w * h * (ng + 2 * nw) - 4 * (ng - FIXED_N + nw);
     /* the emoji: a codepoint (4 bytes) and a record of 45 bytes of palette and
      * the w*h bytes of 4bpp pixels (two cells wide) each */
     if (ne > rest / (49 + w * h)) return 0;
@@ -835,8 +839,9 @@ static void font_commit(uint8_t *m, size_t len)
     font_data = m; font_len = len;
     cell_w = rd16(m+4); cell_h = rd16(m+6); baseline = rd16(m+8);
     num_glyphs = rd16(m+10); num_wide = rd16(m+12); num_emoji = rd16(m+14);
+    font_langs = rd16(m+16);
     ncp_tab    = m + FONT_HDR;
-    wcp_tab    = ncp_tab + 4 * (size_t)(num_glyphs - ASCII_N);
+    wcp_tab    = ncp_tab + 4 * (size_t)(num_glyphs - FIXED_N);
     glyph_data = wcp_tab + 4 * (size_t)num_wide;
     wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
     emoji_cps  = wide_data + (size_t)cell_w * 2 * cell_h * num_wide;
@@ -852,8 +857,9 @@ int xterm_glyph_slot(uint32_t cp)
 {
     if (!font_data) return -1;
     if (cp >= 0x20 && cp <= 0x7E) return (int)(cp - 0x20);
-    for (int i = 0; i < num_glyphs - ASCII_N; i++)
-        if (rd32(ncp_tab + 4 * (size_t)i) == cp) return ASCII_N + i;
+    if (cp >= 0xA0 && cp <= 0xFF) return LATIN1_SLOT + (int)(cp - 0xA0);
+    for (int i = 0; i < num_glyphs - FIXED_N; i++)
+        if (rd32(ncp_tab + 4 * (size_t)i) == cp) return FIXED_N + i;
     return -1;
 }
 
@@ -1390,8 +1396,14 @@ int xterm_init(void)
     build_palette();
     size_t flen;
     uint8_t *fm = font_open(font_path, &flen);
-    if (!fm) die("could not load a BFN3 font: /etc/bfnt/font2 (make -C _font install)\n");
+    if (!fm) die("could not load a BFN4 font: /etc/bfnt/font2 (make -C _font install)\n");
     font_commit(fm, flen);
+    /* A keyboard language this program has (xterm_conf.h) needs its glyphs in
+     * the font: without them its characters would come out as boxes, so refuse.
+     * A font with more languages than the program is fine. */
+    if (XTERM_LANGS & ~(unsigned)font_langs)
+        die("the font in /etc/bfnt lacks the glyphs of a keyboard language in xterm_conf.h:\n"
+            "make -C _font install (after making the fonts with the same xterm_conf.h)\n");
 
     /* Close-on-exec (SOCK_CLOEXEC has O_CLOEXEC's value): the shells and
      * programs we start must not inherit the connection.  They would keep

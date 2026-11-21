@@ -17,16 +17,15 @@
  * and put in this file what programs actually print (the glyphs are cheap, a
  * window that goes full-size is not).
  *
- * The narrow glyphs are slots 0..CHARSET_COUNT-1 of the font: the printable
- * ASCII, U+0020..U+007E, in slots 0..94 (the ASCII range below, a plain
- * offset and no table: the programs rely on this), then the codepoints of
- * charset_extra[], in order, in slots 95 on.  A font holds up to 511 narrow
- * glyphs, slots 0..510: slot 511 is not one (see vt.c, which uses it to mark a
- * double-width character in its small cells).  The table holds, in order:
+ * The narrow glyphs are slots 0..CHARSET_COUNT-1 of the font.  The first two
+ * ranges have no table, a plain offset (the programs rely on this): the
+ * printable ASCII, U+0020..U+007E, in slots 0..94, and all of Latin-1,
+ * U+00A0..U+00FF (the no-break space to ÿ), in slots 95..190.  U+0080..U+009F
+ * are controls and have no glyph.  Then come the codepoints of charset_extra[],
+ * in order, in slots 191 on.  A font holds up to 511 narrow glyphs, slots
+ * 0..510: slot 511 is not one (see vt.c, which uses it to mark a double-width
+ * character in its small cells).  The table holds, in order:
  *
- *   - all of Latin-1, U+00A0..U+00FF (96 glyphs, the no-break space to ÿ:
- *     the accented letters, the sharp s, Æ/æ, and the signs). U+0080..U+009F
- *     are controls and have no glyph;
  *   - the ligatures Œ/œ (U+0152/0153), which are not Latin-1;
  *   - light and double box-drawing (what dialog/whiptail/ncurses TUIs
  *     actually draw), square corners only;
@@ -76,30 +75,26 @@
 #define CHARSET_ASCII_HI     0x7E
 #define CHARSET_ASCII_COUNT  (CHARSET_ASCII_HI - CHARSET_ASCII_LO + 1)     /* 95 */
 
-#define CHARSET_EXTRA_BASE   (CHARSET_ASCII_BASE + CHARSET_ASCII_COUNT)    /* 95 */
-#define CHARSET_EXTRA_MAX    (511 - CHARSET_EXTRA_BASE)                    /* 416 */
+#define CHARSET_LATIN1_BASE  (CHARSET_ASCII_BASE + CHARSET_ASCII_COUNT)   /* 95 */
+#define CHARSET_LATIN1_LO    0xA0
+#define CHARSET_LATIN1_HI    0xFF
+#define CHARSET_LATIN1_COUNT (CHARSET_LATIN1_HI - CHARSET_LATIN1_LO + 1)  /* 96 */
 
-/* xterm_glyph_slot() in _lib/xterm.c relies on the ASCII range being exactly
- * slots 0..94, U+0020..U+007E; this keeps that true if anyone edits it. */
+#define CHARSET_EXTRA_BASE   (CHARSET_LATIN1_BASE + CHARSET_LATIN1_COUNT) /* 191 */
+#define CHARSET_EXTRA_MAX    (511 - CHARSET_EXTRA_BASE)                   /* 320 */
+
+/* xterm_glyph_slot() in _lib/xterm.c and vt.c's glyph_of() rely on these two
+ * ranges being exactly slots 0..94 and 95..190, with no table; this keeps that
+ * true if anyone edits it. */
 _Static_assert(CHARSET_ASCII_BASE == 0 && CHARSET_ASCII_LO == 0x20 &&
-               CHARSET_ASCII_HI == 0x7E && CHARSET_ASCII_COUNT == 95,
-              "the ASCII convention is part of the font format (xterm.c)");
+               CHARSET_ASCII_HI == 0x7E && CHARSET_ASCII_COUNT == 95 &&
+               CHARSET_LATIN1_BASE == 95 && CHARSET_LATIN1_LO == 0xA0 &&
+               CHARSET_LATIN1_HI == 0xFF && CHARSET_LATIN1_COUNT == 96 &&
+               CHARSET_EXTRA_BASE == 191,
+              "the ASCII and Latin-1 convention is part of the font format (xterm.c)");
 
 
 static const uint16_t charset_extra[] = {
-    /* all of Latin-1, U+00A0..U+00FF, in order: 96 glyphs */
-    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,     /*   ¡ ¢ £ ¤ ¥ ¦ § */
-    0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,     /* ¨ © ª « ¬ ­ ® ¯ */
-    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,     /* ° ± ² ³ ´ µ ¶ · */
-    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,     /* ¸ ¹ º » ¼ ½ ¾ ¿ */
-    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,     /* À Á Â Ã Ä Å Æ Ç */
-    0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,     /* È É Ê Ë Ì Í Î Ï */
-    0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,     /* Ð Ñ Ò Ó Ô Õ Ö × */
-    0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,     /* Ø Ù Ú Û Ü Ý Þ ß */
-    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,     /* à á â ã ä å æ ç */
-    0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,     /* è é ê ë ì í î ï */
-    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,     /* ð ñ ò ó ô õ ö ÷ */
-    0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,     /* ø ù ú û ü ý þ ÿ */
     0x0152, 0x0153,                                           /* Œ œ */
     0x2500, 0x2502, 0x250C, 0x2510, 0x2514, 0x2518, 0x251C, 0x2524,
     0x252C, 0x2534, 0x253C,                            /* light box drawing */
@@ -172,8 +167,10 @@ _Static_assert(CHARSET_EXTRA_COUNT <= CHARSET_EXTRA_MAX,
 /* slot -> codepoint. Returns 0 for a slot past the end of the charset. */
 static inline uint32_t charset_codepoint(int slot)
 {
-    if (slot >= CHARSET_ASCII_BASE && slot < CHARSET_EXTRA_BASE)
+    if (slot >= CHARSET_ASCII_BASE && slot < CHARSET_LATIN1_BASE)
         return (uint32_t)(CHARSET_ASCII_LO + (slot - CHARSET_ASCII_BASE));
+    if (slot >= CHARSET_LATIN1_BASE && slot < CHARSET_EXTRA_BASE)
+        return (uint32_t)(CHARSET_LATIN1_LO + (slot - CHARSET_LATIN1_BASE));
     if (slot >= CHARSET_EXTRA_BASE && slot < CHARSET_COUNT)
         return charset_extra[slot - CHARSET_EXTRA_BASE];
     return 0;

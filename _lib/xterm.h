@@ -49,10 +49,10 @@ uint8_t *xterm_bg_buffer(void);
  * than a centred narrow glyph. */
 #define XTERM_ATTR_WIDE      0x80
 /* What the font in use draws a codepoint with.  xterm_glyph_slot() is the
- * glyph slot of a narrow character (0..94 are U+0020..U+007E, the rest are the
- * font's own table of codepoints, up to slot 510: it may not fit the glyph
- * byte, see XTERM_ATTR_HI), xterm_wide_slot() the wide slot of a
- * double-width character drawn from its own two-cell bitmap, and
+ * glyph slot of a narrow character (0..94 are U+0020..U+007E, 95..190 are
+ * U+00A0..U+00FF, the rest are the font's own table of codepoints, up to slot
+ * 510: it may not fit the glyph byte, see XTERM_ATTR_HI), xterm_wide_slot() the
+ * wide slot of a double-width character drawn from its own two-cell bitmap, and
  * xterm_emoji_index() the record of an emoji in the font.  Each is -1 if
  * the font has nothing for the codepoint, and the cell is then drawn as a
  * placeholder box.  The font is the only source of these, so a program that

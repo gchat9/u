@@ -166,8 +166,9 @@ static void cells_cold(const Grid *g, int rows, int cols)
  * small cell is a glyph number (9 bits) and a style number (7 bits):
  *
  *   glyph number     for a narrow character, its slot in the font: 0..94 are
- *                    U+0020..U+007E, then charset_extra[] (_font/charset.h),
- *                    the characters the font draws: up to 511 of them, 0..510.
+ *                    U+0020..U+007E, 95..190 are U+00A0..U+00FF, then
+ *                    charset_extra[] (_font/charset.h), the characters the
+ *                    font draws: up to 511 of them, 0..510.
  *                    511 is not a glyph: it says that this cell is the first
  *                    half of a double-width character, and the cell after it
  *                    is not a cell but the character: all 16 bits of it are
@@ -242,7 +243,10 @@ static int scratch_need(int cols)
 static int glyph_of(uint32_t cp, int wide)
 {
     if (!wide) {
-        if (cp - 0x20 < 95) return (int)(cp - 0x20);
+        if (cp - CHARSET_ASCII_LO < CHARSET_ASCII_COUNT)
+            return (int)(cp - CHARSET_ASCII_LO);
+        if (cp - CHARSET_LATIN1_LO < CHARSET_LATIN1_COUNT)
+            return CHARSET_LATIN1_BASE + (int)(cp - CHARSET_LATIN1_LO);
         if (!cp) return 0;
         for (int i = 0; i < CHARSET_EXTRA_COUNT; i++)
             if (charset_extra[i] == cp) return CHARSET_EXTRA_BASE + i;
@@ -263,7 +267,8 @@ static uint32_t cp_of(unsigned g, int wide)
         if (g < 256) return g < CHARSET_WIDE_COUNT ? charset_wide_extra[g] : ' ';
         return g - 256 < EMOJI_COUNT ? emoji_charset[g - 256] : ' ';
     }
-    if (g < CHARSET_EXTRA_BASE) return 0x20 + g;
+    if (g < CHARSET_LATIN1_BASE) return CHARSET_ASCII_LO + g;
+    if (g < CHARSET_EXTRA_BASE) return CHARSET_LATIN1_LO + (g - CHARSET_LATIN1_BASE);
     return g - CHARSET_EXTRA_BASE < CHARSET_EXTRA_COUNT ? charset_extra[g - CHARSET_EXTRA_BASE] : ' ';
 }
 

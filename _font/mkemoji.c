@@ -39,10 +39,11 @@
 #define STBI_ONLY_PNG
 #include "stb_image.h"
 
+#include "charset.h"
 #include "emoji_charset.h"
 #include "../_lib/width.h"          /* emoji_wide(): the sanity check below */
 
-#define FONT_HDR 16                 /* the header of mkfont.c's font */
+#define FONT_HDR 18                 /* the header of mkfont.c's font */
 
 #define NCOLORS         15
 #define ALPHA_THRESHOLD 128   /* >= this (of 255) counts as opaque */
@@ -172,7 +173,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: not a font (too short)\n", argv[1]); return 1;
     }
     fclose(fin);
-    if (memcmp(font, "BFN3", 4) != 0) { fprintf(stderr, "%s: not a BFN3 font (mkfont.c)\n", argv[1]); return 1; }
+    if (memcmp(font, "BFN4", 4) != 0) { fprintf(stderr, "%s: not a BFN4 font (mkfont.c)\n", argv[1]); return 1; }
     uint16_t cell_w, cell_h, num_glyphs, num_wide;
     memcpy(&cell_w, font + 4, 2);
     memcpy(&cell_h, font + 6, 2);
@@ -180,7 +181,7 @@ int main(int argc, char **argv)
     memcpy(&num_wide, font + 12, 2);
     int gw = cell_w * 2, gh = cell_h;
     /* the end of the glyph tables and bitmaps: what the emoji section follows */
-    size_t body_end = FONT_HDR + 4 * ((size_t)num_glyphs - 95 + num_wide)
+    size_t body_end = FONT_HDR + 4 * ((size_t)num_glyphs - CHARSET_EXTRA_BASE + num_wide)
                     + (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
     if (body_end > (size_t)fn) { fprintf(stderr, "%s: truncated\n", argv[1]); return 1; }
 
