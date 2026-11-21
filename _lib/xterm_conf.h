@@ -138,6 +138,14 @@
 #define XTERM_GROUPS 2
 #endif
 
+/* The next three options each add a script: the keys that type it (here) and
+ * its glyphs (_font/charset.h, 49 to 95 of the font's 511 narrow slots, and in
+ * the programs' small cells, see VT_CELL_COMPACT).  Give the same options to
+ * the fonts as to the programs: make -C _font install XTERM_GREEK=1 ...
+ * (_font/check_charset.py checks that every key has its glyph).  A program
+ * without an option still shows what it is sent from a font with the glyphs,
+ * but a window that has such characters on it costs full-size cells. */
+
 /* The unaccented Greek letters, for the gr layout.  Off by default: the code
  * for them is only compiled in with -DXTERM_GREEK=1 (about 100 bytes). */
 #ifndef XTERM_GREEK
@@ -145,7 +153,8 @@
 #endif
 
 /* Latin-2 letters (Polish, Czech, Slovak, Hungarian, Romanian, Croatian, ...)
- * and the Turkish letters of Latin-3.  Off by default: the table and its
+ * and the Turkish letters of Latin-3 (the glyphs also have the Latin-1 letters
+ * that those languages need, and the Romanian comma-below ones).  Off by default: the table and its
  * lookup are only compiled in with -DXTERM_LATIN2=1 (about 150 bytes). */
 #ifndef XTERM_LATIN2
 #define XTERM_LATIN2 0
