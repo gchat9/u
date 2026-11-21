@@ -30,8 +30,13 @@
  *                 U+00FF, in order: those two ranges have no table, see
  *                 charset.h)
  *   codepoints of the wide glyphs: num_wide x u32
- *   num_glyphs   narrow glyphs, cell_w x cell_h bytes of alpha each
- *   num_wide     wide glyphs, (2*cell_w) x cell_h bytes of alpha each
+ *   num_glyphs   narrow glyphs, cell_w x cell_h coverage values of 4 bits each
+ *                (0 = nothing, 15 = solid), row by row, two to a byte with the
+ *                first in the high nibble; each row is a whole number of bytes
+ *                ((cell_w+1)/2; the last nibble of a row of odd length is 0),
+ *                so a glyph takes (cell_w+1)/2*cell_h bytes
+ *   num_wide     wide glyphs: the left half and then the right half of the
+ *                (2*cell_w) x cell_h bitmap, each laid out like a narrow glyph
  *   the emoji section, appended by mkemoji (see mkemoji.c); num_emoji is 0
  *   in what mkfont writes:
  *     num_emoji x u32   the codepoint of each emoji
@@ -83,6 +88,20 @@ static uint8_t *load_file(const char *path)
     if (!b || fread(b, 1, n, f) != (size_t)n) { fprintf(stderr, "%s: read error\n", path); exit(1); }
     fclose(f);
     return b;
+}
+
+/* Write the w x h part of the alpha bitmap a (rows `stride` apart) as 4-bit
+ * coverage values, rounded to the nearest of 16 levels, row by row, two to a
+ * byte, the first in the high nibble; a row of odd length ends in a 0 nibble.
+ * The reader (xterm.c) scales a level l back to l*17, so 0 and 255 stay exact. */
+static void put_glyph(FILE *f, const uint8_t *a, int stride, int w, int h)
+{
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x += 2) {
+            unsigned hi = (a[y * stride + x] * 15u + 127) / 255;
+            unsigned lo = x + 1 < w ? (a[y * stride + x + 1] * 15u + 127) / 255 : 0;
+            fputc((int)(hi << 4 | lo), f);
+        }
 }
 
 /*
@@ -200,7 +219,7 @@ int main(int argc, char **argv)
         uint32_t cp = charset_codepoint(slot);
         if (cp) draw_cp(&fi, scale, cp, cell, cell_w, cell_h, baseline, 0);
 
-        fwrite(cell, 1, cell_w * cell_h, out);
+        put_glyph(out, cell, cell_w, cell_w, cell_h);
     }
 
     free(cell);
@@ -227,13 +246,14 @@ int main(int argc, char **argv)
         stbtt_GetCodepointHMetrics(&wfi, (int)cp, &wadv, &wlsb);
         int pen_x = (int)((ww - wadv * wscale) / 2 + 0.5f);
         draw_cp(&wfi, wscale, cp, wcell, ww, cell_h, baseline, pen_x);
-        fwrite(wcell, 1, ww * cell_h, out);
+        put_glyph(out, wcell, ww, cell_w, cell_h);                    /* left half */
+        put_glyph(out, wcell + cell_w, ww, cell_w, cell_h);           /* right half */
     }
 
     free(wcell); free(wttf); free(ttf); fclose(out);
 
     unsigned total = 18 + 4 * (NUM_GLYPHS - CHARSET_EXTRA_BASE) + 4 * NUM_WIDE
-                   + NUM_GLYPHS * cell_w * cell_h + NUM_WIDE * ww * cell_h;
+                   + (NUM_GLYPHS + 2 * NUM_WIDE) * ((cell_w + 1) / 2) * cell_h;
     fprintf(stderr, "wrote %s  (%d narrow + %d wide glyphs, %u bytes)\n",
             out_path, NUM_GLYPHS, NUM_WIDE, total);
     return 0;

@@ -182,7 +182,7 @@ int main(int argc, char **argv)
     int gw = cell_w * 2, gh = cell_h;
     /* the end of the glyph tables and bitmaps: what the emoji section follows */
     size_t body_end = FONT_HDR + 4 * ((size_t)num_glyphs - CHARSET_EXTRA_BASE + num_wide)
-                    + (size_t)cell_w * cell_h * (num_glyphs + 2 * (size_t)num_wide);
+                    + ((size_t)num_glyphs + 2 * num_wide) * ((cell_w + 1) / 2) * cell_h;  /* 4 bits a pixel */
     if (body_end > (size_t)fn) { fprintf(stderr, "%s: truncated\n", argv[1]); return 1; }
 
     FILE *out = fopen(argv[2], "wb");

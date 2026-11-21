@@ -757,8 +757,10 @@ static uint16_t  font_langs;    /* the XTERM_LANGS bits the font has glyphs for 
 static const uint8_t *ncp_tab;  /* codepoints (u32) of the narrow glyphs past ASCII and Latin-1 */
 static const uint8_t *wcp_tab;  /* codepoints (u32) of the wide glyphs */
 static const uint8_t *emoji_cps;   /* codepoints (u32) of the emoji */
-static const uint8_t *glyph_data;
-static const uint8_t *wide_data;   /* num_wide glyphs of 2*cell_w x cell_h, after the narrow ones */
+static const uint8_t *glyph_data;  /* the narrow glyphs, 4 bits a pixel (glyph_bytes each) */
+static const uint8_t *wide_data;   /* num_wide glyphs of two halves, each like a narrow one, after the narrow ones */
+static size_t    row_bytes;     /* bytes of a row of a glyph: cell_w 4-bit values, rounded up */
+static size_t    glyph_bytes;   /* bytes of a narrow glyph, or of one half of a wide one */
 static const uint8_t *emoji_data;  /* num_emoji records, after the emoji's codepoints (see draw_emoji) */
 static size_t    emoji_rec;     /* bytes per record: 45 palette + packed 4bpp pixels */
 static int       WIN_W, WIN_H, cols, rows;
@@ -806,12 +808,15 @@ static int font_valid(const uint8_t *m, size_t n)
      * ones within the 256 a byte names; the emoji too (255 is the "none"
      * index) */
     if (ng < FIXED_N || ng > 511 || nw > 256 || ne > 255) return 0;
-    /* the bitmaps: (n-FONT_HDR) / h / w is the number of cells the file has
-     * room for, with no overflow -- checked before anything multiplies */
-    if ((n - FONT_HDR) / h / w < ng + 2 * nw) return 0;
+    /* the bitmaps, 4 bits a pixel, rows of whole bytes: (n-FONT_HDR) / h / w is
+     * the number of cells the file has room for, with no overflow -- checked
+     * before anything multiplies: the glyphs need at least half a byte a pixel */
+    if ((n - FONT_HDR) / h / w < (ng + 2 * nw) / 2) return 0;
+    size_t bitmaps = (ng + 2 * nw) * ((w + 1) / 2) * h;
+    if (bitmaps > n - FONT_HDR) return 0;
     /* the codepoint tables of the narrow and wide glyphs, 4 bytes each */
-    if (4 * (ng - FIXED_N + nw) > n - FONT_HDR - w * h * (ng + 2 * nw)) return 0;
-    size_t rest = n - FONT_HDR - w * h * (ng + 2 * nw) - 4 * (ng - FIXED_N + nw);
+    if (4 * (ng - FIXED_N + nw) > n - FONT_HDR - bitmaps) return 0;
+    size_t rest = n - FONT_HDR - bitmaps - 4 * (ng - FIXED_N + nw);
     /* the emoji: a codepoint (4 bytes) and a record of 45 bytes of palette and
      * the w*h bytes of 4bpp pixels (two cells wide) each */
     if (ne > rest / (49 + w * h)) return 0;
@@ -843,8 +848,10 @@ static void font_commit(uint8_t *m, size_t len)
     ncp_tab    = m + FONT_HDR;
     wcp_tab    = ncp_tab + 4 * (size_t)(num_glyphs - FIXED_N);
     glyph_data = wcp_tab + 4 * (size_t)num_wide;
-    wide_data  = glyph_data + (size_t)cell_w * cell_h * num_glyphs;
-    emoji_cps  = wide_data + (size_t)cell_w * 2 * cell_h * num_wide;
+    row_bytes  = ((size_t)cell_w + 1) / 2;
+    glyph_bytes = row_bytes * cell_h;
+    wide_data  = glyph_data + glyph_bytes * num_glyphs;
+    emoji_cps  = wide_data + 2 * glyph_bytes * num_wide;
     emoji_data = emoji_cps + 4 * (size_t)num_emoji;
     emoji_rec  = 45 + ((size_t)cell_w * 2 * cell_h + 1) / 2;
 }
@@ -959,7 +966,7 @@ static inline uint16_t pack565(uint32_t c)
  * coverage values, which is why filling lazily beats building it whole
  * when the colours change from cell to cell.  ~0 marks an empty entry (no
  * pixel value, 0x00RRGGBB or RGB565, can be that). */
-static uint32_t lut[256];
+static uint32_t lut[16];      /* colour of each of the 16 coverage levels, ~0u: not computed yet */
 static uint32_t lut_key = ~0u;
 static uint32_t lut_fg, lut_bg;
 
@@ -969,12 +976,12 @@ static void lut_set(uint8_t fgi, uint8_t bgi)
     if (key == lut_key) return;
     lut_key = key;
     lut_fg = palette[fgi]; lut_bg = palette[bgi];
-    for (int i = 0; i < 256; i++) lut[i] = ~0u;
+    for (int i = 0; i < 16; i++) lut[i] = ~0u;
 }
 
-static uint32_t lut_fill(uint8_t a, uint8_t depth)
+__attribute__((noinline)) static uint32_t lut_fill(uint8_t a, uint8_t depth)
 {
-    uint32_t p = blend(a, lut_fg, lut_bg);
+    uint32_t p = blend((uint8_t)(a * 17), lut_fg, lut_bg);    /* level 15 is 255 */
     return lut[a] = depth == 16 ? pack565(p) : p;
 }
 
@@ -996,29 +1003,58 @@ static void fill_row(int r, uint32_t color, uint8_t depth)
 }
 
 /* Paint the whole cell from a glyph's coverage bitmap through lut[].
- * Cell column x shows glyph column x - sh (blank outside the glyph).
- * `stride` is the bitmap's row length: cell_w for a narrow glyph, or
- * 2*cell_w for a wide one (g then points at the column the cell shows).
- * Written out per pixel size (GLYPH_ROW) so the depth test is per row,
- * not per pixel. */
-#define GLYPH_ROW(T)                                                   \
-    for (int x = 0; x < cell_w; x++) {                                 \
-        unsigned gx = (unsigned)(x - sh);                              \
-        uint8_t a = gx < cell_w ? g[gx] : 0;                           \
-        uint32_t p = lut[a];                                           \
-        if (p == ~0u) p = lut_fill(a, depth);                          \
+ * The bitmap is 4 bits a pixel, row by row, each row a whole number of bytes
+ * (row_bytes), the first pixel of a byte in its high nibble: the format of a
+ * narrow glyph, and of each half of a wide one.  Written out per pixel size
+ * (GLYPH_ROW) so the depth test is per row, not per pixel, and a byte, two
+ * pixels, at a time. */
+#define GLYPH_PIX(T, x, level)                                         \
+    do {                                                               \
+        unsigned a_ = (level);                                         \
+        uint32_t p = lut[a_];                                          \
+        if (p == ~0u) p = lut_fill((uint8_t)a_, depth);                \
         ((T *)line)[x] = (T)p;                                         \
+    } while (0)
+#define GLYPH_ROW(T)                                                   \
+    {                                                                  \
+        const uint8_t *q = g;                                          \
+        int x = 0;                                                     \
+        for (; x + 1 < cell_w; x += 2, q++) {                          \
+            GLYPH_PIX(T, x, *q >> 4);                                  \
+            GLYPH_PIX(T, x + 1, *q & 15);                              \
+        }                                                              \
+        if (x < cell_w) GLYPH_PIX(T, x, *q >> 4);                      \
     }
 __attribute__((optimize("O2"))) /* the hot loop: -Os costs ~30% here */
-static void draw_glyph(const uint8_t *g, int stride, int sh, uint8_t depth)
+static void draw_glyph(const uint8_t *g, uint8_t depth)
 {
-    for (int y = 0; y < cell_h; y++, g += stride) {
+    for (int y = 0; y < cell_h; y++, g += row_bytes) {
         uint8_t *line = cell_buf + (size_t)y * cell_stride;
-        if (depth == 16) { GLYPH_ROW(uint16_t) }
-        else             { GLYPH_ROW(uint32_t) }
+        if (depth == 16) GLYPH_ROW(uint16_t)
+        else             GLYPH_ROW(uint32_t)
     }
 }
 #undef GLYPH_ROW
+#undef GLYPH_PIX
+
+/* The same for a narrow glyph in a fullwidth character's cell: the glyph is
+ * centred across the two cells, so cell column x shows glyph column x - sh
+ * (blank outside the glyph).  Rare, so plain and small rather than fast. */
+__attribute__((noinline)) static void draw_glyph_shifted(const uint8_t *g, int sh, uint8_t depth)
+{
+    for (int y = 0; y < cell_h; y++) {
+        uint8_t *line = cell_buf + (size_t)y * cell_stride;
+        for (int x = 0; x < cell_w; x++) {
+            unsigned gx = (unsigned)(x - sh), a = 0;
+            if (gx < cell_w)
+                a = (g[y * row_bytes + (gx >> 1)] >> ((~gx & 1) * 4)) & 15;
+            uint32_t p = lut[a];
+            if (p == ~0u) p = lut_fill((uint8_t)a, depth);
+            if (depth == 16) ((uint16_t *)line)[x] = (uint16_t)p;
+            else             ((uint32_t *)line)[x] = p;
+        }
+    }
+}
 
 /* Draw the left (half=0) or right (half=1) half of emoji k over the
  * already-bg-filled cell_buf. Each record is 15 RGB palette entries
@@ -1090,23 +1126,23 @@ static void render_cell(int row, int col, uint8_t depth)
      * drawn over a plain background, which is what glyph slot 0 gives:
      * it is the space (slot 0), so its coverage is all zero. */
     const uint8_t *g = glyph_data;
-    int sh = 0, stride = cell_w;
+    int sh = 0;
     if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) && (rattrs & XTERM_ATTR_WIDE)) {
         /* A wide glyph: this cell's half of a two-cell bitmap. An index
          * past the font's wide glyphs leaves g on slot 0, a blank. */
         if (cp < num_wide) {
-            g = wide_data + (size_t)cp * 2 * cell_w * cell_h + (size_t)half * cell_w;
-            stride = 2 * cell_w;
+            g = wide_data + ((size_t)cp * 2 + half) * glyph_bytes;
         }
     } else if (!is_emoji && !(rattrs & XTERM_ATTR_MISSING) && cp < num_glyphs) {
-        g += (size_t)cp*cell_w*cell_h;
+        g += (size_t)cp * glyph_bytes;
         /* A fullwidth character reuses its narrow twin's glyph, centred
          * across the two cells; this cell shows glyph columns x - sh
          * (left half: shifted right by half a cell; right half: the
          * remainder). Ordinary cells: sh = 0, every column in range. */
         if (is_fw) sh = cell_w / 2 - half * cell_w;
     }
-    draw_glyph(g, stride, sh, depth);
+    if (sh) draw_glyph_shifted(g, sh, depth);
+    else    draw_glyph(g, depth);
     if (is_emoji)
         draw_emoji(cp, half, fg, depth);
     else if (rattrs & XTERM_ATTR_MISSING)
