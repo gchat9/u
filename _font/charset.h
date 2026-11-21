@@ -24,24 +24,23 @@
  * glyphs, slots 0..510: slot 511 is not one (see vt.c, which uses it to mark a
  * double-width character in its small cells).  The table holds, in order:
  *
- *   - a small set of accented Latin letters (Western European, minus
- *     the ones left out on purpose; no other Latin-1 letters), plus the
- *     sharp s and the Æ/Œ ligatures. Œ/œ are not Latin-1 (U+0152/0153),
- *     so there is no Latin-1 range here at all;
+ *   - all of Latin-1, U+00A0..U+00FF (96 glyphs, the no-break space to ÿ:
+ *     the accented letters, the sharp s, Æ/æ, and the signs). U+0080..U+009F
+ *     are controls and have no glyph;
+ *   - the ligatures Œ/œ (U+0152/0153), which are not Latin-1;
  *   - light and double box-drawing (what dialog/whiptail/ncurses TUIs
  *     actually draw), square corners only;
- *   - a few block/shade glyphs, four arrows, and three punctuation/
- *     dingbat marks (check marks, em dash), the degree sign, the French
- *     guillemets, and the horizontal ellipsis;
+ *   - a few block/shade glyphs, four arrows, three punctuation/dingbat marks
+ *     (check marks, em dash) and the horizontal ellipsis;
  *   - what command-line programs print besides (typographic quotes, bullets,
- *     arrows, triangles, circles, crosses, the no-break space and a few signs);
+ *     arrows, triangles, circles, crosses and the minus sign);
  *   - and then, each only if its option is set (xterm_conf.h; for the fonts:
  *     make -C _font XTERM_GREEK=1 ..., and the same -D for the programs, which
  *     is what makes the keyboard layouts of those options useful):
  *       XTERM_GREEK     the unaccented Greek letters (49)
  *       XTERM_LATIN2    the letters of Latin-2 and the Turkish and Romanian
- *                       ones, with the Latin-1 letters that those languages
- *                       use and the base set lacks (72)
+ *                       ones (65; the Latin-1 letters of those languages
+ *                       are in the range above)
  *       XTERM_CYRILLIC  the Cyrillic letters of Russian, Ukrainian,
  *                       Belarusian, Bulgarian, Serbian and Macedonian, and
  *                       the numero sign (95)
@@ -88,16 +87,19 @@ _Static_assert(CHARSET_ASCII_BASE == 0 && CHARSET_ASCII_LO == 0x20 &&
 
 
 static const uint16_t charset_extra[] = {
-    0x00C0, 0x00E0, 0x00E1, 0x00C2, 0x00E2, 0x00C4, 0x00E4,   /* À à á Â â Ä ä */
-    0x00C7, 0x00E7,                                           /* Ç ç */
-    0x00C9, 0x00E9, 0x00C8, 0x00E8, 0x00CA, 0x00EA, 0x00CB, 0x00EB, /* É é È è Ê ê Ë ë */
-    0x00CC, 0x00EC, 0x00CE, 0x00EE, 0x00CF, 0x00EF,           /* Ì ì Î î Ï ï */
-    0x00D3, 0x00F3, 0x00D2, 0x00F2, 0x00D4, 0x00F4, 0x00D6, 0x00F6, /* Ó ó Ò ò Ô ô Ö ö */
-    0x00F1,                                                   /* ñ */
-    0x00D9, 0x00F9, 0x00DB, 0x00FB, 0x00DC, 0x00FC,           /* Ù ù Û û Ü ü */
-    0x00FF,                                                   /* ÿ */
-    0x00DF,                                                   /* ß */
-    0x00C6, 0x00E6,                                           /* Æ æ */
+    /* all of Latin-1, U+00A0..U+00FF, in order: 96 glyphs */
+    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,     /*   ¡ ¢ £ ¤ ¥ ¦ § */
+    0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,     /* ¨ © ª « ¬ ­ ® ¯ */
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,     /* ° ± ² ³ ´ µ ¶ · */
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,     /* ¸ ¹ º » ¼ ½ ¾ ¿ */
+    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,     /* À Á Â Ã Ä Å Æ Ç */
+    0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,     /* È É Ê Ë Ì Í Î Ï */
+    0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,     /* Ð Ñ Ò Ó Ô Õ Ö × */
+    0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,     /* Ø Ù Ú Û Ü Ý Þ ß */
+    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,     /* à á â ã ä å æ ç */
+    0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,     /* è é ê ë ì í î ï */
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,     /* ð ñ ò ó ô õ ö ÷ */
+    0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,     /* ø ù ú û ü ý þ ÿ */
     0x0152, 0x0153,                                           /* Œ œ */
     0x2500, 0x2502, 0x250C, 0x2510, 0x2514, 0x2518, 0x251C, 0x2524,
     0x252C, 0x2534, 0x253C,                            /* light box drawing */
@@ -106,15 +108,12 @@ static const uint16_t charset_extra[] = {
     0x2580, 0x2584, 0x2588, 0x2591, 0x2592, 0x2593,    /* block / shade */
     0x25B2, 0x25BA, 0x25BC, 0x25C4,                    /* arrows: up right down left */
     0x2714, 0x2713, 0x2014,                            /* ✔ ✓ — */
-    0x00B0,                                            /* ° */
-    0x00AB, 0x00BB,                                    /* « » */
     0x2026,                                            /* … */
     /* what current command-line programs print and a font without it draws as
-     * a box: a no-break space (tree, ls -l), typographic quotes and the bullet
+     * a box: typographic quotes and the bullet
      * (man, git, package managers), the four arrows, the open triangles
-     * (htop, vim, ncdu), circles, crosses, and the middle dot, multiplication
-     * and minus signs */
-    0x00A0, 0x00B7, 0x00D7, 0x2212,                    /*   · × −  */
+     * (htop, vim, ncdu), circles, crosses and the minus sign */
+    0x2212,                                            /* − */
     0x2018, 0x2019, 0x201C, 0x201D, 0x2022,            /* ‘ ’ “ ” •  */
     0x2190, 0x2191, 0x2192, 0x2193,                    /* ← ↑ → ↓  */
     0x25B3, 0x25B7, 0x25BD, 0x25C1, 0x25CB, 0x25CF,    /* △ ▷ ▽ ◁ ○ ●  */
@@ -131,19 +130,19 @@ static const uint16_t charset_extra[] = {
 #endif
 #if XTERM_LATIN2
     /* the letters of the Latin-2 keysyms (and the spacing breve, ogonek, caron,
-     * double acute and dot above), the Turkish letters of Latin-3 (Ğ ğ İ ı),
-     * Romanian ones with the comma below (Ș ș Ț ț), and the Latin-1 letters
-     * Á Í Ú Ý í ú ý, which Czech, Slovak and Hungarian use and which the
-     * Western European set above does without */
-    0x00C1, 0x00CD, 0x00DA, 0x00DD, 0x00ED, 0x00FA, 0x00FD, 0x0102,
-    0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x010C, 0x010D, 0x010E,
-    0x010F, 0x0110, 0x0111, 0x0118, 0x0119, 0x011A, 0x011B, 0x011E,
-    0x011F, 0x0130, 0x0131, 0x0139, 0x013A, 0x013D, 0x013E, 0x0141,
-    0x0142, 0x0143, 0x0144, 0x0147, 0x0148, 0x0150, 0x0151, 0x0154,
-    0x0155, 0x0158, 0x0159, 0x015A, 0x015B, 0x015E, 0x015F, 0x0160,
-    0x0161, 0x0162, 0x0163, 0x0164, 0x0165, 0x016E, 0x016F, 0x0170,
-    0x0171, 0x0179, 0x017A, 0x017B, 0x017C, 0x017D, 0x017E, 0x0218,
-    0x0219, 0x021A, 0x021B, 0x02C7, 0x02D8, 0x02D9, 0x02DB, 0x02DD,
+     * double acute and dot above), the Turkish letters of Latin-3 (Ğ ğ İ ı) and
+     * the Romanian ones with the comma below (Ș ș Ț ț).  The Latin-1 letters
+     * that Czech, Slovak and Hungarian use (Á Í Ú Ý í ú ý) are in the Latin-1
+     * range above */
+    0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x010C, 0x010D,
+    0x010E, 0x010F, 0x0110, 0x0111, 0x0118, 0x0119, 0x011A, 0x011B,
+    0x011E, 0x011F, 0x0130, 0x0131, 0x0139, 0x013A, 0x013D, 0x013E,
+    0x0141, 0x0142, 0x0143, 0x0144, 0x0147, 0x0148, 0x0150, 0x0151,
+    0x0154, 0x0155, 0x0158, 0x0159, 0x015A, 0x015B, 0x015E, 0x015F,
+    0x0160, 0x0161, 0x0162, 0x0163, 0x0164, 0x0165, 0x016E, 0x016F,
+    0x0170, 0x0171, 0x0179, 0x017A, 0x017B, 0x017C, 0x017D, 0x017E,
+    0x0218, 0x0219, 0x021A, 0x021B, 0x02C7, 0x02D8, 0x02D9, 0x02DB,
+    0x02DD,
 #endif
 #if XTERM_CYRILLIC
     /* Ё..я and ё..џ, Ґ ґ and №: the Cyrillic keysyms */
