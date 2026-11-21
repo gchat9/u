@@ -28,6 +28,12 @@ uint8_t *xterm_bg_buffer(void);
  * the cell's bg colour. Both halves of a pair must be flagged. */
 #define XTERM_ATTR_EMOJI_L   0x04
 #define XTERM_ATTR_EMOJI_R   0x08
+/* Both halves at once is no emoji (no cell is both): the cell is an ordinary
+ * narrow one whose glyph slot is 256 more than its glyph byte.  A font has up
+ * to 511 narrow glyphs, a byte holds 256 of them; xscr_glyph_byte() (see
+ * xterm_screen.h) makes the byte and the attribute for any slot.  (The cell
+ * may also be underlined or struck through: those are other bits.) */
+#define XTERM_ATTR_HI        (XTERM_ATTR_EMOJI_L | XTERM_ATTR_EMOJI_R)
 /* The glyph byte for this (single-width) cell has no meaning: the font
  * has nothing for the character, so draw a placeholder outline box in
  * the cell's fg colour instead of any glyph. */
@@ -44,7 +50,8 @@ uint8_t *xterm_bg_buffer(void);
 #define XTERM_ATTR_WIDE      0x80
 /* What the font in use draws a codepoint with.  xterm_glyph_slot() is the
  * glyph slot of a narrow character (0..94 are U+0020..U+007E, the rest are the
- * font's own table of codepoints), xterm_wide_slot() the wide slot of a
+ * font's own table of codepoints, up to slot 510: it may not fit the glyph
+ * byte, see XTERM_ATTR_HI), xterm_wide_slot() the wide slot of a
  * double-width character drawn from its own two-cell bitmap, and
  * xterm_emoji_index() the record of an emoji in the font.  Each is -1 if
  * the font has nothing for the codepoint, and the cell is then drawn as a

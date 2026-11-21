@@ -21,6 +21,13 @@ void xscr_render(const Screen *screen);
  * see xterm.h.) */
 int xscr_glyph_slot(uint32_t ch);
 
+/* The glyph byte to store in xterm_framebuffer() for the narrow glyph slot g
+ * (from xscr_glyph_slot(): -1 for none), and the attribute bits it needs: they
+ * are ORed into *attr, which the caller has set to the cell's underline and
+ * strike-through bits already, as a slot of 256 or more is XTERM_ATTR_HI and the
+ * byte less 256, and a missing glyph is XTERM_ATTR_MISSING and the byte 0. */
+uint8_t xscr_glyph_byte(int g, uint8_t *attr);
+
 /* Glyph slot and attribute for one half of a double-width character (what
  * xscr_render stores for it in the framebuffer and attribute buffers). */
 int xscr_wide_glyph(uint32_t wch, int right, uint8_t *attr);

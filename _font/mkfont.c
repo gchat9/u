@@ -52,6 +52,8 @@
 #define NUM_GLYPHS  CHARSET_COUNT        /* only what charset.h defines */
 #define NUM_WIDE    CHARSET_WIDE_COUNT
 
+_Static_assert(NUM_GLYPHS <= 511 && NUM_WIDE <= 256, "the font format's limits (xterm.c, font_valid)");
+
 static void w16(FILE *f, uint16_t v) {          /* write LE uint16 */
     uint8_t b[2] = { v & 0xFF, v >> 8 };
     fwrite(b, 1, 2, f);

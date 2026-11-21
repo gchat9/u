@@ -68,6 +68,13 @@ int xscr_glyph_slot(uint32_t ch)
     return xterm_glyph_slot(ch);
 }
 
+uint8_t xscr_glyph_byte(int g, uint8_t *attr)
+{
+    if (g < 0)    { *attr |= XTERM_ATTR_MISSING; return 0; }
+    if (g >= 256) { *attr |= XTERM_ATTR_HI; return (uint8_t)(g - 256); }
+    return (uint8_t)g;
+}
+
 /* Glyph slot and attribute for one half of a double-width character:
  * one with a bitmap of its own in the font's wide glyphs (ツ), a
  * fullwidth form drawing its narrow twin's glyph spread over two cells,
@@ -143,15 +150,18 @@ void xscr_render(const Screen *s)
                      (row[c-1].flags & CELL_WIDE)) {
                 wch = row[c-1].ch; right = 1;
             }
-            uint8_t wattr = 0;
-            int g = wch ? xscr_wide_glyph(wch, right, &wattr) : xscr_glyph_slot(ch);
-            fb[i] = g < 0 ? 0 : (uint8_t)g;
+            uint8_t extra = 0;                 /* what the glyph adds to the attributes */
+            if (wch) {
+                int g = xscr_wide_glyph(wch, right, &extra);
+                fb[i] = g < 0 ? 0 : (uint8_t)g;
+            } else {
+                fb[i] = xscr_glyph_byte(xscr_glyph_slot(ch), &extra);
+            }
             resolve_colors(cell, &fgb[i], &bgb[i], &atb[i]);
             if (sel_on && sel_hit(r, c)) {     /* selected: reverse video */
                 uint8_t t = fgb[i]; fgb[i] = bgb[i]; bgb[i] = t;
             }
-            if (wattr)      atb[i] |= wattr;   /* OR: keeps underline/strike */
-            else if (g < 0) atb[i] |= XTERM_ATTR_MISSING;  /* after resolve_colors, which sets atb */
+            atb[i] |= extra;                   /* OR: keeps underline/strike (after resolve_colors, which sets atb) */
         }
         for (int c = w; c < cols; c++) {
             int i = r * cols + c;

@@ -798,9 +798,10 @@ static int font_valid(const uint8_t *m, size_t n)
     size_t w = rd16(m+4), h = rd16(m+6);
     size_t ng = rd16(m+10), nw = rd16(m+12), ne = rd16(m+14);
     if (w == 0 || h == 0) return 0;
-    /* ASCII, then the table's narrow glyphs, all within the 256 slots a byte
-     * can name; the wide ones likewise; the emoji too (255 is the "none" index) */
-    if (ng < ASCII_N || ng > 256 || nw > 256 || ne > 255) return 0;
+    /* ASCII, then the table's narrow glyphs, up to the 511 slots (0..510) that
+     * 9 bits name besides vt.c's wide-character mark; the wide ones within the
+     * 256 a byte names; the emoji too (255 is the "none" index) */
+    if (ng < ASCII_N || ng > 511 || nw > 256 || ne > 255) return 0;
     /* the bitmaps: (n-FONT_HDR) / h / w is the number of cells the file has
      * room for, with no overflow -- checked before anything multiplies */
     if ((n - FONT_HDR) / h / w < ng + 2 * nw) return 0;
@@ -1064,6 +1065,9 @@ static void render_cell(int row, int col, uint8_t depth)
     /* A wide character (emoji or fullwidth form) is one character over
      * two cells: the cursor inverts both halves whichever of the two
      * it's on, never just half. */
+    /* slot: 256 more than the glyph byte, for a narrow cell flagged HI */
+    int slot = scr[idx];
+    if ((rattrs & XTERM_ATTR_HI) == XTERM_ATTR_HI) { slot += 256; rattrs &= (uint8_t)~XTERM_ATTR_HI; }
     int half = (rattrs & (XTERM_ATTR_EMOJI_R | XTERM_ATTR_FW_R)) != 0;
     int pair = col - half;
     int is_emoji = (rattrs & (XTERM_ATTR_EMOJI_L | XTERM_ATTR_EMOJI_R)) != 0;
@@ -1075,7 +1079,7 @@ static void render_cell(int row, int col, uint8_t depth)
     if (is_cursor) { uint8_t t = bgi; bgi = fgi; fgi = t; }
     lut_set(fgi, bgi);
     uint32_t fg = palette[fgi];
-    uint8_t cp = scr[idx];
+    int cp = slot;
     /* Anything that isn't an ordinary glyph (emoji, placeholder box) is
      * drawn over a plain background, which is what glyph slot 0 gives:
      * it is the space (slot 0), so its coverage is all zero. */

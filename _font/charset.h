@@ -13,14 +13,16 @@
  * decides how much memory a window takes, never what it shows, so a font and
  * a program built from different versions of this file still agree on every
  * pixel; but a window that prints characters the program's copy lacks costs
- * more, so rebuild the programs after growing the set, and put in it what
- * programs actually print (the glyphs are cheap, a window that goes
- * full-size is not).
+ * more, so build the programs and the fonts with the same options (below),
+ * and put in this file what programs actually print (the glyphs are cheap, a
+ * window that goes full-size is not).
  *
  * The narrow glyphs are slots 0..CHARSET_COUNT-1 of the font: the printable
  * ASCII, U+0020..U+007E, in slots 0..94 (the ASCII range below, a plain
  * offset and no table: the programs rely on this), then the codepoints of
- * charset_extra[], in order, in slots 95 on. The table holds, in order:
+ * charset_extra[], in order, in slots 95 on.  A font holds up to 511 narrow
+ * glyphs, slots 0..510: slot 511 is not one (see vt.c, which uses it to mark a
+ * double-width character in its small cells).  The table holds, in order:
  *
  *   - a small set of accented Latin letters (Western European, minus
  *     the ones left out on purpose; no other Latin-1 letters), plus the
@@ -30,7 +32,9 @@
  *     actually draw), square corners only;
  *   - a few block/shade glyphs, four arrows, and three punctuation/
  *     dingbat marks (check marks, em dash), the degree sign, the French
- *     guillemets, and the horizontal ellipsis.
+ *     guillemets, and the horizontal ellipsis;
+ *   - what command-line programs print besides (typographic quotes, bullets,
+ *     arrows, triangles, circles, crosses, the no-break space and a few signs).
  *
  * Which character is drawn with which glyph, where one character is drawn with
  * another's glyph (the hyphens, the big solidus, the fullwidth forms), is the
@@ -39,13 +43,14 @@
  *
  * Double-width glyphs are a second array of the same kind: charset_wide_extra[]
  * holds the codepoints of the wide glyphs, which mkfont bakes as two-cell
- * bitmaps (wide slot i is the i-th entry), after the narrow ones.
+ * bitmaps (wide slot i is the i-th entry), after the narrow ones; there is room
+ * for 256.  The colour emoji of emoji_charset.h (255 at most) are numbered after
+ * them, 256 on, by vt.c.
  *
  * The font file holds CHARSET_COUNT narrow and CHARSET_WIDE_COUNT wide glyphs,
  * so every glyph dropped here is also dropped from the fonts. Extending the
  * charset later means appending to charset_extra[] or charset_wide_extra[]
- * (order doesn't matter); the _Static_asserts below keep CHARSET_RESERVE slots
- * of each kind free, to be spent on purpose by lowering that number.
+ * (order doesn't matter); the _Static_asserts below say when a table is full.
  */
 #pragma once
 
@@ -57,7 +62,7 @@
 #define CHARSET_ASCII_COUNT  (CHARSET_ASCII_HI - CHARSET_ASCII_LO + 1)     /* 95 */
 
 #define CHARSET_EXTRA_BASE   (CHARSET_ASCII_BASE + CHARSET_ASCII_COUNT)    /* 95 */
-#define CHARSET_EXTRA_MAX    (256 - CHARSET_EXTRA_BASE)                    /* 161 */
+#define CHARSET_EXTRA_MAX    (511 - CHARSET_EXTRA_BASE)                    /* 416 */
 
 /* xterm_glyph_slot() in _lib/xterm.c relies on the ASCII range being exactly
  * slots 0..94, U+0020..U+007E; this keeps that true if anyone edits it. */
@@ -104,15 +109,9 @@ static const uint16_t charset_extra[] = {
 /* Number of glyphs actually baked into font<STEP>.bfnt (slots 0..COUNT-1). */
 #define CHARSET_COUNT (CHARSET_EXTRA_BASE + CHARSET_EXTRA_COUNT)
 
-/* Slots deliberately kept free in each of the two glyph arrays, for
- * future additions. Both are indexed by a uint8_t, so 256 is the hard
- * limit of each. */
-#define CHARSET_RESERVE 50
-
+/* A font holds slots 0..510 of narrow glyphs: see the top. */
 _Static_assert(CHARSET_EXTRA_COUNT <= CHARSET_EXTRA_MAX,
-              "charset_extra[] overflows the font's 256 glyph slots -- trim it");
-_Static_assert(CHARSET_COUNT + CHARSET_RESERVE <= 256,
-              "charset_extra[] has eaten into the reserved narrow glyph slots");
+              "charset_extra[] overflows the font's 511 narrow glyph slots -- trim it");
 
 /* slot -> codepoint. Returns 0 for a slot past the end of the charset. */
 static inline uint32_t charset_codepoint(int slot)
@@ -136,8 +135,8 @@ static const uint16_t charset_wide_extra[] = {
 };
 #define CHARSET_WIDE_COUNT ((int)(sizeof(charset_wide_extra) / sizeof(charset_wide_extra[0])))
 
-_Static_assert(CHARSET_WIDE_COUNT + CHARSET_RESERVE <= 256,
-              "charset_wide_extra[] has eaten into the reserved wide glyph slots");
+_Static_assert(CHARSET_WIDE_COUNT <= 256,
+              "charset_wide_extra[] overflows the font's 256 wide glyph slots -- trim it");
 
 /* wide slot -> codepoint (0 past the end), for mkfont.c */
 static inline uint32_t charset_wide_codepoint(int slot)

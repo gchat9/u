@@ -47,11 +47,11 @@ static void x11_emit(void *vctx, const char *s, int n, Style style)
     X11StatusCtx *ctx = vctx;
     for (int i = 0; i < n && ctx->col < ctx->cols; i++, ctx->col++) {
         int idx = ctx->row * ctx->xcols + ctx->col;
-        int g = xscr_glyph_slot((uint8_t)s[i]);
-        ctx->fb[idx]  = g < 0 ? 0 : (uint8_t)g;
+        uint8_t attr = 0;
+        ctx->fb[idx]  = xscr_glyph_byte(xscr_glyph_slot((uint8_t)s[i]), &attr);
         ctx->fgb[idx] = style.fg;
         ctx->bgb[idx] = style.bg;
-        ctx->atb[idx] = g < 0 ? XTERM_ATTR_MISSING : 0;
+        ctx->atb[idx] = attr;
     }
 }
 
