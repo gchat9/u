@@ -2,12 +2,20 @@
  * charset.h — the font's glyph set, as mkfont.c bakes it in: the one place
  * that says which codepoint each glyph of a font is.
  *
- * This is build input only. Each font file (font<STEP>.bfnt) records, in its
- * own tables, the codepoint of every glyph in it (see the layout in mkfont.c),
- * and xterm reads that, so the programs that draw text do not include this
- * file: the glyph set can change by rebuilding the fonts, with no program
- * rebuilt. What the glyph set is, and that it is what the programs assume, is
- * all that this file has to keep right.
+ * This is build input. Each font file (font<STEP>.bfnt) records, in its own
+ * tables, the codepoint of every glyph in it (see the layout in mkfont.c), and
+ * xterm reads that, so what is drawn does not depend on this file: the glyph
+ * set can change by rebuilding the fonts, with no program rebuilt.
+ *
+ * The one program-side use is vt.c's small cells (VT_CELL_COMPACT): a grid
+ * whose characters are all in this file's tables (and emoji_charset.h's) is
+ * stored at 2 bytes a cell, one with any other character at 8.  That only
+ * decides how much memory a window takes, never what it shows, so a font and
+ * a program built from different versions of this file still agree on every
+ * pixel; but a window that prints characters the program's copy lacks costs
+ * more, so rebuild the programs after growing the set, and put in it what
+ * programs actually print (the glyphs are cheap, a window that goes
+ * full-size is not).
  *
  * The narrow glyphs are slots 0..CHARSET_COUNT-1 of the font: the printable
  * ASCII, U+0020..U+007E, in slots 0..94 (the ASCII range below, a plain
@@ -80,6 +88,16 @@ static const uint16_t charset_extra[] = {
     0x00B0,                                            /* ° */
     0x00AB, 0x00BB,                                    /* « » */
     0x2026,                                            /* … */
+    /* what current command-line programs print and a font without it draws as
+     * a box: a no-break space (tree, ls -l), typographic quotes and the bullet
+     * (man, git, package managers), the four arrows, the open triangles
+     * (htop, vim, ncdu), circles, crosses, and the middle dot, multiplication
+     * and minus signs */
+    0x00A0, 0x00B7, 0x00D7, 0x2212,                    /*   · × −  */
+    0x2018, 0x2019, 0x201C, 0x201D, 0x2022,            /* ‘ ’ “ ” •  */
+    0x2190, 0x2191, 0x2192, 0x2193,                    /* ← ↑ → ↓  */
+    0x25B3, 0x25B7, 0x25BD, 0x25C1, 0x25CB, 0x25CF,    /* △ ▷ ▽ ◁ ○ ●  */
+    0x2717, 0x2718,                                    /* ✗ ✘ */
 };
 #define CHARSET_EXTRA_COUNT ((int)(sizeof(charset_extra) / sizeof(charset_extra[0])))
 

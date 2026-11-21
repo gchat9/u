@@ -27,8 +27,8 @@ static bool row_is(const VTParser *p, int r, const char *text, int flag)
 {
     char got[256]; int k = 0;
     for (int c = 0; c < p->scr.cols && k < 255; c++)
-        if (!(p->scr.cells[r][c].flags & CELL_WIDE_CONT))
-            got[k++] = (char)(p->scr.cells[r][c].ch ? p->scr.cells[r][c].ch : ' ');
+        if (!(vt_cell(&p->scr, r, c).flags & CELL_WIDE_CONT))
+            got[k++] = (char)(vt_cell(&p->scr, r, c).ch ? vt_cell(&p->scr, r, c).ch : ' ');
     got[k] = 0;
     while (k > 0 && got[k - 1] == ' ') got[--k] = 0;
     int wrapped = p->scr.row_flags[r] & ROW_WRAPPED ? 1 : 0;
@@ -81,18 +81,18 @@ static void scenario_wide(void)
     EXPECT(n == 2 && strcmp(got[0], "abc\xe4\xb8\xad" "d") == 0, "text at 4 columns");
     for (int i = 0; i < n; i++) free(got[i]);
     EXPECT(p->scr.row_flags[0] & ROW_WRAPPED, "the row before the wide character is flagged");
-    EXPECT(p->scr.cells[0][3].flags & CELL_PAD, "the margin cell is padding");
+    EXPECT(vt_cell(&p->scr, 0, 3).flags & CELL_PAD, "the margin cell is padding");
 
     vt_resize(p, 4, 8);                                   /* widen: the padding goes */
     n = recover(p, got, 8);
     EXPECT(n == 2 && strcmp(got[0], "abc\xe4\xb8\xad" "d") == 0, "text at 8 columns");
     for (int i = 0; i < n; i++) free(got[i]);
-    EXPECT(p->scr.cells[0][3].ch == 0x4E2D && !(p->scr.cells[0][3].flags & CELL_PAD),
+    EXPECT(vt_cell(&p->scr, 0, 3).ch == 0x4E2D && !(vt_cell(&p->scr, 0, 3).flags & CELL_PAD),
            "the wide character sits right after abc");
     EXPECT(!(p->scr.row_flags[0] & ROW_WRAPPED), "and the line is one row");
 
     vt_resize(p, 4, 3);                                   /* narrow: abc fills its row */
-    EXPECT(row_is_wrapped(p, 0) && p->scr.cells[1][0].ch == 0x4E2D,
+    EXPECT(row_is_wrapped(p, 0) && vt_cell(&p->scr, 1, 0).ch == 0x4E2D,
            "at 3 columns, abc fills row 0 and 中d starts row 1");
     vt_free(p);
     free(p);
@@ -147,7 +147,7 @@ static void scenario_rep(void)
     feed(p, "\x1b[44m \x1b[9b\x1b[0m");                  /* ten blue blanks in all */
     int blue = 0;
     for (int c = 0; c < 10; c++)
-        if (!(p->scr.cells[0][c].flags & CELL_BG_DFL) && p->scr.cells[0][c].bg == 4) blue++;
+        if (!(vt_cell(&p->scr, 0, c).flags & CELL_BG_DFL) && vt_cell(&p->scr, 0, c).bg == 4) blue++;
     EXPECT(blue == 10, "REP paints the whole row blue, got %d of 10 cells", blue);
     EXPECT(p->scr.cur_row == 0 && p->scr.cur_col == 9 && p->scr.pending_wrap,
            "cursor left at the margin with pending wrap, got %d,%d", p->scr.cur_row, p->scr.cur_col);
@@ -235,12 +235,12 @@ static int recover(const VTParser *p, char **out, int max)
     for (int r = s->cur_row + 1; r < s->rows; r++) {
         if (s->row_flags[r] & ROW_WRAPPED) { last = r; continue; }
         for (int c = 0; c < s->cols; c++)
-            if (s->cells[r][c].ch && s->cells[r][c].ch != ' ' && !(s->cells[r][c].flags & CELL_PAD)) last = r;
+            if (vt_cell(s, r, c).ch && vt_cell(s, r, c).ch != ' ' && !(vt_cell(s, r, c).flags & CELL_PAD)) last = r;
     }
     for (int r = 0; r <= last; r++) {   /* rows down to the last with text (or a wrap) */
         for (int c = 0; c < s->cols; c++) {
-            if (s->cells[r][c].flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
-            uint32_t ch = s->cells[r][c].ch;
+            if (vt_cell(s, r, c).flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
+            uint32_t ch = vt_cell(s, r, c).ch;
             q += utf8_put(q, ch ? ch : ' ');
         }
         if (!(s->row_flags[r] & ROW_WRAPPED)) *q++ = '\n';
@@ -410,7 +410,7 @@ static void random_run(unsigned seed, int steps)
             printf("]\n");
             for (int r = 0; r < p->scr.rows; r++) {
                 printf("      %c |", p->scr.row_flags[r] & ROW_WRAPPED ? 'W' : ' ');
-                for (int c = 0; c < p->scr.cols; c++) { uint32_t ch = p->scr.cells[r][c].ch; putchar(ch && ch < 0x80 ? (int)ch : '.'); }
+                for (int c = 0; c < p->scr.cols; c++) { uint32_t ch = vt_cell(&p->scr, r, c).ch; putchar(ch && ch < 0x80 ? (int)ch : '.'); }
                 printf("|\n");
             }
         }

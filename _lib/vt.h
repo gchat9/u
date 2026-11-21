@@ -56,10 +56,29 @@ typedef struct {
 /* Screen buffer                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A grid of cells, rows x cols.  row[r] points at row r; the rows are
+ * Cell[cols] when t is NULL (a full-size grid), and uint16_t[cols] otherwise
+ * (a small one: see VT_CELL_COMPACT in xterm_conf.h), the styles of which t
+ * lists.  Nothing outside vt.c needs to know that: read cells with
+ * vt_row() and vt_cell().  A grid that something else builds from Cell rows
+ * (a view) has t == NULL and its own row array.
+ */
+struct CTab;
 typedef struct {
-    Cell   **cells;         /* primary screen grid [rows][cols]          */
-    Cell   **alt_cells;     /* alternate screen grid                     */
+    void         **row;
+    struct CTab   *t;
+} Grid;
+
+typedef struct {
+    Grid     g;             /* the grid being shown: the primary screen's,
+                             * or in the alternate screen that one's        */
+    Grid     ag;            /* the other one (a primary screen that is out
+                             * of sight; none when not in the alternate)    */
     int      rows, cols;
+    uint8_t  hold, flips;   /* ED 2 clears to wait out before a full-size grid
+                             * is made small again, and how often one has
+                             * been made full-size lately (see vt.c: cleared) */
 
     /* Cursor */
     int      cur_row, cur_col;
@@ -187,6 +206,19 @@ void vt_init_view(VTParser *p, int rows, int cols);
 void vt_free  (VTParser *p);
 void vt_resize(VTParser *p, int rows, int cols);
 void vt_feed  (VTParser *p, const uint8_t *data, size_t len);
+
+/*
+ * Row r of the screen being shown, as Cell[cols].  For a small grid that is a
+ * decoded copy in one of two buffers shared by all screens (slot 0 or 1: ask
+ * for two rows at once with the two slots), valid until the next call with the
+ * same slot; for a full-size one it is the row itself.  Do not write to it.
+ * vt_cell() is the one cell, by value.
+ */
+#if VT_CELL_COMPACT
+extern int vt_compact;      /* 0: new grids are full-size cells (for tests) */
+#endif
+const Cell *vt_row (const Screen *s, int r, int slot);
+Cell        vt_cell(const Screen *s, int r, int c);
 
 /*
  * Serialize the complete VT parser + screen state to fd.

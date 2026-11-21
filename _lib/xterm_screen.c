@@ -122,8 +122,9 @@ void xscr_render(const Screen *s)
     int h = s->rows < rows ? s->rows : rows;
     int w = s->cols < cols ? s->cols : cols;
     for (int r = 0; r < h; r++) {
+        const Cell *row = vt_row(s, r, 0);
         for (int c = 0; c < w; c++) {
-            const Cell *cell = &s->cells[r][c];
+            const Cell *cell = &row[c];
             uint32_t ch = cell->ch;
             int i = r * cols + c;
             /* A wide cell is a CELL_WIDE cell plus a CELL_WIDE_CONT cell
@@ -139,8 +140,8 @@ void xscr_render(const Screen *s)
             uint32_t wch = 0; int right = 0;
             if (cell->flags & CELL_WIDE) wch = ch;
             else if ((cell->flags & CELL_WIDE_CONT) && c > 0 &&
-                     (s->cells[r][c-1].flags & CELL_WIDE)) {
-                wch = s->cells[r][c-1].ch; right = 1;
+                     (row[c-1].flags & CELL_WIDE)) {
+                wch = row[c-1].ch; right = 1;
             }
             uint8_t wattr = 0;
             int g = wch ? xscr_wide_glyph(wch, right, &wattr) : xscr_glyph_slot(ch);
@@ -294,8 +295,8 @@ static int utf8_encode(uint8_t *o, uint32_t cp)
  * of a word?  The second half of a wide character is not blank. */
 static int blank(const Screen *s, int r, int c)
 {
-    const Cell *x = &s->cells[r][c];
-    return (!x->ch || x->ch == ' ') && !(x->flags & CELL_WIDE_CONT);
+    Cell x = vt_cell(s, r, c);
+    return (!x.ch || x.ch == ' ') && !(x.flags & CELL_WIDE_CONT);
 }
 
 /* The end of the word at key k, d = -1 for its start, 1 for its end: a word
@@ -344,10 +345,11 @@ static char *sel_extract(const Screen *s, size_t *len)
         int a = rect || r == r0 ? c0 : 0, b = rect || r == r1 ? c1 : s->cols - 1;
         if (b >= s->cols) b = s->cols - 1;
         int wrapped = !rect && r < r1 && s->row_flags && (s->row_flags[r] & ROW_WRAPPED);
+        const Cell *row = vt_row(s, r, 0);
         if (!wrapped)
-            while (b >= a && (s->cells[r][b].ch == 0 || s->cells[r][b].ch == ' ')) b--;
+            while (b >= a && (row[b].ch == 0 || row[b].ch == ' ')) b--;
         for (int c = a; c <= b; c++) {
-            const Cell *cell = &s->cells[r][c];
+            const Cell *cell = &row[c];
             if (cell->flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
             n += (size_t)utf8_encode((uint8_t *)buf + n, cell->ch ? cell->ch : ' ');
         }

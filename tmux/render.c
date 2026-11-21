@@ -339,8 +339,9 @@ static int count_changed(const RenderState *rs, const Screen *s,
     int n = 0;
     for (int r = 0; r < rows; r++) {
         int src = src_row(r, shift, rows);
+        const Cell *row = vt_row(s, r, 0);
         for (int c = 0; c < cols; c++) {
-            const Cell *cell = &s->cells[r][c];
+            const Cell *cell = &row[c];
             if (cell->flags & CELL_WIDE_CONT) continue;
             const Cell *old = (src < 0) ? &BLANK_CELL : &rs->shadow[src][c];
             if (!cells_eq(cell, old)) n++;
@@ -406,7 +407,7 @@ static int maybe_scroll(RenderState *rs, const Screen *s, int rows, int cols,
 
     uint32_t *hnew = rs->row_hash, *hold = rs->row_hash + rs->rows;
     for (int r = 0; r < rows; r++) {
-        hnew[r] = row_hash(s->cells[r], cols);
+        hnew[r] = row_hash(vt_row(s, r, 0), cols);
         hold[r] = row_hash(rs->shadow[r], cols);
     }
 
@@ -505,7 +506,7 @@ static bool row_wants_wrap(const Screen *s, int r, int rows, int cols)
 static int wrap_cell_col(const Screen *s, int r, int cols)
 {
     int lc = cols - 1;
-    if (s->cells[r][lc].flags & CELL_WIDE_CONT) lc--;
+    if (vt_cell(s, r, lc).flags & CELL_WIDE_CONT) lc--;
     return lc;
 }
 
@@ -660,8 +661,8 @@ void render_screen(RenderState *rs, const Screen *s)
             clear_row_flag(rs, r, cols);
         int force_c = (want && !rs->shadow_row_wrapped[r])
                           ? wrap_cell_col(s, r, cols) : -1;
-        if (draw_row(rs, s->cells[r], rs->shadow[r], r, cols, want, force_c,
-                     want ? s->cells[r + 1] : NULL,
+        if (draw_row(rs, vt_row(s, r, 0), rs->shadow[r], r, cols, want, force_c,
+                     want ? vt_row(s, r + 1, 1) : NULL,
                      want ? rs->shadow[r + 1] : NULL))
             rs->shadow_row_wrapped[r] = true;
     }

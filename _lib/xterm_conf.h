@@ -77,6 +77,38 @@
 #endif
 
 /* ================================================================== */
+/* Cell grids                                                           */
+/* ================================================================== */
+
+/*
+ * A window's screen is kept as 2 bytes a cell for as long as everything on it
+ * is something the font draws, in not too many different styles, and as 8
+ * bytes a cell (what any Unicode character and the 256 colours need) from the
+ * first moment it is not.  It is decided per grid (the alternate screen has its
+ * own), and the full-size grid goes back to the small one when the screen is
+ * cleared or resized and everything fits again.
+ *
+ * A small cell is a glyph number (9 bits) and a style number (7 bits).  The
+ * glyph numbers are those of _font/charset.h: ASCII, then the characters the
+ * font has besides it, 511 glyphs at most.  The glyph number 511 stands for a
+ * double-width character: the cell after it holds all 16 bits of the glyph's
+ * index among the double-width glyphs (256) and the emoji (255).  The styles are the
+ * fg/bg/attribute combinations on the grid, up to 128 of them: the programs we
+ * know use a dozen or two, and the ones that are no longer on the screen are
+ * dropped when the table fills up.  A character the font does not have (it is
+ * drawn as a box), or the 129th style in use, makes the grid full-size.
+ * Nothing is ever lost or approximated.  (Overwriting, erasing or shifting half
+ * of a double-width character blanks the other half, in either format.)
+ *
+ * What it saves is 75% of a grid (66x24: 12K -> 3K) per window that is in the
+ * small format, for about 3K of code.  Set to 0 to always use the full-size
+ * cells.
+ */
+#ifndef VT_CELL_COMPACT
+#define VT_CELL_COMPACT     1
+#endif
+
+/* ================================================================== */
 /* Keyboard (xterm.c)                                                   */
 /* ================================================================== */
 

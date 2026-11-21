@@ -637,7 +637,7 @@ int session_observer_push(int obs_fd, const Screen *s,
 
     size_t row_bytes = (size_t)s->cols * sizeof(Cell);
     for (int r = 0; r < s->rows; r++)
-        if (write_all(obs_fd, s->cells[r], row_bytes) < 0) return -1;
+        if (write_all(obs_fd, vt_row(s, r, 0), row_bytes) < 0) return -1;
 
     return 0;
 }
@@ -792,7 +792,7 @@ static void obs_draw(RenderState *rs, Screen *scr, Cell **local,
                      const ObsHeader *h, int our_rows, int our_cols,
                      ObsStatusKey *key)
 {
-    scr->cells       = local;
+    scr->g.row       = (void **)local;   /* a view: full-size cells */
     scr->cur_row     = h->cur_row < scr->rows ? h->cur_row : scr->rows - 1;
     scr->cur_col     = h->cur_col < scr->cols ? h->cur_col : scr->cols - 1;
     scr->cur_visible = h->cur_visible;

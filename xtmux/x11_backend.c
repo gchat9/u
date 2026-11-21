@@ -98,27 +98,28 @@ void x11_backend_status(int row, int cols, int active,
  * pointer is kept to the rows above it (see main.c). */
 
 static Screen tv;                 /* the viewer's grid; cur_row -1: no cursor */
-static Cell  *tv_store;           /* the cells tv.cells[] point into */
+static Cell  *tv_store;           /* the cells tv.g.row[] point into */
+#define tvc ((Cell **)tv.g.row)   /* tv is a view: full-size cells */
 static int    tr_row, tr_col;     /* the text cursor */
 
 /* Make tv match the window's size.  It is blanked by _begin, and a resize
  * redraws the viewer, so nothing needs carrying over.  On allocation
- * failure tv.cells stays NULL and every function here does nothing. */
+ * failure tv.g.row stays NULL and every function here does nothing. */
 static void tv_fit(void)
 {
     int rows = xterm_rows(), cols = xterm_columns();
-    if (tv.cells && tv.rows == rows && tv.cols == cols) return;
-    free(tv.cells); free(tv_store); free(tv.row_flags);
-    tv.cells = NULL; tv_store = NULL; tv.row_flags = NULL; tv.rows = tv.cols = 0;
-    tv.cells     = malloc(sizeof *tv.cells * (size_t)rows);
+    if (tv.g.row && tv.rows == rows && tv.cols == cols) return;
+    free(tv.g.row); free(tv_store); free(tv.row_flags);
+    tv.g.row = NULL; tv_store = NULL; tv.row_flags = NULL; tv.rows = tv.cols = 0;
+    tv.g.row     = malloc(sizeof(void *) * (size_t)rows);
     tv_store     = malloc(sizeof *tv_store * (size_t)rows * (size_t)cols);
     tv.row_flags = malloc((size_t)rows);
-    if (!tv.cells || !tv_store || !tv.row_flags) {
-        free(tv.cells); free(tv_store); free(tv.row_flags);
-        tv.cells = NULL; tv_store = NULL; tv.row_flags = NULL;
+    if (!tv.g.row || !tv_store || !tv.row_flags) {
+        free(tv.g.row); free(tv_store); free(tv.row_flags);
+        tv.g.row = NULL; tv_store = NULL; tv.row_flags = NULL;
         return;
     }
-    for (int r = 0; r < rows; r++) tv.cells[r] = tv_store + (size_t)r * cols;
+    for (int r = 0; r < rows; r++) tvc[r] = tv_store + (size_t)r * cols;
     tv.rows = rows; tv.cols = cols;
     tv.cur_row = tv.cur_col = -1;
 }
@@ -126,7 +127,7 @@ static void tv_fit(void)
 static void blank_row(int r, Style st)
 {
     for (int c = 0; c < tv.cols; c++) {
-        Cell *x = &tv.cells[r][c];
+        Cell *x = &tvc[r][c];
         x->ch = 0; x->fg = st.fg; x->bg = st.bg; x->attrs = 0; x->flags = 0;
     }
     tv.row_flags[r] = 0;
@@ -134,13 +135,13 @@ static void blank_row(int r, Style st)
 
 void x11_backend_text_fill(int row, Style st)
 {
-    if (tv.cells && row >= 0 && row < tv.rows) blank_row(row, st);
+    if (tv.g.row && row >= 0 && row < tv.rows) blank_row(row, st);
 }
 
 void x11_backend_text_begin(void)
 {
     tv_fit();
-    if (!tv.cells) return;
+    if (!tv.g.row) return;
     for (int r = 0; r < tv.rows; r++) blank_row(r, (Style){ XTERM_FG_DEFAULT, XTERM_BG_DEFAULT });
     tr_row = tr_col = 0;
 }
@@ -171,7 +172,7 @@ static uint32_t next_char(const char **p, const char *end, int *width)
 static void put_text_char(int row, int col, uint32_t cp, int width, Style st)
 {
     for (int h = 0; h < width; h++) {
-        Cell *x = &tv.cells[row][col + h];
+        Cell *x = &tvc[row][col + h];
         x->ch    = h ? 0 : cp;
         x->fg    = st.fg;
         x->bg    = st.bg;
@@ -183,7 +184,7 @@ static void put_text_char(int row, int col, uint32_t cp, int width, Style st)
 /* Draw up to n bytes of text at (row, col), clipped to the row, no wrap. */
 void x11_backend_text_at(int row, int col, const char *s, int n, Style st)
 {
-    if (!tv.cells || row < 0 || row >= tv.rows) return;
+    if (!tv.g.row || row < 0 || row >= tv.rows) return;
     for (const char *end = s + n; s < end; ) {
         int w; uint32_t cp = next_char(&s, end, &w);
         if (!cp) continue;
@@ -202,16 +203,16 @@ static void text_break(int wrapped)
     tr_col = 0;
     if (++tr_row < tv.rows) return;
     tr_row = tv.rows - 1;
-    Cell *top = tv.cells[0];
-    memmove(tv.cells, tv.cells + 1, sizeof *tv.cells * (size_t)(tv.rows - 1));
-    tv.cells[tv.rows - 1] = top;
+    Cell *top = tvc[0];
+    memmove(tv.g.row, tv.g.row + 1, sizeof(void *) * (size_t)(tv.rows - 1));
+    tvc[tv.rows - 1] = top;
     memmove(tv.row_flags, tv.row_flags + 1, (size_t)(tv.rows - 1));
     blank_row(tv.rows - 1, (Style){ XTERM_FG_DEFAULT, XTERM_BG_DEFAULT });
 }
 
 void x11_backend_text_line(const char *s, int n, Style st, int wrapped)
 {
-    if (!tv.cells) return;
+    if (!tv.g.row) return;
     for (const char *end = s + n; s < end; ) {
         int w; uint32_t cp = next_char(&s, end, &w);
         if (!cp) continue;
@@ -227,7 +228,7 @@ void x11_backend_text_line(const char *s, int n, Style st, int wrapped)
  * one.  The text view has no cursor (cur_row is -1). */
 void x11_backend_text_end(void)
 {
-    if (tv.cells) xscr_render(&tv);
+    if (tv.g.row) xscr_render(&tv);
 }
 
 const Screen *x11_backend_text_screen(void) { return &tv; }

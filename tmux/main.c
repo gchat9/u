@@ -490,8 +490,9 @@ static void render_scrollback_view(void)
     for (int r = live_skip; r < s->rows && row < view_rows; r++, row++) {
         /* Find last non-space cell for trimming */
         int last = -1;
+        const Cell *row = vt_row(s, r, 0);
         for (int c = 0; c < s->cols; c++) {
-            Cell *cell = &s->cells[r][c];
+            const Cell *cell = &row[c];
             if (cell->flags & CELL_WIDE_CONT) continue;
             uint32_t cp = cell->ch ? cell->ch : ' ';
             if (cp != ' ') last = c;
@@ -500,7 +501,7 @@ static void render_scrollback_view(void)
         char line[(size_t)s->cols * 4];
         int  ll = 0;
         for (int c = 0; c <= last && c < s->cols; c++) {
-            Cell *cell = &s->cells[r][c];
+            const Cell *cell = &row[c];
             if (cell->flags & CELL_WIDE_CONT) continue;
             uint32_t cp = cell->ch ? cell->ch : ' ';
             if      (cp < 0x80)    { line[ll++] = (char)cp; }

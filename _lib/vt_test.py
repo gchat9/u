@@ -32,6 +32,15 @@ print("## BEL: a bell, but not the end of an OSC or DCS string")
 check("BEL sets the bell flag; OSC (BEL or ST) and DCS ends do not", ["bell"], "bell: 1 0 0 0")
 print("## alternate screen: restored on leaving, grid given back")
 check("primary comes back, alt starts blank, grid freed", ["alt"], "alt: primary PQ blank 1 freed 2 in_alt 0")
+print("## small cells against full-size cells (same traffic, same screen)")
+for seed, mode in ((1, 0), (2, 0), (3, 1), (4, 1), (5, 1), (6, 2), (7, 2), (8, 3), (9, 3), (10, 3)):
+    check("seed %d, mode %d, 20000 steps" % (seed, mode), ["diff", str(seed), "20000", str(mode)], "identical")
+print("## style table: full, then cleaned up")
+check("127 styles and a 3-line scroll widen the grid safely; styles that come and go do not",
+      ["styles"], "styles: full table widened 1, many styles in turn stayed small 1")
+print("## invalid UTF-8: nothing drawn for it, nothing lost after it")
+check("overlong, surrogate and too-large forms are dropped; a cut-short sequence does not eat the next byte",
+      ["utf8"], "[ab|][ab|][ab|][ab|][x|][x<e9>|][|xy][z|][<e9><2500>|]")
 print("## saved cursor after a screen shrink")
 check("restore after shrink stays on screen", ["repro"], "inside the 16-row screen: yes")
 print("## random escape-heavy traffic with resizes")

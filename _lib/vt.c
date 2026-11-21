@@ -21,6 +21,15 @@
 /* Cell / row helpers                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Is grid g in the small format?  (Never, if that is configured out.) */
+#if VT_CELL_COMPACT
+#define GT(g) ((g)->t)
+int vt_compact = 1;     /* 0: new grids are full-size (for tests) */
+#else
+#define GT(g) 0
+#endif
+static inline size_t gesz(const Grid *g) { return GT(g) ? 2 : sizeof(Cell); }
+
 static Cell blank_cell(const Screen *s)
 {
     Cell c = {0};
@@ -36,13 +45,6 @@ static Cell blank_cell(const Screen *s)
         c.bg = (uint8_t)s->cur_bg;
     }
     return c;
-}
-
-static void clear_row_range(Screen *s, Cell *row, int from, int to)
-{
-    Cell b = blank_cell(s);
-    for (int c = from; c <= to; c++)
-        row[c] = b;
 }
 
 /* ------------------------------------------------------------------ */
@@ -126,10 +128,10 @@ static void cells_madvise(void *buf, size_t len, int advice)
 
 /* Tell the kernel the data pages backing a cell grid are no longer
  * needed.  Call immediately before free_cells(). */
-static void cells_dontneed(Cell **grid, int rows, int cols)
+static void cells_dontneed(const Grid *g, int rows, int cols)
 {
-    cells_madvise(cells_data(grid, rows), cells_data_bytes(rows, cols),
-                  MADV_DONTNEED);
+    cells_madvise((char *)g->row + (size_t)rows * sizeof(void *),
+                  (size_t)rows * (size_t)cols * gesz(g), MADV_DONTNEED);
 }
 
 /* Tell the kernel the data pages of an inactive (alt) grid are cold
@@ -137,22 +139,587 @@ static void cells_dontneed(Cell **grid, int rows, int cols)
  * the data is still valid if accessed; the kernel just treats these
  * pages as candidates for reclaim under memory pressure.
  * Requires Linux 5.4+; guarded so older headers compile cleanly. */
-static void cells_cold(Cell **grid, int rows, int cols)
+static void cells_cold(const Grid *g, int rows, int cols)
 {
 #if defined(MADV_COLD)
-    cells_madvise(cells_data(grid, rows), cells_data_bytes(rows, cols),
-                  MADV_COLD);
+    cells_madvise((char *)g->row + (size_t)rows * sizeof(void *),
+                  (size_t)rows * (size_t)cols * gesz(g), MADV_COLD);
 #else
-    (void)grid; (void)rows; (void)cols;
+    (void)g; (void)rows; (void)cols;
 #endif
 }
 
 #else  /* !__linux__ */
-static void cells_dontneed(Cell **grid, int rows, int cols)
-{ (void)grid; (void)rows; (void)cols; }
-static void cells_cold(Cell **grid, int rows, int cols)
-{ (void)grid; (void)rows; (void)cols; }
+static void cells_dontneed(const Grid *g, int rows, int cols)
+{ (void)g; (void)rows; (void)cols; }
+static void cells_cold(const Grid *g, int rows, int cols)
+{ (void)g; (void)rows; (void)cols; }
 #endif /* __linux__ */
+
+/* ------------------------------------------------------------------ */
+/* Grid formats: full-size cells, and small ones (VT_CELL_COMPACT)      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A full-size grid (Grid.t == NULL) is rows of Cell.  A small one is rows of
+ * uint16_t, and Grid.t holds what the style numbers in them stand for.  A
+ * small cell is a glyph number (9 bits) and a style number (7 bits):
+ *
+ *   glyph number     for a narrow character, its slot in the font: 0..94 are
+ *                    U+0020..U+007E, then charset_extra[] (_font/charset.h),
+ *                    the characters the font draws: up to 511 of them, 0..510.
+ *                    511 is not a glyph: it says that this cell is the first
+ *                    half of a double-width character, and the cell after it
+ *                    is not a cell but the character: all 16 bits of it are
+ *                    the index of its glyph, 0..255 in charset_wide_extra[],
+ *                    256.. in emoji_charset[] (at most 255 of them, so that
+ *                    that value is never 511).  That is 511 + 511 glyphs in
+ *                    nine bits, and a wide character is two cells as it is in
+ *                    a full-size grid.
+ *   style number     an index into t->st: fg, bg, the attributes and the
+ *                    default-colour and padding flags, as seen so far on this
+ *                    grid (up to 128; 0 is the defaults and nothing else).  A
+ *                    wide character has the style of its first cell: the
+ *                    second half is drawn with it.
+ *
+ * so an all-zero cell is a plain blank, and a freshly calloc()ed grid is a
+ * blank screen whose pages cost nothing until they are written to.  The
+ * glyph tables are compile-time and shared, so a small grid only has styles
+ * to look up.
+ *
+ * The one thing a cell does not tell is whether it is the second half of a
+ * wide character: that is the cell before it being a 511.  So a wide
+ * character is never left in halves, in either kind of grid: whatever
+ * overwrites, erases, shifts or cuts off one half of it first blanks the other
+ * (cut(), heal(); as xterm does), and the second half is never anything
+ * but the one that follows its first.
+ *
+ * What cannot be told in this format -- a character outside the tables
+ * (which the font cannot draw either: it shows as a box), a wide one outside
+ * them, the 129th style that a cleanup of the table (grid_gc) does not
+ * free -- widens the grid first (grid_widen), so that every Cell can be
+ * stored.  A wide grid is made small again by grid_compact() when it is
+ * blank, or after a resize, if what is in it fits.
+ *
+ * The decoded rows that vt_row() hands out live in two buffers shared by all
+ * screens: the program is single-threaded and uses a row between two calls.
+ */
+#if VT_CELL_COMPACT
+
+#include "../_font/charset.h"
+#include "../_font/emoji_charset.h"
+
+#define WMARK 511       /* the glyph number of the first half of a wide character */
+
+_Static_assert(CHARSET_COUNT <= WMARK && CHARSET_WIDE_COUNT <= 256 && EMOJI_COUNT <= 255,
+               "the font's glyph set does not fit the glyph numbers of a small cell");
+
+typedef struct CTab {
+    uint32_t st[128];         /* fg | bg << 8 | attrs << 16 | flags << 24 */
+    uint8_t  nst, hint;       /* entries used; the one found last         */
+} CTab;
+
+#define ST_FLAGS    (CELL_FG_DFL | CELL_BG_DFL | CELL_PAD)
+#define ST_DEFAULT  ((uint32_t)(CELL_FG_DFL | CELL_BG_DFL) << 24)
+
+static Cell *vt_scr[2];
+static int   vt_scr_cap;
+
+static int scratch_need(int cols)
+{
+    if (cols <= vt_scr_cap) return 1;
+    for (int i = 0; i < 2; i++) {
+        Cell *b = realloc(vt_scr[i], (size_t)cols * sizeof(Cell));
+        if (!b) return 0;
+        vt_scr[i] = b;
+    }
+    vt_scr_cap = cols;
+    return 1;
+}
+
+/* The glyph number of codepoint cp: of a narrow character (wide == 0), or the
+ * index of a double-width one; -1 if the tables have none. */
+static int glyph_of(uint32_t cp, int wide)
+{
+    if (!wide) {
+        if (cp - 0x20 < 95) return (int)(cp - 0x20);
+        if (!cp) return 0;
+        for (int i = 0; i < CHARSET_EXTRA_COUNT; i++)
+            if (charset_extra[i] == cp) return CHARSET_EXTRA_BASE + i;
+        return -1;
+    }
+    for (int i = 0; i < CHARSET_WIDE_COUNT; i++)
+        if (charset_wide_extra[i] == cp) return i;
+    for (int i = 0; i < EMOJI_COUNT; i++)
+        if (emoji_charset[i] == cp) return 256 + i;
+    return -1;
+}
+
+/* The codepoint of glyph number g (a blank for a number that is none, which
+ * only a damaged grid has). */
+static uint32_t cp_of(unsigned g, int wide)
+{
+    if (wide) {
+        if (g < 256) return g < CHARSET_WIDE_COUNT ? charset_wide_extra[g] : ' ';
+        return g - 256 < EMOJI_COUNT ? emoji_charset[g - 256] : ' ';
+    }
+    if (g < CHARSET_EXTRA_BASE) return 0x20 + g;
+    return g - CHARSET_EXTRA_BASE < CHARSET_EXTRA_COUNT ? charset_extra[g - CHARSET_EXTRA_BASE] : ' ';
+}
+
+/* The part of a cell that a style number stands for. */
+static uint32_t skey(const Cell *x)
+{
+    unsigned f = x->flags;
+    return ((f & CELL_FG_DFL) ? 0u : x->fg)
+         | ((f & CELL_BG_DFL) ? 0u : (uint32_t)x->bg << 8)
+         | (uint32_t)x->attrs << 16
+         | (uint32_t)(f & ST_FLAGS) << 24;
+}
+
+/* The cell(s) at x (avail of them from there on) as small cells in out[0..1],
+ * adding the style to the tables.  Returns the number of cells that went
+ * into it (1, or 2 for a wide character and its second half); 0 if they do
+ * not fit the format for what is in them (the tables have no glyph for the
+ * character, or this is half a character); ENC_FULL if the style table is
+ * full. */
+#define ENC_FULL (-1)
+static int enc16(CTab *t, const Cell *x, int avail, uint16_t *out)
+{
+    unsigned f = x->flags;
+    int wide = (f & CELL_WIDE) != 0, g = WMARK, w = 0;
+    if (f & CELL_WIDE_CONT) return 0;           /* a second half, but not after a first */
+    if (wide) {
+        if (avail < 2 || !(x[1].flags & CELL_WIDE_CONT) || x[1].ch ||
+            skey(x) != skey(x + 1) || (w = glyph_of(x->ch, 1)) < 0)
+            return 0;
+    } else if ((g = glyph_of(x->ch, 0)) < 0) {
+        return 0;
+    }
+    uint32_t key = skey(x);
+    unsigned j = t->hint;
+    if (t->st[j] != key) {
+        for (j = 0; j < t->nst && t->st[j] != key; j++) ;
+        if (j == t->nst) {
+            if (j == 128) return ENC_FULL;
+            t->st[t->nst++] = key;
+        }
+        t->hint = (uint8_t)j;
+    }
+    out[0] = (uint16_t)(g | j << 9);
+    if (wide) out[1] = (uint16_t)w;
+    return 1 + wide;
+}
+
+/* Cell number j of the style table t's style number, without its character. */
+static Cell dec_style(const CTab *t, unsigned j)
+{
+    uint32_t k = t->st[j];
+    Cell x;
+    x.ch    = 0;
+    x.fg    = (uint8_t)k;
+    x.bg    = (uint8_t)(k >> 8);
+    x.attrs = (uint8_t)(k >> 16);
+    x.flags = (uint8_t)(k >> 24);
+    return x;
+}
+
+/* The two halves of the wide character that starts at cell v, whose second
+ * half is raw. */
+static void dec_wide(const CTab *t, uint16_t v, uint16_t raw, Cell *two)
+{
+    two[0] = dec_style(t, v >> 9);
+    two[1] = two[0];
+    two[0].ch = cp_of(raw, 1);
+    two[0].flags |= CELL_WIDE;
+    two[1].flags |= CELL_WIDE_CONT;
+}
+
+#endif /* VT_CELL_COMPACT */
+
+/* A new grid, blank: small if allowed, else (or if there is no memory for
+ * that) full-size.  0 if there is no memory at all.  A small grid is one
+ * allocation: the row pointers, the cells, the tables. */
+static int grid_new(Grid *g, int rows, int cols)
+{
+    memset(g, 0, sizeof *g);
+#if VT_CELL_COMPACT
+    if (vt_compact && scratch_need(cols)) {
+        size_t cells = ((size_t)rows * cols * 2 + 3) & ~(size_t)3;
+        void **r = calloc(1, (size_t)rows * sizeof(void *) + cells + sizeof(CTab));
+        if (r) {
+            uint16_t *d = (uint16_t *)(r + rows);
+            for (int i = 0; i < rows; i++) r[i] = d + (size_t)i * cols;
+            g->t = (CTab *)((char *)d + cells);
+            g->t->st[0] = ST_DEFAULT;
+            g->t->nst = 1;
+            g->row = r;
+            return 1;
+        }
+    }
+#endif
+    g->row = (void **)alloc_cells(rows, cols);
+    return g->row != NULL;
+}
+
+static void grid_free(Grid *g, int rows, int cols)
+{
+    if (g->row) {
+        cells_dontneed(g, rows, cols);
+        free(g->row);               /* and the tables, if any: they are in it */
+    }
+    memset(g, 0, sizeof *g);
+}
+
+/* Row rowp of grid g, as Cell[cols] in out. */
+static void rowdec(const Grid *g, const void *rowp, int cols, Cell *out)
+{
+#if VT_CELL_COMPACT
+    if (g->t) {
+        const uint16_t *p = rowp;
+        for (int c = 0; c < cols; c++) {
+            uint16_t v = p[c];
+            if ((v & 511) == WMARK && c + 1 < cols) {
+                dec_wide(g->t, v, p[c + 1], out + c);
+                c++;
+                continue;
+            }
+            Cell x = dec_style(g->t, v >> 9);
+            x.ch = (v & 511) == WMARK ? ' ' : cp_of(v & 511, 0);   /* (a 511 with no room for its half) */
+            out[c] = x;
+        }
+        return;
+    }
+#endif
+    memcpy(out, rowp, (size_t)cols * sizeof(Cell));
+}
+
+static const Cell *grow(const Screen *s, const Grid *g, int r, int slot)
+{
+#if VT_CELL_COMPACT
+    if (g->t) {
+        rowdec(g, g->row[r], s->cols, vt_scr[slot]);
+        return vt_scr[slot];
+    }
+#endif
+    return g->row[r];
+}
+
+const Cell *vt_row(const Screen *s, int r, int slot)
+{
+    return grow(s, &s->g, r, slot);
+}
+
+Cell vt_cell(const Screen *s, int r, int c)
+{
+#if VT_CELL_COMPACT
+    if (s->g.t) {
+        const uint16_t *p = s->g.row[r];
+        Cell two[2];
+        if (c > 0 && (p[c - 1] & 511) == WMARK) {       /* the second half */
+            dec_wide(s->g.t, p[c - 1], p[c], two);
+            return two[1];
+        }
+        if ((p[c] & 511) == WMARK && c + 1 < s->cols) {
+            dec_wide(s->g.t, p[c], p[c + 1], two);
+            return two[0];
+        }
+        Cell x = dec_style(s->g.t, p[c] >> 9);
+        x.ch = cp_of(p[c] & 511, 0);
+        return x;
+    }
+#endif
+    return ((const Cell *)s->g.row[r])[c];
+}
+
+/* Make grid g (a screen's, of its size) full-size.  0 if out of memory, and
+ * g as it was. */
+static int grid_widen(const Screen *s, Grid *g)
+{
+#if VT_CELL_COMPACT
+    if (!g->t) return 1;
+    Cell **w = alloc_cells(s->rows, s->cols);
+    if (!w) return 0;
+    for (int r = 0; r < s->rows; r++) rowdec(g, g->row[r], s->cols, w[r]);
+    grid_free(g, s->rows, s->cols);
+    g->row  = (void **)w;
+#else
+    (void)s; (void)g;
+#endif
+    return 1;
+}
+
+#if VT_CELL_COMPACT
+/* All of a row of cells as small cells in out (NULL: only see whether they
+ * would fit).  1, or what enc16 says. */
+static int row_enc(CTab *t, const Cell *x, int cols, uint16_t *out)
+{
+    uint16_t o[2];
+    for (int c = 0; c < cols; ) {
+        int k = enc16(t, x + c, cols - c, o);
+        if (k <= 0) return k;
+        if (out) { out[c] = o[0]; if (k == 2) out[c + 1] = o[1]; }
+        c += k;
+    }
+    return 1;
+}
+#endif
+
+/* Make full-size grid g small again if all of it fits. */
+static void grid_compact(const Screen *s, Grid *g)
+{
+#if VT_CELL_COMPACT
+    if (g->t || !g->row || !vt_compact) return;
+    Grid n;
+    if (!grid_new(&n, s->rows, s->cols)) return;
+    int ok = n.t != NULL;
+    for (int r = 0; ok && r < s->rows; r++)
+        ok = row_enc(n.t, g->row[r], s->cols, NULL) == 1 &&
+             row_enc(n.t, g->row[r], s->cols, n.row[r]) == 1;
+    if (!ok) { grid_free(&n, s->rows, s->cols); return; }
+    grid_free(g, s->rows, s->cols);
+    *g = n;
+#else
+    (void)s; (void)g;
+#endif
+}
+
+#if VT_CELL_COMPACT
+/* The style table of small grid g (a screen's) is full: renumber the styles
+ * that its cells use, dropping the rest, which are all that a long-lived
+ * window collects.  Cells are rewritten in place (rows do not move).  Returns
+ * 0 if every style is in use (nothing was freed). */
+static int grid_gc(const Screen *s, Grid *g)
+{
+    CTab *t = g->t;
+    uint8_t used[128] = {1};                /* style 0 is the blank */
+    for (int r = 0; r < s->rows; r++) {
+        const uint16_t *p = g->row[r];
+        for (int c = 0; c < s->cols; c++) {
+            used[p[c] >> 9] = 1;
+            if ((p[c] & 511) == WMARK) c++;     /* the character, not a cell */
+        }
+    }
+    uint8_t map[128];
+    unsigned n = 0;
+    for (unsigned i = 0; i < t->nst; i++)
+        if (used[i]) { map[i] = (uint8_t)n; t->st[n++] = t->st[i]; }
+    if (n == t->nst) return 0;
+    for (int r = 0; r < s->rows; r++) {
+        uint16_t *p = g->row[r];
+        for (int c = 0; c < s->cols; c++) {
+            int w = (p[c] & 511) == WMARK;
+            p[c] = (uint16_t)((p[c] & 511) | map[p[c] >> 9] << 9);
+            if (w) c++;
+        }
+    }
+    t->nst = (uint8_t)n;
+    t->hint = 0;
+    return 1;
+}
+
+/* Make small grid g full-size because of what is being written to it.  Each
+ * time that happens soon after the grid was made small again, an ED 2 has to
+ * wait longer before it does that (cleared): a program that clears and repaints
+ * wide text every frame would otherwise flip the grid every other frame. */
+static int widen_for_content(Screen *s, Grid *g)
+{
+    if (!g->t) return 1;
+    if (!grid_widen(s, g)) return 0;
+    s->hold = s->flips ? (uint8_t)(1u << s->flips) : 0;
+    if (s->flips < 4) s->flips++;
+    return 1;
+}
+#endif
+
+/* Row r of grid g (a screen's) is to become the cells x, Cell[cols]: it
+ * is stored small if they fit, tidying the style table once if it is full;
+ * else the grid is widened first. */
+static void row_store(Screen *s, Grid *g, int r, const Cell *x)
+{
+#if VT_CELL_COMPACT
+    if (g->t) {
+        int e = row_enc(g->t, x, s->cols, NULL);
+        if (e == ENC_FULL && grid_gc(s, g)) e = row_enc(g->t, x, s->cols, NULL);
+        if (e == 1) { row_enc(g->t, x, s->cols, g->row[r]); return; }
+        if (!widen_for_content(s, g)) { memset(g->row[r], 0, (size_t)s->cols * 2); return; }
+    }
+#endif
+    memcpy(g->row[r], x, (size_t)s->cols * sizeof(Cell));
+}
+
+/* Is cell c of row r of g the first half of a wide character; the second? */
+static int is_first(const Grid *g, int r, int c)
+{
+#if VT_CELL_COMPACT
+    if (g->t) return (((const uint16_t *)g->row[r])[c] & 511) == WMARK;
+#endif
+    return (((const Cell *)g->row[r])[c].flags & CELL_WIDE) != 0;
+}
+
+static int is_second(const Grid *g, int r, int c)
+{
+    if (c == 0) return 0;
+#if VT_CELL_COMPACT
+    if (g->t) return (((const uint16_t *)g->row[r])[c - 1] & 511) == WMARK;
+#endif
+    return (((const Cell *)g->row[r])[c].flags & CELL_WIDE_CONT) != 0;
+}
+
+/* Store the narrow cell x at (r, c) of grid g, which is a screen's; the grid
+ * is widened if x does not fit.  Not a part of a wide character: see cut(). */
+static void store1(Screen *s, Grid *g, int r, int c, const Cell *x)
+{
+#if VT_CELL_COMPACT
+    if (g->t) {
+        uint16_t v[2];
+        int e = enc16(g->t, x, 1, v);
+        if (e == ENC_FULL && grid_gc(s, g)) e = enc16(g->t, x, 1, v);
+        if (e == 1) { ((uint16_t *)g->row[r])[c] = v[0]; return; }
+        if (!widen_for_content(s, g)) { ((uint16_t *)g->row[r])[c] = 0; return; }
+    }
+#endif
+    ((Cell *)g->row[r])[c] = *x;
+}
+
+/* Columns a..b of row r of g are about to be overwritten.  A wide character
+ * that this cuts in two (it starts before a, or ends after b) loses its other
+ * half: it becomes a blank, as in xterm. */
+static void cut(Screen *s, Grid *g, int r, int a, int b)
+{
+    Cell bl = blank_cell(s);
+    int first = a > 0 && is_second(g, r, a);
+    int last  = b + 1 < s->cols && is_first(g, r, b);
+    /* The first half goes first, so that what is left in between (the second half
+     * as a cell of its own) is still a grid that can be widened. */
+    if (first) store1(s, g, r, a - 1, &bl);
+    if (last) { store1(s, g, r, b, &bl); store1(s, g, r, b + 1, &bl); }
+}
+
+/* Store x at (r, c) of grid g (a screen's); a narrow cell. */
+static void cput(Screen *s, Grid *g, int r, int c, Cell x)
+{
+    cut(s, g, r, c, c);
+    store1(s, g, r, c, &x);
+}
+
+/* Store the wide character x (x has the CELL_WIDE flag) and its second half,
+ * at (r, c) and (r, c + 1). */
+static void cput_wide(Screen *s, Grid *g, int r, int c, Cell x)
+{
+    cut(s, g, r, c, c + 1);
+#if VT_CELL_COMPACT
+    if (g->t) {
+        Cell two[2] = { x, x };
+        two[1].ch = 0;
+        two[1].flags = (uint8_t)((x.flags & ~CELL_WIDE) | CELL_WIDE_CONT);
+        uint16_t v[2];
+        int e = enc16(g->t, two, 2, v);
+        if (e == ENC_FULL && grid_gc(s, g)) e = enc16(g->t, two, 2, v);
+        if (e == 2) { ((uint16_t *)g->row[r])[c] = v[0]; ((uint16_t *)g->row[r])[c + 1] = v[1]; return; }
+        if (!widen_for_content(s, g)) { ((uint16_t *)g->row[r])[c] = ((uint16_t *)g->row[r])[c + 1] = 0; return; }
+    }
+#endif
+    Cell *row = g->row[r];
+    row[c] = x;
+    row[c + 1] = x;
+    row[c + 1].ch = 0;
+    row[c + 1].flags = (uint8_t)((x.flags & ~CELL_WIDE) | CELL_WIDE_CONT);
+}
+
+/* Make the blank cell, as the current rendition draws it, storable in the
+ * screen being shown, widening it if it is not: the operations that move rows
+ * about and blank some of them call this first, so that none of them can find
+ * the grid replaced half way. */
+static void blank_ready(Screen *s)
+{
+#if VT_CELL_COMPACT
+    if (!s->g.t) return;
+    Cell b = blank_cell(s);
+    uint16_t v[2];
+    int e = enc16(s->g.t, &b, 1, v);
+    if (e == ENC_FULL && grid_gc(s, &s->g)) e = enc16(s->g.t, &b, 1, v);
+    if (e != 1) widen_for_content(s, &s->g);
+#else
+    (void)s;
+#endif
+}
+
+/* Erase columns from..to of row r of the screen being shown. */
+static void fill(Screen *s, int r, int from, int to)
+{
+    Cell b = blank_cell(s);
+    Grid *g = &s->g;
+    cut(s, g, r, from, to);
+#if VT_CELL_COMPACT
+    if (g->t) {
+        uint16_t v[2];
+        int e = enc16(g->t, &b, 1, v);
+        if (e == ENC_FULL && grid_gc(s, g)) e = enc16(g->t, &b, 1, v);
+        if (e == 1) {
+            for (int c = from; c <= to; c++) ((uint16_t *)g->row[r])[c] = v[0];
+            return;
+        }
+        if (!widen_for_content(s, g)) return;
+    }
+#endif
+    for (int c = from; c <= to; c++) ((Cell *)g->row[r])[c] = b;
+}
+
+/* Erase the whole screen being shown, which is a new grid. */
+static void fill_new(Screen *s)
+{
+#if VT_CELL_COMPACT
+    if (s->g.t) {
+        Cell b = blank_cell(s);
+        uint16_t v[2];
+        int e = enc16(s->g.t, &b, 1, v);
+        if (e == ENC_FULL && grid_gc(s, &s->g)) e = enc16(s->g.t, &b, 1, v);
+        if (e == 1 && !v[0]) return;                /* it is zero already */
+    }
+#endif
+    for (int r = 0; r < s->rows; r++) fill(s, r, 0, s->cols - 1);
+}
+
+/* A wide character in x[c] that is only half of one (a first half with no
+ * second, a second with no first) becomes a blank. */
+static void heal(Cell *x, int c, int cols, Cell blank)
+{
+    if (c < 0 || c >= cols) return;
+    if (((x[c].flags & CELL_WIDE_CONT) && (c == 0 || !(x[c - 1].flags & CELL_WIDE))) ||
+        ((x[c].flags & CELL_WIDE) && (c + 1 >= cols || !(x[c + 1].flags & CELL_WIDE_CONT))))
+        x[c] = blank;
+}
+
+/* Move n cells of row r of the screen being shown from column src to dst.  The
+ * row is worked on as full-size cells, so that a wide character that this
+ * leaves in half can be blanked at the places where it can happen. */
+static void row_move(Screen *s, int r, int dst, int src, int n)
+{
+    Cell *x = s->g.row[r];
+#if VT_CELL_COMPACT
+    if (s->g.t) { x = vt_scr[1]; rowdec(&s->g, s->g.row[r], s->cols, x); }
+#endif
+    memmove(x + dst, x + src, (size_t)n * sizeof(Cell));
+    Cell b = blank_cell(s);
+    heal(x, dst - 1, s->cols, b); heal(x, dst, s->cols, b);
+    heal(x, dst + n - 1, s->cols, b); heal(x, dst + n, s->cols, b);
+#if VT_CELL_COMPACT
+    if (s->g.t) row_store(s, &s->g, r, x);
+#endif
+}
+
+/* The screen has just been cleared (ED 2/3): a grid that went full-size may
+ * be small again.  ED 2 is also what a program repainting wide text sends
+ * every frame, so that one waits out some clears (hold) after the widening;
+ * how many grows with every flip (widen_for_content), and ED 3, which is a
+ * program asking to forget, makes it none. */
+static void cleared(Screen *s, int force)
+{
+    if (force) s->hold = s->flips = 0;
+    if (!GT(&s->g) && s->hold) s->hold--;
+    else grid_compact(s, &s->g);
+}
 
 /* ------------------------------------------------------------------ */
 /* Tab stops                                                            */
@@ -192,8 +759,8 @@ static void scr_init(Screen *s, int rows, int cols, bool history)
     memset(s, 0, sizeof(*s));
     s->rows           = rows;
     s->cols           = cols;
-    s->cells     = alloc_cells(rows, cols);
-    s->alt_cells = NULL;   /* allocated lazily on first ?1047h/?1049h */
+    grid_new(&s->g, rows, cols);
+    /* s->ag: allocated lazily on first ?1047h/?1049h */
     s->row_flags = calloc((size_t)rows, 1);
 #if SCROLLBACK_ENABLED
     s->scrollback     = history ? calloc(1, SCROLLBACK_BYTES) : NULL;
@@ -214,7 +781,7 @@ static void scr_init(Screen *s, int rows, int cols, bool history)
  * pair, leaving swaps them back. */
 static void alt_swap(Screen *s)
 {
-    Cell **g = s->cells;     s->cells     = s->alt_cells;     s->alt_cells     = g;
+    Grid g = s->g;           s->g         = s->ag;            s->ag            = g;
     uint8_t *f = s->row_flags; s->row_flags = s->alt_row_flags; s->alt_row_flags = f;
     s->in_alt_screen = !s->in_alt_screen;
 }
@@ -223,22 +790,19 @@ static void alt_swap(Screen *s)
  * alternate one. */
 static int alt_enter(Screen *s)
 {
-    if (!s->alt_cells)      s->alt_cells      = alloc_cells(s->rows, s->cols);
+    if (!s->ag.row && !grid_new(&s->ag, s->rows, s->cols)) return 0;
     if (!s->alt_row_flags)  s->alt_row_flags  = calloc((size_t)s->rows, 1);
-    if (!s->alt_cells || !s->alt_row_flags) return 0;
+    if (!s->alt_row_flags) return 0;
     alt_swap(s);
     memset(s->row_flags, 0, (size_t)s->rows);
     return 1;
 }
 
-/* Free the grid in alt_cells (after alt_swap that is the alternate screen's,
+/* Free the grid in ag (after alt_swap that is the alternate screen's,
  * once it is left).  The flags stay: they are one byte a row. */
 static void alt_release(Screen *s)
 {
-    if (!s->alt_cells) return;
-    cells_dontneed(s->alt_cells, s->rows, s->cols);
-    free_cells(s->alt_cells, s->rows);
-    s->alt_cells = NULL;
+    grid_free(&s->ag, s->rows, s->cols);
 }
 
 static void scr_free(Screen *s)
@@ -254,12 +818,8 @@ static void scr_free(Screen *s)
     /* Hint to the kernel: these pages will not be read again.
      * This immediately reduces RSS for the calling process even though
      * the virtual address range stays committed to the allocator. */
-    if (s->cells)     cells_dontneed(s->cells,     s->rows, s->cols);
-    if (s->alt_cells) cells_dontneed(s->alt_cells, s->rows, s->cols);
-    free_cells(s->cells,     s->rows);
-    free_cells(s->alt_cells, s->rows);
-    s->cells     = NULL;
-    s->alt_cells = NULL;
+    grid_free(&s->g,  s->rows, s->cols);
+    grid_free(&s->ag, s->rows, s->cols);
 }
 
 /* ------------------------------------------------------------------ */
@@ -285,9 +845,14 @@ static void scr_free(Screen *s)
  *  - Append '\n'
  *  - If the buffer has no room, drop the oldest line (first '\n') first
  */
-static void scrollback_capture(Screen *s, Cell **row_ptr, uint8_t rflags)
+static void scrollback_capture(Screen *s, const void *rowp, uint8_t rflags)
 {
     if (!s->scrollback) return;
+
+    const Cell *row = rowp;
+#if VT_CELL_COMPACT
+    if (s->g.t) { rowdec(&s->g, rowp, s->cols, vt_scr[0]); row = vt_scr[0]; }
+#endif
 
     /* Encode row to a temp buffer */
     char tmp[4096];
@@ -295,7 +860,7 @@ static void scrollback_capture(Screen *s, Cell **row_ptr, uint8_t rflags)
     int  last_nonspace = -1;
 
     for (int c = 0; c < s->cols && tlen < (int)sizeof(tmp) - 4; c++) {
-        Cell *cell = &(*row_ptr)[c];
+        const Cell *cell = &row[c];
         if (cell->flags & (CELL_WIDE_CONT | CELL_PAD)) continue;
 
         uint32_t cp = cell->ch ? cell->ch : ' ';
@@ -349,19 +914,29 @@ static void scrollback_capture(Screen *s, Cell **row_ptr, uint8_t rflags)
 }
 #endif /* SCROLLBACK_ENABLED */
 
+/* Rotate rows top..top+height-1 (of the screen being shown, and their wrap
+ * flags) up by k: the first k go to the end, the rest move up.  Only the row
+ * pointers move, not the cells; no memory is needed. */
+static void rot_rows(Screen *s, int top, int height, int k)
+{
+    for (int pass = 0; pass < 3; pass++) {
+        int lo = pass == 1 ? k : 0, hi = pass == 0 ? k : height;
+        for (int i = lo, j = hi - 1; i < j; i++, j--) {
+            void *t = s->g.row[top + i]; s->g.row[top + i] = s->g.row[top + j]; s->g.row[top + j] = t;
+            if (s->row_flags) {
+                uint8_t f = s->row_flags[top + i];
+                s->row_flags[top + i] = s->row_flags[top + j]; s->row_flags[top + j] = f;
+            }
+        }
+    }
+}
+
 static void scroll_up(Screen *s, int n)
 {
     if (n <= 0) return;
     int height = s->scroll_bottom - s->scroll_top + 1;
     if (n > height) n = height;
-
-    /* Save the lines that will be erased */
-    Cell **save = malloc((size_t)n * sizeof(Cell *));
-    uint8_t *fsave = s->row_flags ? malloc((size_t)n) : NULL;
-    for (int i = 0; i < n; i++) {
-        save[i] = s->cells[s->scroll_top + i];
-        if (fsave) fsave[i] = s->row_flags[s->scroll_top + i];
-    }
+    blank_ready(s);
 
 #if SCROLLBACK_ENABLED
     /* Capture departing lines into scrollback.
@@ -371,62 +946,37 @@ static void scroll_up(Screen *s, int n)
      * - alternate screen content is temporary and not historically useful. */
     if (s->scroll_top == 0 && !s->in_alt_screen) {
         for (int i = 0; i < n; i++)
-            scrollback_capture(s, &save[i], fsave ? fsave[i] : 0);
+            scrollback_capture(s, s->g.row[i], s->row_flags ? s->row_flags[i] : 0);
     }
 #endif
 
-    /* Shift surviving lines up */
-    memmove(&s->cells[s->scroll_top],
-            &s->cells[s->scroll_top + n],
-            (size_t)(height - n) * sizeof(Cell *));
-    if (s->row_flags)
-        memmove(&s->row_flags[s->scroll_top],
-                &s->row_flags[s->scroll_top + n],
-                (size_t)(height - n));
-
-    /* Put the recycled rows at the bottom and blank them */
-    for (int i = 0; i < n; i++) {
-        s->cells[s->scroll_bottom - n + 1 + i] = save[i];
-        clear_row_range(s, s->cells[s->scroll_bottom - n + 1 + i],
-                        0, s->cols - 1);
-        if (s->row_flags) s->row_flags[s->scroll_bottom - n + 1 + i] = 0;
+    /* The first n rows (the ones that go) are recycled as the last n, blank */
+    rot_rows(s, s->scroll_top, height, n);
+    for (int i = s->scroll_bottom - n + 1; i <= s->scroll_bottom; i++) {
+        fill(s, i, 0, s->cols - 1);
+        if (s->row_flags) s->row_flags[i] = 0;
     }
-    free(save);
-    free(fsave);
 }
 
 /*
  * Scroll the scroll region DOWN by `n` lines.
  * Lines at scroll_bottom-n+1..scroll_bottom are discarded;
  * scroll_top..scroll_bottom-n shift down; n blank lines at top.
+ * The wrap flag belongs to its line: it moves down with it, and the
+ * blank lines put in at the top have none.
  */
 static void scroll_down(Screen *s, int n)
 {
     if (n <= 0) return;
     int height = s->scroll_bottom - s->scroll_top + 1;
     if (n > height) n = height;
+    blank_ready(s);
 
-    Cell **save = malloc((size_t)n * sizeof(Cell *));
-    for (int i = 0; i < n; i++)
-        save[i] = s->cells[s->scroll_bottom - n + 1 + i];
-
-    memmove(&s->cells[s->scroll_top + n],
-            &s->cells[s->scroll_top],
-            (size_t)(height - n) * sizeof(Cell *));
-    /* The wrap flag belongs to its line: it moves down with it, and the
-     * blank lines put in at the top have none. */
-    if (s->row_flags) {
-        memmove(&s->row_flags[s->scroll_top + n],
-                &s->row_flags[s->scroll_top],
-                (size_t)(height - n));
-        memset(&s->row_flags[s->scroll_top], 0, (size_t)n);
+    rot_rows(s, s->scroll_top, height, height - n);
+    for (int i = s->scroll_top; i < s->scroll_top + n; i++) {
+        fill(s, i, 0, s->cols - 1);
+        if (s->row_flags) s->row_flags[i] = 0;
     }
-
-    for (int i = 0; i < n; i++) {
-        s->cells[s->scroll_top + i] = save[i];
-        clear_row_range(s, s->cells[s->scroll_top + i], 0, s->cols - 1);
-    }
-    free(save);
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +1061,7 @@ static void put_char(VTParser *p, uint32_t ch)
      * time. The >= 0x1100 guard keeps the table scans off the hot path
      * for all ordinary text. */
     int width = cp_width(ch);
-    if (!width) return;
+    if (!width || (width == 2 && s->cols < 2)) return;     /* (no room for a wide one at all) */
     p->last_graphic = ch;   /* what REP repeats */
 
     /* Handle pending wrap: wrap to next line before placing char */
@@ -528,8 +1078,9 @@ static void put_char(VTParser *p, uint32_t ch)
 
     /* If a double-wide char doesn't fit, pad with space and wrap */
     if (width == 2 && s->cur_col + 1 >= s->cols) {
-        s->cells[s->cur_row][s->cur_col] = blank_cell(s);
-        s->cells[s->cur_row][s->cur_col].flags |= CELL_PAD;
+        Cell pad = blank_cell(s);
+        pad.flags |= CELL_PAD;
+        cput(s, &s->g, s->cur_row, s->cur_col, pad);
         if (s->auto_wrap) {
             if (s->row_flags) s->row_flags[s->cur_row] |= ROW_WRAPPED;
             s->cur_col = 0;
@@ -541,32 +1092,22 @@ static void put_char(VTParser *p, uint32_t ch)
 
     /* Insert mode: shift line content right */
     if (s->insert_mode) {
-        Cell *row = s->cells[s->cur_row];
-        int   tail = s->cols - s->cur_col - width;
+        int tail = s->cols - s->cur_col - width;
         if (tail > 0)
-            memmove(&row[s->cur_col + width], &row[s->cur_col],
-                    (size_t)tail * sizeof(Cell));
+            row_move(s, s->cur_row, s->cur_col + width, s->cur_col, tail);
         /* blank the inserted slot(s) */
-        for (int i = 0; i < width; i++)
-            row[s->cur_col + i] = blank_cell(s);
+        fill(s, s->cur_row, s->cur_col, s->cur_col + width - 1);
     }
 
-    /* Write main cell */
+    /* Write the character: one cell, or a wide one's first and second halves */
     Cell cell = { .ch = ch, .attrs = s->cur_attrs };
     if (s->cur_fg == COLOR_DEFAULT) cell.flags |= CELL_FG_DFL;
     else                             cell.fg     = (uint8_t)s->cur_fg;
     if (s->cur_bg == COLOR_DEFAULT) cell.flags |= CELL_BG_DFL;
     else                             cell.bg     = (uint8_t)s->cur_bg;
     if (width == 2)                  cell.flags |= CELL_WIDE;
-    s->cells[s->cur_row][s->cur_col] = cell;
-
-    /* Write wide continuation cell */
-    if (width == 2 && s->cur_col + 1 < s->cols) {
-        Cell cont  = cell;
-        cont.ch    = 0;
-        cont.flags = (cont.flags & ~CELL_WIDE) | CELL_WIDE_CONT;
-        s->cells[s->cur_row][s->cur_col + 1] = cont;
-    }
+    if (width == 2) cput_wide(s, &s->g, s->cur_row, s->cur_col, cell);   /* (it fits: see above) */
+    else            cput(s, &s->g, s->cur_row, s->cur_col, cell);
 
     /* Advance cursor */
     int new_col = s->cur_col + width;
@@ -673,7 +1214,8 @@ static void handle_sgr(VTParser *p)
         /* 256-colour fg */
         case 38:
             if (i + 2 < p->num_params && p->params[i + 1] == 5) {
-                s->cur_fg = (uint16_t)p->params[i + 2];
+                if (p->params[i + 2] <= 255)     /* else not a colour: ignored */
+                    s->cur_fg = (uint16_t)p->params[i + 2];
                 i += 2;
             } else if (i + 4 < p->num_params && p->params[i + 1] == 2) {
                 /* truecolor: approximate as 256-colour – TODO later */
@@ -683,7 +1225,8 @@ static void handle_sgr(VTParser *p)
         /* 256-colour bg */
         case 48:
             if (i + 2 < p->num_params && p->params[i + 1] == 5) {
-                s->cur_bg = (uint16_t)p->params[i + 2];
+                if (p->params[i + 2] <= 255)     /* else not a colour: ignored */
+                    s->cur_bg = (uint16_t)p->params[i + 2];
                 i += 2;
             } else if (i + 4 < p->num_params && p->params[i + 1] == 2) {
                 i += 4;
@@ -748,24 +1291,26 @@ static void dispatch_csi(VTParser *p, char final)
                 /* erase from cursor to end (0), or whole screen (2) */
                 int start_row = (m == 2) ? 0 : s->cur_row;
                 int start_col = (m == 2) ? 0 : s->cur_col;
-                clear_row_range(s, s->cells[start_row], start_col, s->cols - 1);
+                fill(s, start_row, start_col, s->cols - 1);
                 for (int r = start_row + 1; r < s->rows; r++)
-                    clear_row_range(s, s->cells[r], 0, s->cols - 1);
+                    fill(s, r, 0, s->cols - 1);
                 /* The rows from the start of the erase down lose their wrap
                  * flags (as xterm does, the row the erase starts on too). */
                 if (s->row_flags)
                     memset(s->row_flags + start_row, 0, (size_t)(s->rows - start_row));
+                if (m == 2) cleared(s, 0);
             } else if (m == 1) {
                 /* erase from top to cursor */
                 for (int r = 0; r < s->cur_row; r++)
-                    clear_row_range(s, s->cells[r], 0, s->cols - 1);
-                clear_row_range(s, s->cells[s->cur_row], 0, s->cur_col);
+                    fill(s, r, 0, s->cols - 1);
+                fill(s, s->cur_row, 0, s->cur_col);
                 if (s->row_flags) memset(s->row_flags, 0, (size_t)s->cur_row);
             } else if (m == 3) {
                 /* erase scrollback – same as 2 for our purposes */
                 for (int r = 0; r < s->rows; r++)
-                    clear_row_range(s, s->cells[r], 0, s->cols - 1);
+                    fill(s, r, 0, s->cols - 1);
                 if (s->row_flags) memset(s->row_flags, 0, (size_t)s->rows);
+                cleared(s, 1);
             }
             break;
         }
@@ -775,12 +1320,12 @@ static void dispatch_csi(VTParser *p, char final)
              * xterm with a line that wraps and is then erased): EL 0, from
              * any column, clears it; EL 2 does not. */
             if (m == 0) {
-                clear_row_range(s, s->cells[s->cur_row], s->cur_col, s->cols - 1);
+                fill(s, s->cur_row, s->cur_col, s->cols - 1);
                 if (s->row_flags) s->row_flags[s->cur_row] = 0;
             } else if (m == 1) {
-                clear_row_range(s, s->cells[s->cur_row], 0, s->cur_col);
+                fill(s, s->cur_row, 0, s->cur_col);
             } else if (m == 2) {
-                clear_row_range(s, s->cells[s->cur_row], 0, s->cols - 1);
+                fill(s, s->cur_row, 0, s->cols - 1);
             }
             break;
         }
@@ -788,7 +1333,7 @@ static void dispatch_csi(VTParser *p, char final)
             int n = P(0,1);
             int end = s->cur_col + n - 1;
             if (end >= s->cols) end = s->cols - 1;
-            clear_row_range(s, s->cells[s->cur_row], s->cur_col, end);
+            fill(s, s->cur_row, s->cur_col, end);
             break;
         }
 
@@ -805,19 +1350,17 @@ static void dispatch_csi(VTParser *p, char final)
         case '@': { /* ICH – insert N blank chars */
             int n = P(0,1);
             if (n > s->cols - s->cur_col) n = s->cols - s->cur_col;
-            Cell *row = s->cells[s->cur_row];
-            memmove(&row[s->cur_col + n], &row[s->cur_col],
-                    (size_t)(s->cols - s->cur_col - n) * sizeof(Cell));
-            clear_row_range(s, row, s->cur_col, s->cur_col + n - 1);
+            row_move(s, s->cur_row, s->cur_col + n, s->cur_col,
+                     s->cols - s->cur_col - n);
+            fill(s, s->cur_row, s->cur_col, s->cur_col + n - 1);
             break;
         }
         case 'P': { /* DCH – delete N chars */
             int n = P(0,1);
             if (n > s->cols - s->cur_col) n = s->cols - s->cur_col;
-            Cell *row = s->cells[s->cur_row];
-            memmove(&row[s->cur_col], &row[s->cur_col + n],
-                    (size_t)(s->cols - s->cur_col - n) * sizeof(Cell));
-            clear_row_range(s, row, s->cols - n, s->cols - 1);
+            row_move(s, s->cur_row, s->cur_col, s->cur_col + n,
+                     s->cols - s->cur_col - n);
+            fill(s, s->cur_row, s->cols - n, s->cols - 1);
             break;
         }
         case 'L': { /* IL – insert N lines */
@@ -930,11 +1473,10 @@ static void dispatch_csi(VTParser *p, char final)
                         s->alt_saved_bg    = s->cur_bg;
                         s->alt_saved_attrs = s->cur_attrs;
                         if (!alt_enter(s)) break;
-                        /* Primary grid (now in alt_cells) is no longer hot;
+                        /* Primary grid (now in ag) is no longer hot;
                          * let the kernel demote its pages in the LRU. */
-                        cells_cold(s->alt_cells, s->rows, s->cols);
-                        for (int r = 0; r < s->rows; r++)
-                            clear_row_range(s, s->cells[r], 0, s->cols - 1);
+                        cells_cold(&s->ag, s->rows, s->cols);
+                        fill_new(s);
                         s->cur_row = 0; s->cur_col = 0;
                         s->scroll_top = 0; s->scroll_bottom = s->rows - 1;
                     }
@@ -967,7 +1509,7 @@ static void dispatch_csi(VTParser *p, char final)
                 case 47: case 1047: case 1049:
                     if (s->in_alt_screen) {
                         alt_swap(s);
-                        /* The alt grid (now in alt_cells) is dead: the next
+                        /* The alt grid (now in ag) is dead: the next
                          * entry starts from a blank one, so give it back
                          * rather than keep its pages resident. */
                         alt_release(s);
@@ -1073,7 +1615,12 @@ static void dispatch_esc(VTParser *p, char final)
  * Feed one byte into the carry buffer.
  * Returns  1 if a complete codepoint is available in *out.
  *          0 if more bytes are needed.
- *         -1 on encoding error (caller should reset and re-feed).
+ *         -1 on an invalid byte or sequence: nothing is drawn for it (the
+ *            decoder is reset).
+ *         -2 on a sequence cut short by a byte that is not a continuation
+ *            byte: the decoder is reset, and that byte is to be fed again,
+ *            as it may start the next character.
+ * Overlong forms, surrogates and values past U+10FFFF are invalid.
  */
 static int utf8_feed(VTParser *p, uint8_t byte, uint32_t *out)
 {
@@ -1096,10 +1643,9 @@ static int utf8_feed(VTParser *p, uint8_t byte, uint32_t *out)
 
     /* Continuation byte expected */
     if ((byte & 0xC0) != 0x80) {
-        /* Bad continuation: reset and signal error */
         p->utf8_want = 0;
         p->utf8_len  = 0;
-        return -1;
+        return -2;
     }
 
     p->utf8_buf[p->utf8_len++] = byte;
@@ -1117,8 +1663,12 @@ static int utf8_feed(VTParser *p, uint8_t byte, uint32_t *out)
     case 4: cp = ((uint32_t)(b[0] & 0x07) << 18) | ((uint32_t)(b[1] & 0x3F) << 12)
                | ((uint32_t)(b[2] & 0x3F) <<  6) |  (b[3] & 0x3F); break;
     }
+    unsigned want = p->utf8_want;
     p->utf8_want = 0;
     p->utf8_len  = 0;
+    if (cp < (want == 2 ? 0x80u : want == 3 ? 0x800u : 0x10000u) ||
+        cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+        return -1;
     *out = cp;
     return 1;
 }
@@ -1179,29 +1729,34 @@ void vt_free(VTParser *p)
 /* ------------------------------------------------------------------ */
 
 /*
- * Allocate a new grid at (new_rows × new_cols), copy as much content
- * from old_grid as fits (top-left anchored), fill remainder with blank
+ * Allocate a new full-size grid at (new_rows × new_cols), copy as much
+ * content from g (which is full-size) as fits (top-left anchored), fill remainder with blank
  * cells, then release the old grid.  Handles NULL old_grid (first use).
  *
  * Caller must pass the OLD rows/cols so cells_dontneed can find the
  * data block inside the single allocation before we free it.
  */
-static Cell **resize_grid(Cell **old_grid, int old_rows, int old_cols,
-                           int new_rows, int new_cols)
+static void resize_grid(Grid *g, int old_rows, int old_cols,
+                        int new_rows, int new_cols)
 {
     Cell **new_grid = alloc_cells(new_rows, new_cols);
-    if (!new_grid) return old_grid;   /* OOM: keep old grid unchanged */
+    if (!new_grid) return;   /* OOM: keep old grid unchanged */
 
-    if (old_grid) {
+    if (g->row) {
+        Cell **old_grid = (Cell **)g->row;
         int copy_rows = old_rows < new_rows ? old_rows : new_rows;
         int copy_cols = old_cols < new_cols ? old_cols : new_cols;
-        for (int r = 0; r < copy_rows; r++)
+        for (int r = 0; r < copy_rows; r++) {
             memcpy(new_grid[r], old_grid[r], (size_t)copy_cols * sizeof(Cell));
+            if (copy_cols < old_cols)           /* a wide character cut off at the edge */
+                heal(new_grid[r], copy_cols - 1, copy_cols,
+                     (Cell){ .ch = ' ', .flags = CELL_FG_DFL | CELL_BG_DFL });
+        }
 
-        cells_dontneed(old_grid, old_rows, old_cols);
-        free_cells(old_grid, old_rows);
+        cells_dontneed(g, old_rows, old_cols);
+        free(g->row);
     }
-    return new_grid;
+    g->row = (void **)new_grid;
 }
 
 /*
@@ -1342,7 +1897,7 @@ static bool reflow(Screen *s, int nr, int nc)
         int start = pos, b = r;
         for (;;) {
             for (int c = 0; c < oc; c++) {
-                const Cell *x = &s->cells[b][c];
+                const Cell *x = &((Cell **)s->g.row)[b][c];
                 if (!(x->flags & CELL_PAD)) lin[pos++] = *x;
             }
             if (b + 1 >= or_ || !row_wraps(s, b) || b + 1 == cf) break;
@@ -1403,7 +1958,7 @@ static bool reflow(Screen *s, int nr, int nc)
             for (int k = 0; k < R; k++, row++) {
                 const int w = oc < nc ? oc : nc;
                 for (int c = 0; c < w; c++) {
-                    Cell x = s->cells[cf + k][c];
+                    Cell x = ((Cell **)s->g.row)[cf + k][c];
                     if (c == nc - 1 && (x.flags & CELL_WIDE)) x = blank_cell(s);   /* cut in two */
                     tg[row][c] = x;
                 }
@@ -1416,7 +1971,7 @@ static bool reflow(Screen *s, int nr, int nc)
         for (int k = 0; k < R; k++, row++) {
             const int w = oc < nc ? oc : nc;
             for (int c = 0; c < w; c++) {
-                Cell x = s->cells[cf + k][c];
+                Cell x = ((Cell **)s->g.row)[cf + k][c];
                 if (c == nc - 1 && (x.flags & CELL_WIDE)) x = blank_cell(s);
                 tg[row][c] = x;
             }
@@ -1438,7 +1993,7 @@ static bool reflow(Screen *s, int nr, int nc)
     s->scrollback_len = pull < cut ? pull : len;   /* history taken: back to its line; else all stays */
     s->cols = nc;
     for (int r = 0; r < over; r++)
-        scrollback_capture(s, &tg[r], tf[r]);
+        scrollback_capture(s, tg[r], tf[r]);
     for (int r = 0; r < keep; r++) {
         memcpy(ng[r], tg[over + r], (size_t)nc * sizeof(Cell));
         nf[r] = tf[over + r];
@@ -1447,10 +2002,10 @@ static bool reflow(Screen *s, int nr, int nc)
     free(tf);
     free(lin); free(lstart); free(llen); free(tmp);
 
-    if (s->alt_cells) s->alt_cells = resize_grid(s->alt_cells, or_, oc, nr, nc);
-    cells_dontneed(s->cells, or_, oc);
-    free_cells(s->cells, or_);
-    s->cells = ng;
+    if (s->ag.row) resize_grid(&s->ag, or_, oc, nr, nc);
+    cells_dontneed(&s->g, or_, oc);
+    free(s->g.row);
+    s->g.row = (void **)ng;
     free(s->row_flags);
     s->row_flags = nf;
     s->rows = nr;
@@ -1474,23 +2029,22 @@ fail:
 }
 #endif /* SCROLLBACK_ENABLED */
 
-static void scr_resize(Screen *s, int new_rows, int new_cols)
+static void scr_resize_wide(Screen *s, int new_rows, int new_cols)
 {
     int old_rows = s->rows;
     int old_cols = s->cols;
 
 #if SCROLLBACK_ENABLED
-    if (!s->in_alt_screen && s->scrollback && s->cells && new_cols >= 2 &&
+    if (!s->in_alt_screen && s->scrollback && s->g.row && new_cols >= 2 &&
         s->scroll_top == 0 && s->scroll_bottom == old_rows - 1 &&
         reflow(s, new_rows, new_cols))
         return;
 #endif
 
     /* Default resize (shrink with no scrollback, or alt screen) */
-    s->cells = resize_grid(s->cells, old_rows, old_cols, new_rows, new_cols);
-    if (s->alt_cells)
-        s->alt_cells = resize_grid(s->alt_cells, old_rows, old_cols,
-                                    new_rows, new_cols);
+    resize_grid(&s->g, old_rows, old_cols, new_rows, new_cols);
+    if (s->ag.row)
+        resize_grid(&s->ag, old_rows, old_cols, new_rows, new_cols);
 
     /* Resize row_flags: realloc and zero any new rows */
     if (s->row_flags) {
@@ -1526,6 +2080,19 @@ static void scr_resize(Screen *s, int new_rows, int new_cols)
     if (s->alt_saved_col >= new_cols) s->alt_saved_col = new_cols - 1;
 }
 
+/* Resize both grids, which the resizing above does only to full-size ones: so
+ * they are made that, and small again once resized, if what they hold fits.
+ * (Out of memory for that: the screen stays as it was.) */
+static void scr_resize(Screen *s, int new_rows, int new_cols)
+{
+    s->hold = s->flips = 0;
+    if (!grid_widen(s, &s->g) || (s->ag.row && !grid_widen(s, &s->ag))) return;
+    scr_resize_wide(s, new_rows, new_cols);
+    grid_compact(s, &s->g);
+    if (s->ag.row) grid_compact(s, &s->ag);
+}
+
+
 void vt_resize(VTParser *p, int rows, int cols)
 {
     if (rows == p->scr.rows && cols == p->scr.cols) return;
@@ -1550,6 +2117,7 @@ void vt_resize(VTParser *p, int rows, int cols)
 
 #include <unistd.h>
 #include <errno.h>
+
 
 static int vt_write_all(int fd, const void *buf, size_t n)
 {
@@ -1675,7 +2243,7 @@ int vt_serialize(const VTParser *p, int fd)
     if (vt_write_all(fd, &sw, sizeof(sw)) < 0) return -1;
 
     /*
-     * Cell data: write rows in LOGICAL order (s->cells[0..rows-1]) not
+     * Cell data: write rows in LOGICAL order (rows 0..rows-1 of s->g) not
      * physical memory order.  Scrolling shuffles the row pointer array
      * without moving cell data, so physical order may be rotated relative
      * to logical order.  Deserializing physical order back into a fresh
@@ -1683,15 +2251,30 @@ int vt_serialize(const VTParser *p, int fd)
      */
     size_t row_bytes = (size_t)s->cols * sizeof(Cell);
     for (int r = 0; r < s->rows; r++)
-        if (vt_write_all(fd, s->cells[r], row_bytes) < 0) return -1;
+        if (vt_write_all(fd, grow(s, &s->g, r, 0), row_bytes) < 0) return -1;
 
     /* Alt cell data (also logical order) */
-    uint8_t has_alt = s->alt_cells ? 1 : 0;
+    uint8_t has_alt = s->ag.row ? 1 : 0;
     if (vt_write_all(fd, &has_alt, 1) < 0) return -1;
     if (has_alt)
         for (int r = 0; r < s->rows; r++)
-            if (vt_write_all(fd, s->alt_cells[r], row_bytes) < 0) return -1;
+            if (vt_write_all(fd, grow(s, &s->ag, r, 0), row_bytes) < 0) return -1;
 
+    return 0;
+}
+
+/* The rows of grid g, read from fd as Cell[cols] each. */
+static int read_grid(Screen *s, Grid *g, int fd)
+{
+    size_t row_bytes = (size_t)s->cols * sizeof(Cell);
+    Cell *buf = malloc(row_bytes);
+    if (!buf) return -1;
+    for (int r = 0; r < s->rows; r++) {
+        if (vt_read_all(fd, buf, row_bytes) < 0) { free(buf); return -1; }
+        for (int c = 0; c < s->cols; c++) heal(buf, c, s->cols, blank_cell(s));
+        row_store(s, g, r, buf);
+    }
+    free(buf);
     return 0;
 }
 
@@ -1764,19 +2347,14 @@ int vt_deserialize(VTParser *p, int fd)
      * vt_init has sequential row pointers, which is exactly the logical
      * order we serialized, so each row lands in the right place.
      */
-    size_t row_bytes = (size_t)s->cols * sizeof(Cell);
-    for (int r = 0; r < s->rows; r++)
-        if (vt_read_all(fd, s->cells[r], row_bytes) < 0) return -1;
+    if (read_grid(s, &s->g, fd) < 0) return -1;
 
     /* Alt cells */
     uint8_t has_alt;
     if (vt_read_all(fd, &has_alt, 1) < 0) return -1;
     if (has_alt) {
-        if (!s->alt_cells)
-            s->alt_cells = alloc_cells(s->rows, s->cols);
-        if (!s->alt_cells) return -1;
-        for (int r = 0; r < s->rows; r++)
-            if (vt_read_all(fd, s->alt_cells[r], row_bytes) < 0) return -1;
+        if (!s->ag.row && !grid_new(&s->ag, s->rows, s->cols)) return -1;
+        if (read_grid(s, &s->ag, fd) < 0) return -1;
     }
 
     return 0;
@@ -1814,19 +2392,19 @@ void vt_feed(VTParser *p, const uint8_t *data, size_t len)
 
         /* ---- GROUND ---- */
         case ST_GROUND:
-            if (c < 0x20) {
-                handle_c0(p, c);
-            } else if (c == 0x7F) {
-                /* DEL – ignore */
+            if (c < 0x20 || c == 0x7F) {
+                p->utf8_want = 0;       /* a control ends a sequence cut short */
+                if (c != 0x7F) handle_c0(p, c);     /* DEL is ignored */
             } else {
                 uint32_t cp;
                 int r = utf8_feed(p, c, &cp);
+                if (r == -2) r = utf8_feed(p, c, &cp);  /* c starts afresh */
                 if (r == 1) {
                     if (p->g0_dec && cp >= 0x60 && cp <= 0x7e) cp = dec_graphics[cp - 0x60];
                     put_char(p, cp);
                 }
                 /* r == 0: partial multibyte, state held in p->utf8_* */
-                /* r == -1: invalid byte, skip */
+                /* r == -1: invalid byte or sequence, skip */
             }
             break;
 
