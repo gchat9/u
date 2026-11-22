@@ -34,7 +34,6 @@
 #include <time.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -905,49 +904,77 @@ static int wire_str(const uint8_t *b, size_t blen, size_t *pos, size_t *n, const
     return 1;
 }
 
+/* One line of known_hosts, without its line end, against the host and its key:
+ * 1 if it is the entry of this host with this key, -1 if it is the entry of
+ * this host with another key, 0 if it says nothing of the two (or is not an
+ * entry that can be used: it is skipped, not fatal).  The line is cut up. */
+static int kh_line(char *line, const char *host, const uint8_t *pubkey /* 32 bytes */) {
+    if (line[0] == '#') return 0;
+    char *sp1 = strchr(line, ' '); if (!sp1) return 0;
+    *sp1 = '\0'; const char *h = line;
+    char *sp2 = strchr(sp1+1, ' '); if (!sp2) return 0;
+    /* h = hostname, sp1+1 = key type, sp2+1 = base64 key blob */
+    char *type = sp1+1; *sp2 = '\0';
+    char *b64  = sp2+1;
+    /* strip a trailing CR */
+    size_t bl = strlen(b64);
+    while (bl && b64[bl-1] == '\r') b64[--bl] = '\0';
+
+    if (strcmp(h, host) != 0) return 0;
+    if (strcmp(type, "ssh-ed25519") != 0) return 0;
+
+    uint8_t blob[256]; ssize_t blen = b64dec(b64, strlen(b64), blob, sizeof blob);
+    if (blen < 0) return 0;
+    /* blob is the SSH wire format: string("ssh-ed25519") || string(32-byte key) */
+    size_t pos = 0, tl, kl; const uint8_t *k;
+    if (!wire_str(blob, (size_t)blen, &pos, &tl, NULL)) return 0;  /* type */
+    if (!wire_str(blob, (size_t)blen, &pos, &kl, &k)) return 0;    /* key */
+    if (kl != 32) return 0;
+
+    return (sodium_memcmp(k, pubkey, 32) == 0) ? 1 : -1;
+}
+
 /* Returns 1 if found and matches, 0 if not found, -1 if found but mismatch */
 static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
     char *path = known_hosts_path();
-    FILE *f = fopen(path, "r");
+    int fd = open(path, O_RDONLY);
     /* Only a file that does not exist means that no key is known.  Any other
      * failure (permissions, a directory, an I/O error) must not be taken for
      * "unknown host": that would ask the user about a host whose key is in the
      * file, and accept the answer. */
-    if (!f) {
+    if (fd < 0) {
         if (errno == ENOENT) { free(path); return 0; }
         die(path, ": cannot open: ", strerror(errno));
     }
     free(path);
 
-    char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char *sp1 = strchr(line, ' '); if (!sp1) continue;
-        *sp1 = '\0'; const char *h = line;
-        char *sp2 = strchr(sp1+1, ' '); if (!sp2) continue;
-        /* h = hostname, sp1+1 = key type, sp2+1 = base64 key blob */
-        char *type = sp1+1; *sp2 = '\0';
-        char *b64  = sp2+1;
-        /* strip trailing newline */
-        size_t bl = strlen(b64);
-        while (bl && (b64[bl-1] == '\n' || b64[bl-1] == '\r')) b64[--bl] = '\0';
-
-        if (strcmp(h, host) != 0) continue;
-        if (strcmp(type, "ssh-ed25519") != 0) continue;
-
-        uint8_t blob[256]; ssize_t blen = b64dec(b64, strlen(b64), blob, sizeof blob);
-        if (blen < 0) continue;
-        /* blob is the SSH wire format: string("ssh-ed25519") || string(32-byte key) */
-        size_t pos = 0, tl, kl; const uint8_t *k;
-        if (!wire_str(blob, (size_t)blen, &pos, &tl, NULL)) continue;  /* type */
-        if (!wire_str(blob, (size_t)blen, &pos, &kl, &k)) continue;    /* key */
-        if (kl != 32) continue;
-
-        fclose(f);
-        return (sodium_memcmp(k, pubkey, 32) == 0) ? 1 : -1;
+    /* The file has a line for every host there has been, so it is not read
+     * whole: pieces of 4 KiB, cut into lines here.  What is left of a piece
+     * after its last line end goes to the front for the next; a line that
+     * does not fit is skipped to its end (skip), as no entry is that long. */
+    char buf[4096]; size_t have = 0; int skip = 0, v = 0;
+    for (;;) {
+        ssize_t r = read_retry(fd, buf + have, sizeof buf - 1 - have);
+        if (r < 0) die("known_hosts: cannot read: ", strerror(errno));
+        have += (size_t)r;
+        if (r == 0) {                    /* the end; the last line may have no line end */
+            if (have && !skip) { buf[have] = '\0'; v = kh_line(buf, host, pubkey); }
+            break;
+        }
+        char *p = buf, *end = buf + have, *nl;
+        while (!v && (nl = memchr(p, '\n', (size_t)(end - p)))) {
+            *nl = '\0';
+            if (!skip) v = kh_line(p, host, pubkey);
+            skip = 0;                    /* a skipped line ends here */
+            p = nl + 1;
+        }
+        if (v) break;
+        have = (size_t)(end - p);
+        if (skip || have == sizeof buf - 1) { skip = 1; have = 0; }
+        else memmove(buf, p, have);
     }
-    if (ferror(f)) die("known_hosts: cannot read: ", strerror(errno));
-    fclose(f); return 0;
+    close(fd);
+    return v;
 }
 
 /* The wire form of an ssh-ed25519 public key: string("ssh-ed25519") ||
