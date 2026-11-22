@@ -330,6 +330,13 @@ static ssize_t b64dec(const char *in, size_t n, uint8_t *out, size_t outmax) {
     return (ssize_t)oi;
 }
 
+/* read(), which a signal does not make fail. */
+static ssize_t read_retry(int fd, void *buf, size_t n) {
+    ssize_t r;
+    while ((r = read(fd, buf, n)) < 0 && errno == EINTR) {}
+    return r;
+}
+
 /* ══════════════════════ OpenSSH ed25519 key loading ══════════════════════
  *
  * Parses "-----BEGIN OPENSSH PRIVATE KEY-----" (openssh-key-v1 format).
@@ -354,36 +361,47 @@ static void load_ed25519_key(const char *path,
                               uint8_t sk[crypto_sign_SECRETKEYBYTES],
                               uint8_t pk[crypto_sign_PUBLICKEYBYTES])
 {
-    FILE *f = fopen(path, "r");
-    if (!f) die(path, ": ", strerror(errno));
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) die(path, ": ", strerror(errno));
     /* As OpenSSH: a key anyone else can read is no longer a secret. */
     struct stat kst;
-    if (fstat(fileno(f), &kst) == 0 && (kst.st_mode & 077))
+    if (fstat(fd, &kst) == 0 && (kst.st_mode & 077))
         die(path, ": unprotected private key file: remove group and other access (chmod 600)");
 
-    /* Every copy of the key we make is wiped below; that includes stdio's
-     * buffer, which would otherwise be freed by fclose() with the key in it. */
-    char iobuf[4096];
-    setvbuf(f, iobuf, _IOFBF, sizeof iobuf);
-
-    char b64buf[16384]; size_t b64len = 0; int in_key = 0;
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "BEGIN OPENSSH PRIVATE KEY")) { in_key = 1; continue; }
-        if (strstr(line, "END OPENSSH PRIVATE KEY"))   { break; }
-        if (!in_key) continue;
-        size_t l = strlen(line);
-        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) l--;
-        if (b64len + l >= sizeof(b64buf)) die("key file too large");
-        memcpy(b64buf + b64len, line, l); b64len += l;
+    /* The file is a few hundred bytes: read it whole, into a buffer that is
+     * wiped below and is the only copy there is (nothing is buffered in the
+     * library).  What can be decoded into raw[] fits: 8192 bytes are 10924
+     * characters of base64, and the newlines and the two markers make it 11.2 K. */
+    char buf[16384]; size_t len = 0;
+    for (;;) {
+        ssize_t r = read_retry(fd, buf + len, sizeof buf - len);
+        if (r < 0) die(path, ": ", strerror(errno));
+        if (r == 0) break;
+        len += (size_t)r;
+        if (len == sizeof buf) die("key file too large");
     }
-    fclose(f);
-    sodium_memzero(iobuf, sizeof iobuf);
-    sodium_memzero(line, sizeof line);
+    close(fd);
+
+    /* The base64 between the markers, without the line ends, to the front of
+     * the buffer, over the lines already used. */
+    size_t n = 0; int in_key = 0;
+    for (char *p = buf, *end = buf + len; p < end; ) {
+        char *nl = memchr(p, '\n', (size_t)(end - p));
+        char *e = nl ? nl : end;
+        *e = '\0';                          /* e < buf + sizeof buf: len is less */
+        if (strstr(p, "BEGIN OPENSSH PRIVATE KEY")) in_key = 1;
+        else if (strstr(p, "END OPENSSH PRIVATE KEY")) break;
+        else if (in_key) {
+            size_t l = strlen(p);
+            while (l && p[l-1] == '\r') l--;
+            memmove(buf + n, p, l); n += l;
+        }
+        p = e + 1;
+    }
 
     uint8_t raw[8192];
-    ssize_t rawlen = b64dec(b64buf, b64len, raw, sizeof raw);
-    sodium_memzero(b64buf, sizeof b64buf);
+    ssize_t rawlen = b64dec(buf, n, raw, sizeof raw);
+    sodium_memzero(buf, sizeof buf);
     if (rawlen < 15) die("key too short, too long or bad base64");
     if (memcmp(raw, "openssh-key-v1", 14) != 0 || raw[14] != 0)
         die("bad openssh-key-v1 magic");
