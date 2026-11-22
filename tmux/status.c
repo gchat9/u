@@ -1,7 +1,8 @@
 #include "status.h"
 #include "config.h"
+#include "fmt.h"
 
-#include <stdio.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -15,20 +16,21 @@
 /* Process name                                                         */
 /* ================================================================== */
 
+/* The name of the process, from its comm: the first line of it, as far as buf
+ * has room (buflen is at least 2); "?" if there is none. */
 static void proc_name(pid_t pid, char *buf, size_t buflen)
 {
-    if (pid <= 0) { snprintf(buf, buflen, "?"); return; }
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) { snprintf(buf, buflen, "?"); return; }
-    if (!fgets(buf, (int)buflen, f))
-        snprintf(buf, buflen, "?");
-    else {
-        size_t l = strlen(buf);
-        if (l > 0 && buf[l-1] == '\n') buf[l-1] = '\0';
+    char path[32];
+    ssize_t n = -1;
+    if (pid > 0) {
+        int fd;
+        join(path, sizeof path, "/proc/", DEC(pid), "/comm");
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) { n = read(fd, buf, buflen - 1); close(fd); }
     }
-    fclose(f);
+    if (n <= 0) n = (ssize_t)join(buf, buflen, "?");
+    buf[n] = '\0';
+    buf[strcspn(buf, "\n")] = '\0';
 }
 
 /* ================================================================== */
@@ -65,10 +67,9 @@ void status_layout(StatusEmit emit, void *ctx, int cols, int active,
         if (wins_alive[i])
             proc_name(child_pids[i], pname, sizeof(pname));
         else
-            snprintf(pname, sizeof(pname), "dead");
+            join(pname, sizeof pname, "dead");
         if (strlen(pname) > 10) pname[10] = '\0';
-        tab_w[i] = snprintf(tab_text[i], sizeof(tab_text[i]),
-                            "%d:%s", i + 1, pname);
+        tab_w[i] = (int)join(tab_text[i], sizeof tab_text[i], DEC(i + 1), ":", pname);
     }
 
     int host_w  = (int)strlen(hostname) + 2;
