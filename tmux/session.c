@@ -34,6 +34,7 @@
 #include "status.h"
 #include "window.h"
 #include "input.h"
+#include "fmt.h"
 
 #ifdef X11_BACKEND
 #include "x11_backend.h"
@@ -316,9 +317,9 @@ void window_answer_cpr(Window *w)
     w->vt.cpr_requested = false;
 
     char reply[32];
-    int n = snprintf(reply, sizeof reply, "\033[%d;%dR",
-                     w->vt.scr.cur_row + 1, w->vt.scr.cur_col + 1);
-    (void)write(w->pty.master, reply, (size_t)n);
+    size_t n = join(reply, sizeof reply, "\033[", DEC(w->vt.scr.cur_row + 1), ";",
+                    DEC(w->vt.scr.cur_col + 1), "R");
+    (void)write(w->pty.master, reply, n);
 }
 
 /* ------------------------------------------------------------------ */

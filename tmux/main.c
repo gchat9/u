@@ -21,6 +21,7 @@
 #include "config.h"
 #include "window.h"
 #include "session.h"
+#include "fmt.h"
 #ifdef X11_BACKEND
 #include "x11_backend.h"
 #endif
@@ -527,9 +528,8 @@ static void render_scrollback_view(void)
     /* Scrollback status indicator in the status row, in the status
      * bar's own colours (config.h) */
     char ind_text[64];
-    int ilen = snprintf(ind_text, sizeof(ind_text),
-                        "  %d/%d lines  (q/Esc to exit) ",
-                        g_scrollback_offset, sb_lines);
+    int ilen = (int)join(ind_text, sizeof ind_text, "  ", DEC(g_scrollback_offset), "/",
+                         DEC(sb_lines), " lines  (q/Esc to exit) ");
 #ifdef X11_BACKEND
     x11_backend_text_fill(g_rows - 1, STATUS_BAR_COLOR);
     x11_backend_text_at(g_rows - 1, 0, " SCROLLBACK ", 12,
