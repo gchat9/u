@@ -15,7 +15,6 @@
 
 #include <errno.h>
 #include <poll.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -163,10 +162,9 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
 
     if (!closed) {
         if (!interactive) {              /* a command's output must stay readable */
-            char m[96];
-            snprintf(m, sizeof m, "\r\n[exit status %d - press space to reconnect, or close the window]",
-                     ssh->exit_status);
-            xtty_write(m, strlen(m));
+            tty_msg("\n[exit status ");
+            tty_msg(DEC(ssh->exit_status & 255));    /* what the shell is told, and never negative */
+            tty_msg(" - press space to reconnect, or close the window]");
             wait_for_close_or_space();
         }
         window_close();
