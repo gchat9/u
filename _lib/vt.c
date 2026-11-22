@@ -3,7 +3,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 /* ================================================================== */
 /* Helpers                                                              */
@@ -1557,8 +1556,12 @@ static void dispatch_osc(VTParser *p)
     char *sep = strchr(p->osc, ';');
     if (!sep) return;
     int cmd = atoi(p->osc);
-    if (cmd == 0 || cmd == 1 || cmd == 2)
-        snprintf(p->scr.title, sizeof(p->scr.title), "%s", sep + 1);
+    if (cmd == 0 || cmd == 1 || cmd == 2) {
+        size_t n = strlen(sep + 1);               /* cut where it does not fit */
+        if (n > sizeof p->scr.title - 1) n = sizeof p->scr.title - 1;
+        memcpy(p->scr.title, sep + 1, n);
+        p->scr.title[n] = '\0';
+    }
 }
 
 /* ================================================================== */
