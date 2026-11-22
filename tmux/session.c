@@ -52,7 +52,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
@@ -418,7 +417,7 @@ static void daemon_run(int sock, Window *wins[], int cur)
 int session_listen(void)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("mux: socket"); return -1; }
+    if (sock < 0) { perr("mux: socket"); return -1; }
 
     /* Close-on-exec so the socket is not inherited by child shells */
     fcntl(sock, F_SETFD, FD_CLOEXEC);
@@ -446,10 +445,10 @@ int session_listen(void)
         unlink(MUX_SOCKET_PATH);   /* stale or absent — remove if present */
     }
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("mux: bind " MUX_SOCKET_PATH); close(sock); return -1;
+        perr("mux: bind " MUX_SOCKET_PATH); close(sock); return -1;
     }
     if (listen(sock, 1) < 0) {
-        perror("mux: listen"); close(sock); unlink(MUX_SOCKET_PATH); return -1;
+        perr("mux: listen"); close(sock); unlink(MUX_SOCKET_PATH); return -1;
     }
     return sock;
 }
@@ -462,7 +461,7 @@ int session_listen(void)
 int session_rebind(void)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("mux: socket"); return -1; }
+    if (sock < 0) { perr("mux: socket"); return -1; }
     fcntl(sock, F_SETFD, FD_CLOEXEC);
 
     struct sockaddr_un addr;
@@ -472,10 +471,10 @@ int session_rebind(void)
 
     unlink(MUX_SOCKET_PATH);
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("mux: bind " MUX_SOCKET_PATH); close(sock); return -1;
+        perr("mux: bind " MUX_SOCKET_PATH); close(sock); return -1;
     }
     if (listen(sock, 1) < 0) {
-        perror("mux: listen"); close(sock); unlink(MUX_SOCKET_PATH); return -1;
+        perr("mux: listen"); close(sock); unlink(MUX_SOCKET_PATH); return -1;
     }
     return sock;
 }
@@ -484,7 +483,7 @@ void session_detach(int sock, Window *wins[], int cur)
 {
     pid_t pid = fork();
     if (pid < 0) {
-        perror("mux: fork");
+        perr("mux: fork");
         _exit(1);
     }
 
@@ -521,7 +520,7 @@ int session_attach(Window *wins[], int *cur_out,
     if (obs_fd_out)           *obs_fd_out           = -1;
 
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("mux: socket"); return -1; }
+    if (sock < 0) { perr("mux: socket"); return -1; }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -529,17 +528,17 @@ int session_attach(Window *wins[], int *cur_out,
     strncpy(addr.sun_path, MUX_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("mux: connect"); close(sock); return -1;
+        perr("mux: connect"); close(sock); return -1;
     }
 
     /* Query: find out if we're talking to a daemon or a live instance */
     uint8_t query = '?';
     if (write_all(sock, &query, 1) < 0) {
-        perror("mux: write"); close(sock); return -1;
+        perr("mux: write"); close(sock); return -1;
     }
     uint8_t resp = 0;
     if (read_all(sock, &resp, 1) < 0) {
-        perror("mux: read"); close(sock); return -1;
+        perr("mux: read"); close(sock); return -1;
     }
 
     if (resp == 'L') {
@@ -553,7 +552,7 @@ int session_attach(Window *wins[], int *cur_out,
 
         /* Receive window state and PTY master fds */
         if (recv_session(sock, wins, cur_out) < 0) {
-            perror("mux: recv_session"); close(sock); return -1;
+            perr("mux: recv_session"); close(sock); return -1;
         }
 
         /* ACK */
@@ -563,7 +562,7 @@ int session_attach(Window *wins[], int *cur_out,
         /* Receive the session listening socket from old-live via SCM_RIGHTS */
         int new_session_sock = -1;
         if (recv_fds(sock, &new_session_sock, 1) < 0) {
-            perror("mux: recv session socket"); close(sock); return -1;
+            perr("mux: recv session socket"); close(sock); return -1;
         }
         fcntl(new_session_sock, F_SETFD, FD_CLOEXEC);
 
@@ -585,11 +584,11 @@ int session_attach(Window *wins[], int *cur_out,
 
     uint8_t atype = SESSION_TYPE_ATTACH;
     if (write_all(sock, &atype, 1) < 0) {
-        perror("mux: write"); close(sock); return -1;
+        perr("mux: write"); close(sock); return -1;
     }
 
     if (recv_session(sock, wins, cur_out) < 0) {
-        perror("mux: receive session"); close(sock); return -1;
+        perr("mux: receive session"); close(sock); return -1;
     }
 
     /* ACK tells the daemon it can exit */
@@ -1037,7 +1036,7 @@ done:
 int session_observe(void)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("mux: socket"); return -1; }
+    if (sock < 0) { perr("mux: socket"); return -1; }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1045,14 +1044,14 @@ int session_observe(void)
     strncpy(addr.sun_path, MUX_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("mux: connect"); close(sock); return -1;
+        perr("mux: connect"); close(sock); return -1;
     }
 
     uint8_t q = '?';
-    if (write_all(sock, &q, 1) < 0) { perror("mux: write"); close(sock); return -1; }
+    if (write_all(sock, &q, 1) < 0) { perr("mux: write"); close(sock); return -1; }
     uint8_t qr = 0;
     if (read_all(sock, &qr, 1) < 0 || qr != 'L') {
-        fputs("mux observe: not a live session\n", stderr); close(sock); return -1;
+        warn("mux observe: not a live session\n"); close(sock); return -1;
     }
 
     uint8_t otype = SESSION_TYPE_OBSERVE;
@@ -1060,7 +1059,7 @@ int session_observe(void)
 
     int16_t sr, sc;
     if (read_all(sock, &sr, 2) < 0 || read_all(sock, &sc, 2) < 0) {
-        fputs("mux observe: failed to receive session size\n", stderr);
+        warn("mux observe: failed to receive session size\n");
         close(sock); return -1;
     }
 

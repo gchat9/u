@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdio.h>
 
 #ifdef X11_BACKEND
 #include "x11_backend.h"

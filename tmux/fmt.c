@@ -1,6 +1,9 @@
 #include "fmt.h"
 
+#include <errno.h>
 #include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
 
 /* v in decimal at p: the digits of v / 10 first, then the last. */
 int put_u(char *p, unsigned v)
@@ -27,4 +30,20 @@ size_t join_(char *d, size_t cap, const char *s, ...)
     va_end(ap);
     d[n] = '\0';
     return n;
+}
+
+/* Each string is written as it comes: nothing is held, so nothing is cut. */
+void warn_(const char *s, ...)
+{
+    va_list ap;
+    va_start(ap, s);
+    for (; s; s = va_arg(ap, const char *))
+        (void)write(STDERR_FILENO, s, strlen(s));
+    va_end(ap);
+}
+
+void perr(const char *msg)
+{
+    int e = errno;                    /* the strings are written with write() */
+    warn(msg, ": ", strerror(e), "\n");
 }

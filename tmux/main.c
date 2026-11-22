@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -758,7 +757,7 @@ static void cleanup(void)
 static void die(const char *msg)
 {
     cleanup();
-    perror(msg);
+    perr(msg);
     exit(1);
 }
 
@@ -1049,8 +1048,8 @@ static int parse_args(int argc, char *argv[],
     int i = 1;
     while (i < argc && nwin < MAX_WINDOWS) {
         if (!is_new_cmd(argv[i])) {
-            fprintf(stderr, "mux: unknown command '%s'\n", argv[i]);
-            fprintf(stderr, "usage: mux [new|neww [cmd [args]] [; new|neww ...]]\n");
+            warn("mux: unknown command '", argv[i], "'\n"
+                 "usage: mux [new|neww [cmd [args]] [; new|neww ...]]\n");
             exit(1);
         }
         i++;   /* skip the command keyword */
@@ -1067,7 +1066,7 @@ static int parse_args(int argc, char *argv[],
             /* NULL-terminated array pointing into argv (no string copies
              * needed: argv is valid for the lifetime of the process) */
             char **spec = calloc((size_t)(arg_count + 1), sizeof(char *));
-            if (!spec) { perror("mux"); exit(1); }
+            if (!spec) { perr("mux"); exit(1); }
             for (int j = 0; j < arg_count; j++)
                 spec[j] = argv[arg_start + j];
             spec[arg_count] = NULL;
@@ -1125,7 +1124,7 @@ int main(int argc, char *argv[])
         int attach_rc = session_attach(g_wins, &g_cur, &new_sess_fd, &obs_fd);
         if (attach_rc == -2) return 0;   /* observed and done */
         if (attach_rc < 0) {
-            fputs("mux: attach failed\n", stderr);
+            warn("mux: attach failed\n");
             return 1;
         }
         /* Takeover: adopt the session socket and observer channel */
@@ -1140,7 +1139,7 @@ int main(int argc, char *argv[])
              * unconditionally, as the observer promotion below does. */
             g_session_sock = session_rebind();
             if (g_session_sock < 0) {
-                fputs("mux: failed to create session socket\n", stderr);
+                warn("mux: failed to create session socket\n");
                 return 1;
             }
         }
@@ -1171,7 +1170,7 @@ int main(int argc, char *argv[])
         if (g_session_sock < 0) {
             /* session_listen printed the error; check for the common case */
             if (errno == EADDRINUSE)
-                fputs("mux: session already exists (use 'mux attach')\n", stderr);
+                warn("mux: session already exists (use 'mux attach')\n");
             return 1;
         }
 
@@ -1202,7 +1201,7 @@ int main(int argc, char *argv[])
 #ifndef X11_BACKEND
                 (void)write(STDOUT_FILENO, "\033[?1049l", 8);
 #endif
-                fprintf(stderr, "mux: failed to create window %d\n", w + 1);
+                warn("mux: failed to create window ", DEC(w + 1), "\n");
                 return 1;
             }
             if (first_slot < 0) first_slot = slot;
