@@ -456,6 +456,14 @@ static int tcp_connect(const char *host, const char *port) {
  * characters of host names, and digits for the port, are accepted (as OpenSSH
  * does).  IPv6 zone identifiers (fe80::1%eth0) are therefore refused.
  */
+/* Appends s to the string of *n bytes in d, which has room for cap (with the NUL),
+ * and says whether s did not fit: what is left out is left out. */
+static int cats(char *d, size_t cap, size_t *n, const char *s) {
+    while (*s && *n + 1 < cap) d[(*n)++] = *s++;
+    d[*n] = '\0';
+    return *s != '\0';
+}
+
 static int valid_host(const char *h) {
     size_t n = strlen(h);
     if (n == 0 || n > 255 || h[0] == '-') return 0;
@@ -1825,15 +1833,17 @@ int main(int argc, char **argv) {
     if (!identity) {
         const char *home = getenv("HOME");
         if (!home) die("$HOME not set");
-        if (snprintf(default_id, sizeof default_id, "%s/.ssh/id_ed25519", home)
-            >= (int)sizeof default_id) die("$HOME path too long");
+        size_t n = 0;
+        if (cats(default_id, sizeof default_id, &n, home) |
+            cats(default_id, sizeof default_id, &n, "/.ssh/id_ed25519")) die("$HOME path too long");
         identity = default_id;
     }
 
     /* The terminal is set up from here on, so that what follows (errors, the
      * host key question) can be shown in it. */
     char title[512];
-    snprintf(title, sizeof(title), "%s@%s", user, host);
+    size_t tn = 0;
+    cats(title, sizeof title, &tn, user); cats(title, sizeof title, &tn, "@"); cats(title, sizeof title, &tn, host);
     tty_open(title);
 
     /* static: wipe_secrets() runs from exit(), when main's frame is gone if
