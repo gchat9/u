@@ -116,6 +116,8 @@ static long long g_hs_deadline_ms;
  * The count starts with the session (hs_done), not with the handshake. */
 #define KEEPALIVE_SEND_S 150
 #define KEEPALIVE_DEAD_S 180
+#define STR_(x) #x
+#define STR(x) STR_(x)         /* a macro's value, as text: a number that needs no conversion */
 static long long g_last_rx_ms;   /* when the last valid packet from the server came */
 static int       g_ka_sent;      /* a keepalive is out, and nothing has come back since */
 
@@ -145,12 +147,12 @@ static void wait_readable(int fd) {
     for (;;) {
         long long left = g_hs_deadline_ms - now_ms();
         if (left <= 0)
-            die("timed out: the server did not finish the handshake within %d seconds"
-                " (ConnectTimeout)", g_connect_timeout);
+            die("timed out: the server did not finish the handshake within ",
+                DEC(g_connect_timeout), " seconds (ConnectTimeout)");
         struct pollfd p = { .fd = fd, .events = POLLIN };
         int r = poll(&p, 1, (int)left);
         if (r > 0) return;
-        if (r < 0 && errno != EINTR) die("poll: %s", strerror(errno));
+        if (r < 0 && errno != EINTR) die("poll failed");
     }
 }
 
@@ -165,14 +167,23 @@ void noret_write(int fd, const void *b, size_t n)
  * and the end of the program are the terminal's: tty_msg(), tty_exit(). */
 void err(const char *s) { tty_msg(s); }
 
-void die(const char *fmt, ...) __attribute__((noreturn));
-void die(const char *fmt, ...) {
-    char buf[1024];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    if (n > 0) tty_msg(buf);
+/* Every message is a few strings and a newline, which is what tty_msg() takes,
+ * so there is nothing to format and nothing to put together in a buffer: the
+ * length of a message is not limited, and printf is not in the program. */
+void die_(const char *s, ...) {
+    va_list ap; va_start(ap, s);
+    for (; s; s = va_arg(ap, const char *)) tty_msg(s);
+    va_end(ap);
     tty_msg("\n");
     tty_exit(1);
+}
+void die1(const char *s) { die_(s, NULL); }
+
+/* The decimal digits of v, ending at end (see DEC() in mssh.h). */
+char *decstr(char *end, unsigned v) {
+    *--end = '\0';
+    do *--end = (char)('0' + v % 10); while (v /= 10);
+    return end;
 }
 
 /* ══════════════════════════ Growable byte buffer ═════════════════════════
@@ -256,7 +267,7 @@ static uint32_t rdu32(Buf *b) {
 /* Zero-copy: returns a pointer into b's backing store, not a copy. */
 static const uint8_t *rdstr(Buf *b, size_t *olen) {
     uint32_t n = rdu32(b);
-    if (n > b->len - b->pos) die("buf underflow (str len %u)", n);
+    if (n > b->len - b->pos) die("buf underflow");
     const uint8_t *p = b->b + b->pos; b->pos += n;
     if (olen) *olen = n;
     return p;
@@ -344,12 +355,11 @@ static void load_ed25519_key(const char *path,
                               uint8_t pk[crypto_sign_PUBLICKEYBYTES])
 {
     FILE *f = fopen(path, "r");
-    if (!f) die("%s: %s", path, strerror(errno));
+    if (!f) die(path, ": ", strerror(errno));
     /* As OpenSSH: a key anyone else can read is no longer a secret. */
     struct stat kst;
     if (fstat(fileno(f), &kst) == 0 && (kst.st_mode & 077))
-        die("%s: unprotected private key file (mode %03o): remove group and other access (chmod 600)",
-            path, (unsigned)(kst.st_mode & 0777));
+        die(path, ": unprotected private key file: remove group and other access (chmod 600)");
 
     /* Every copy of the key we make is wiped below; that includes stdio's
      * buffer, which would otherwise be freed by fclose() with the key in it. */
@@ -405,7 +415,7 @@ static void load_ed25519_key(const char *path,
      * This is exactly the layout libsodium uses for crypto_sign_SECRETKEYBYTES.
      */
     const uint8_t *privkey = rdstr(&pb, &slen);
-    if (slen != 64) die("unexpected ed25519 privkey length %zu", slen);
+    if (slen != 64) die("unexpected ed25519 privkey length");
     memcpy(sk, privkey, 64);
     memcpy(pk, privkey + 32, 32);
     sodium_memzero(raw, sizeof raw);          /* the decoded file: seed, comment, ... */
@@ -418,7 +428,7 @@ static int tcp_connect(const char *host, const char *port) {
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc) die("getaddrinfo: %s", gai_strerror(rc));
+    if (rc) die("getaddrinfo: ", gai_strerror(rc));
     int fd = -1, why = 0;
     for (r = res; r; r = r->ai_next) {
         fd = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
@@ -433,7 +443,7 @@ static int tcp_connect(const char *host, const char *port) {
         close(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) die("connect to %s:%s failed: %s", host, port, strerror(why));
+    if (fd < 0) die("connect to ", host, ":", port, " failed: ", strerror(why));
     int one = 1;                                   /* keystrokes must not wait for an ACK */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
@@ -496,12 +506,12 @@ static int proxy_connect(const char *cmd, const char *host, const char *port) {
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
-        die("socketpair: %s", strerror(errno));
+        die("socketpair: ", strerror(errno));
     fcntl(sv[0], F_SETFD, FD_CLOEXEC);        /* the child's copies are dup2()ed to 0 and 1, which clears it */
     fcntl(sv[1], F_SETFD, FD_CLOEXEC);
 
     pid_t pid = fork();
-    if (pid < 0) die("fork: %s", strerror(errno));
+    if (pid < 0) die("fork: ", strerror(errno));
 
     if (pid == 0) {
         /* Child: wire sv[1] to stdin and stdout, then exec */
@@ -529,7 +539,7 @@ static void xread(int fd, void *buf, size_t n) {
     while (n > 0) {
         wait_readable(fd);
         ssize_t r = read(fd, p, n);
-        if (r < 0) die("read: %s", strerror(errno));
+        if (r < 0) die("read: ", strerror(errno));
         if (r == 0) die("connection closed by remote");
         p += r; n -= r;
     }
@@ -538,7 +548,7 @@ void xwrite(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n > 0) {
         ssize_t r = write(fd, p, n);
-        if (r <= 0) die("write: %s", strerror(errno));
+        if (r <= 0) die("write: ", strerror(errno));
         p += r; n -= r;
     }
 }
@@ -554,7 +564,7 @@ static void xsend(int fd, const void *buf, size_t n) {
     while (n > 0) {
         ssize_t r = send(fd, p, n, MSG_NOSIGNAL);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) die("write: %s", strerror(errno));
+        if (r <= 0) die("write: ", strerror(errno));
         p += r; n -= (size_t)r;
     }
 }
@@ -604,11 +614,11 @@ static uint8_t *pkt_recv_plain(SSH *ssh, size_t *plen) {
     uint32_t pl = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16)
                 | ((uint32_t)hdr[2] <<  8) |  (uint32_t)hdr[3];
     uint8_t pad = hdr[4];
-    if (!pl || pl > MAX_PKT) die("bad plaintext packet length %u", pl);
+    if (!pl || pl > MAX_PKT) die("bad plaintext packet length");
     /* RFC 4253 6: padding is at least 4 bytes and must fit in the packet.
      * Without this, pl - 1 - pad wraps to ~4 GiB (the server is not yet
      * authenticated here, so this is attacker-controlled). */
-    if (pad < 4 || (uint32_t)pad > pl - 1) die("bad padding length %u in packet of %u", pad, pl);
+    if (pad < 4 || (uint32_t)pad > pl - 1) die("bad padding length");
     uint8_t *tmp = malloc(pl - 1);
     if (!tmp) die("malloc");
     xread(ssh->fd, tmp, pl - 1);
@@ -679,7 +689,7 @@ static uint8_t *pkt_recv_enc(SSH *ssh, size_t *plen) {
     crypto_stream_chacha20_xor_ic(dlen, dlen, 4, nonce, 0, ssh->recv_key + 32);
     uint32_t pl = ((uint32_t)dlen[0] << 24) | ((uint32_t)dlen[1] << 16)
                 | ((uint32_t)dlen[2] <<  8) |  (uint32_t)dlen[3];
-    if (!pl || pl > MAX_PKT) die("bad encrypted packet length %u", pl);
+    if (!pl || pl > MAX_PKT) die("bad encrypted packet length");
 
     uint8_t *cbody = malloc(pl); if (!cbody) die("malloc");
     xread(ssh->fd, cbody, pl);
@@ -761,7 +771,7 @@ static uint8_t *pkt_recv(SSH *ssh, size_t *plen) {
                 size_t ml; const uint8_t *msg = rdstr(&b, &ml);
                 char dmsg[256];
                 server_text(dmsg, sizeof dmsg, msg, ml);
-                die("Server disconnected: %s", dmsg);
+                die("Server disconnected: ", dmsg);
             }
             case SSH_MSG_GLOBAL_REQUEST: {
                 /*
@@ -879,7 +889,7 @@ static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
      * file, and accept the answer. */
     if (!f) {
         if (errno == ENOENT) { free(path); return 0; }
-        die("%s: cannot open: %s", path, strerror(errno));
+        die(path, ": cannot open: ", strerror(errno));
     }
     free(path);
 
@@ -910,7 +920,7 @@ static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
         fclose(f);
         return (sodium_memcmp(k, pubkey, 32) == 0) ? 1 : -1;
     }
-    if (ferror(f)) die("known_hosts: cannot read: %s", strerror(errno));
+    if (ferror(f)) die("known_hosts: cannot read: ", strerror(errno));
     fclose(f); return 0;
 }
 
@@ -1017,11 +1027,11 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
     if (rekey) { sk_pkt = srv_init; sk_len = srv_init_len; }
     else {
         sk_own = pkt_recv(ssh, &sk_len); sk_pkt = sk_own;
-        if (sk_pkt[0] != SSH_MSG_KEXINIT) die("expected KEXINIT, got %d", sk_pkt[0]);
+        if (sk_pkt[0] != SSH_MSG_KEXINIT) die("expected KEXINIT, got ", DEC(sk_pkt[0]));
     }
     /* The strict-KEX scan below reads the name-lists after the type byte and
      * the 16-byte cookie.  A shorter payload would be read past its end. */
-    if (sk_len < 17) die("server KEXINIT too short (%zu bytes)", sk_len);
+    if (sk_len < 17) die("server KEXINIT too short");
     free(ssh->server_kexinit);
     ssh->server_kexinit = malloc(sk_len);
     if (!ssh->server_kexinit) die("malloc");
@@ -1061,7 +1071,7 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
     /* ── Receive ECDH_REPLY ── */
     size_t rlen; uint8_t *reply = pkt_recv(ssh, &rlen);
     if (reply[0] != SSH_MSG_KEX_ECDH_REPLY)
-        die("expected ECDH_REPLY, got %d", reply[0]);
+        die("expected ECDH_REPLY, got ", DEC(reply[0]));
     Buf rb = { reply, rlen, rlen, 1 };
 
     size_t hkb_len; const uint8_t *hkb = rdstr(&rb, &hkb_len); /* host key blob */
@@ -1140,8 +1150,8 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
     } else {
         int kh = kh_check(host, srv_pk);
         if (kh == -1) {
-            die("HOST KEY MISMATCH for %s — possible man-in-the-middle attack!\n"
-                "If you changed the server, edit ~/.ssh/known_hosts.", host);
+            die("HOST KEY MISMATCH for ", host, " — possible man-in-the-middle attack!\n"
+                "If you changed the server, edit ~/.ssh/known_hosts.");
         }
         if (kh == 0) {
             hs_pause();                        /* waiting for the user does not count */
@@ -1199,7 +1209,7 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
     if (ssh->strict_kex) ssh->send_seq = 0;
 
     size_t nk_len; uint8_t *nk_pkt = pkt_recv(ssh, &nk_len);
-    if (nk_pkt[0] != SSH_MSG_NEWKEYS) die("expected NEWKEYS, got %d", nk_pkt[0]);
+    if (nk_pkt[0] != SSH_MSG_NEWKEYS) die("expected NEWKEYS, got ", DEC(nk_pkt[0]));
     free(nk_pkt);
     memcpy(ssh->recv_key, new_recv, 64);
     if (ssh->strict_kex) ssh->recv_seq = 0;
@@ -1235,7 +1245,7 @@ static void request_service(SSH *ssh, const char *name) {
     send_buf(ssh, &b);
 
     size_t rlen; uint8_t *r = pkt_recv_wait(ssh, &rlen);
-    if (r[0] != SSH_MSG_SERVICE_ACCEPT) die("service request '%s' denied", name);
+    if (r[0] != SSH_MSG_SERVICE_ACCEPT) die("service request '", name, "' denied");
     free(r);
 }
 
@@ -1303,7 +1313,7 @@ static void do_auth(SSH *ssh, const char *user,
     size_t rlen; uint8_t *r = auth_recv(ssh, &rlen);
     if (r[0] == SSH_MSG_USERAUTH_FAILURE) die("server rejected our key type");
     if (r[0] != SSH_MSG_USERAUTH_PK_OK && r[0] != SSH_MSG_USERAUTH_SUCCESS)
-        die("unexpected auth response %d during probe", r[0]);
+        die("unexpected auth response ", DEC(r[0]), " during probe");
     int already_ok = (r[0] == SSH_MSG_USERAUTH_SUCCESS);
     free(r);
     if (already_ok) { buf_free(&pkblob); return; }
@@ -1344,7 +1354,7 @@ static void do_auth(SSH *ssh, const char *user,
     if (r[0] != SSH_MSG_USERAUTH_SUCCESS) {
         if (r[0] == SSH_MSG_USERAUTH_FAILURE)
             die("authentication failed — check key is in authorized_keys");
-        die("unexpected auth response %d", r[0]);
+        die("unexpected auth response ", DEC(r[0]));
     }
     free(r);
 }
@@ -1370,10 +1380,10 @@ static void open_session(SSH *ssh) {
         size_t ml; const uint8_t *msg = rdstr(&rb, &ml);
         char omsg[256];
         server_text(omsg, sizeof omsg, msg, ml);
-        die("channel open failed (code %u): %s", code, omsg);
+        die("channel open failed (code ", DEC(code), "): ", omsg);
     }
     if (r[0] != SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
-        die("expected CHANNEL_OPEN_CONFIRMATION, got %d", r[0]);
+        die("expected CHANNEL_OPEN_CONFIRMATION, got ", DEC(r[0]));
     Buf rb = { r, rlen, rlen, 1 };
     rdu32(&rb);                          /* recipient (our local) channel */
     ssh->remote_chan = rdu32(&rb);
@@ -1430,7 +1440,7 @@ static int channel_request(SSH *ssh, const char *type, int want_reply, Buf *extr
 static void send_channel_request(SSH *ssh, const char *type, int want_reply, Buf *extra)
 {
     if (!channel_request(ssh, type, want_reply, extra))
-        die("channel request '%s' failed", type);
+        die("channel request '", type, "' failed");
 }
 
 /*
@@ -1574,7 +1584,7 @@ static int signal_status(const uint8_t *name, size_t n) {
 int ssh_keepalive(SSH *ssh) {
     long long idle = now_ms() - g_last_rx_ms;
     if (idle >= KEEPALIVE_DEAD_S * 1000LL)
-        die("timed out: the server sent nothing for %d seconds", KEEPALIVE_DEAD_S);
+        die("timed out: the server sent nothing for " STR(KEEPALIVE_DEAD_S) " seconds");
     if (!g_ka_sent && idle >= KEEPALIVE_SEND_S * 1000LL) {
         Buf b; buf_init(&b);
         buf_u8(&b, SSH_MSG_GLOBAL_REQUEST);
@@ -1706,9 +1716,9 @@ static void ensure_std_fds(void) {
     for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
         if (fcntl(fd, F_GETFD) >= 0) continue;
         int n = open("/dev/null", O_RDWR);
-        if (n < 0) die("/dev/null: %s", strerror(errno));
+        if (n < 0) die("/dev/null: ", strerror(errno));
         if (n != fd) {
-            if (dup2(n, fd) < 0) die("dup2: %s", strerror(errno));
+            if (dup2(n, fd) < 0) die("dup2 failed");
             close(n);
         }
     }
@@ -1753,7 +1763,7 @@ int main(int argc, char **argv) {
                  */
                 char *eq = strchr(optarg, '=');
                 if (!eq)
-                    die("mssh: bad -o syntax (expected Key=Value): %s", optarg);
+                    die("mssh: bad -o syntax (expected Key=Value): ", optarg);
                 *eq = '\0';
                 const char *key = optarg, *val = eq + 1;
                 if (strcasecmp(key, "UserKnownHostsFile") == 0) {
@@ -1763,10 +1773,10 @@ int main(int argc, char **argv) {
                 } else if (strcasecmp(key, "ConnectTimeout") == 0) {
                     char *end; long v = strtol(val, &end, 10);
                     if (*val == '\0' || *end != '\0' || v < 0 || v > 3600)
-                        die("mssh: bad ConnectTimeout (0-3600 seconds): %s", val);
+                        die("mssh: bad ConnectTimeout (0-3600 seconds): ", val);
                     g_connect_timeout = (int)v;
                 } else {
-                    die("mssh: unsupported option: %s", key);
+                    die("mssh: unsupported option: ", key);
                 }
                 break;
             }
@@ -1794,8 +1804,8 @@ int main(int argc, char **argv) {
     const char *host = hostarg;
     char *at = strchr(hostarg, '@');
     if (at) { *at = '\0'; user = hostarg; host = at + 1; }
-    if (!valid_host(host)) die("mssh: invalid host name: %s", host);
-    if (!valid_port(port)) die("mssh: invalid port: %s", port);
+    if (!valid_host(host)) die("mssh: invalid host name: ", host);
+    if (!valid_port(port)) die("mssh: invalid port: ", port);
 
     /* Build command string (remaining argv joined with spaces) */
     char command[4096] = {0};

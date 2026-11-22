@@ -58,7 +58,20 @@ typedef struct {
 
 /* ── client services, for the front-end ── */
 
-void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+/* die(a, b, ...): show the strings one after another (as tty_msg() does) and a
+ * newline, then exit 1.  There is no format: a string says itself,
+ * strerror(errno) is the system's reason, DEC(n) is a number.  One to eight
+ * arguments, all const char *: the compiler checks that (the sizeof costs no
+ * code), and a lone string is the cheapest call.  DEC(n) is for an unsigned
+ * of 32 bits, not a size_t or a negative number; every DEC has a buffer of its
+ * own, which lives as long as the call does. */
+void die1(const char *s) __attribute__((noreturn));
+void die_(const char *s, ...) __attribute__((noreturn, sentinel));
+char *decstr(char *end, unsigned v);
+#define DEC(n) decstr((char[11]){0} + 11, (unsigned)(n))
+#define DIE_N(...) ((void)sizeof((const char *const[]){ __VA_ARGS__ }), die_(__VA_ARGS__, NULL))
+#define DIE_PICK(_1, _2, _3, _4, _5, _6, _7, _8, f, ...) f
+#define die(...) DIE_PICK(__VA_ARGS__, DIE_N, DIE_N, DIE_N, DIE_N, DIE_N, DIE_N, DIE_N, die1, 0)(__VA_ARGS__)
 
 /* The command line as main() got it, before anything was parsed: a front-end
  * that starts the client afresh (xmssh, on a keypress) execs it again. */

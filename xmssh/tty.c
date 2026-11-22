@@ -148,7 +148,7 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
         fds[0].fd = closed ? -1 : xtty_fd();  fds[0].events = POLLIN;
         fds[1].fd = ssh->fd;                  fds[1].events = POLLIN;
 
-        if (poll(fds, 2, ssh_keepalive(ssh)) < 0 && errno != EINTR) die("poll: %s", strerror(errno));
+        if (poll(fds, 2, ssh_keepalive(ssh)) < 0 && errno != EINTR) die("poll failed");
 
         if (!closed && fds[0].revents) {
             xtty_poll(0, on_input, ssh);

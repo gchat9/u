@@ -137,7 +137,7 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
         fds[1].fd = ssh->fd;       fds[1].events = POLLIN;
 
         int n = poll(fds, 2, ssh_keepalive(ssh));    /* a timeout is for the keepalive check */
-        if (n < 0 && errno != EINTR) die("poll: %s", strerror(errno));
+        if (n < 0 && errno != EINTR) die("poll failed");
         if (g_winch) { g_winch = 0; ssh_window_change(ssh); }
         if (n <= 0) continue;
 
