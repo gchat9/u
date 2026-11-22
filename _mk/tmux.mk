@@ -18,7 +18,7 @@ CFLAGS  = -Wall -Wextra -Wno-unused-result -g -Os -ffunction-sections -fdata-sec
           -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
 LDFLAGS = -lutil -static -Wl,--gc-sections
 
-SRCS ?= main.c pty.c vt.c render.c input.c status.c session.c
+SRCS ?= main.c pty.c vt.c render.c input.c status.c session.c fmt.c
 
 # vt.c is the shared VT parser, in _lib. (.c files only, as in xtmux/Makefile.)
 vpath %.c ../_lib

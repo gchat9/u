@@ -1,0 +1,29 @@
+#pragma once
+
+#include <stddef.h>
+
+/*
+ * Text without printf.  What the program writes is a few strings and the odd
+ * number, which needs no format: the strings are joined, and a number is its
+ * digits.
+ *
+ *   put_u(p, n)               n in decimal at p, no NUL; its length.  For
+ *                             the escape sequences, where the digits go into
+ *                             a buffer that is being built.
+ *   DEC(n)                    n as a string, in a buffer made right there
+ *                             (n is an unsigned of 32 bits, not a size_t or
+ *                             a negative number).
+ *   join(d, cap, a, b, ...)   the strings to d, which has room for cap bytes
+ *                             and a NUL: cut where it is full.  Returns the
+ *                             length, as it is in d.
+ *
+ * join() takes from one to any number of const char *, and the compiler
+ * checks that: the sizeof is not evaluated, and costs nothing.
+ */
+int    put_u(char *p, unsigned v);
+char  *dec_(char *buf, unsigned v);
+size_t join_(char *d, size_t cap, const char *s, ...) __attribute__((sentinel));
+
+#define STRS_OK_(...) ((void)sizeof((const char *const[]){ __VA_ARGS__ }))
+#define DEC(n)             dec_((char[11]){0}, (unsigned)(n))
+#define join(d, cap, ...)  (STRS_OK_(__VA_ARGS__), join_((d), (cap), __VA_ARGS__, NULL))

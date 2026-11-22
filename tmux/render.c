@@ -1,4 +1,5 @@
 #include "render.h"
+#include "fmt.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -56,7 +57,7 @@ static int csi_n(char *t, int n, char final)
 {
     int k = 0;
     t[k++] = '\033'; t[k++] = '[';
-    if (n != 1) k += snprintf(t + k, 12, "%d", n);
+    if (n != 1) k += put_u(t + k, (unsigned)n);
     t[k++] = final;
     return k;
 }
@@ -78,8 +79,8 @@ static void emit_move(RenderState *rs, int row, int col)
     int  bn = 0, tn = 0;
     /* CUP; a parameter of 1 may be left out */
     best[bn++] = '\033'; best[bn++] = '[';
-    if (row > 0) bn += snprintf(best + bn, 12, "%d", row + 1);
-    if (col > 0) { best[bn++] = ';'; bn += snprintf(best + bn, 12, "%d", col + 1); }
+    if (row > 0) bn += put_u(best + bn, (unsigned)(row + 1));
+    if (col > 0) { best[bn++] = ';'; bn += put_u(best + bn, (unsigned)(col + 1)); }
     best[bn++] = 'H';
 
     if (cr >= 0) {
@@ -99,6 +100,13 @@ static void emit_move(RenderState *rs, int row, int col)
     out_raw(best, bn);
     rs->cursor_row = row;
     rs->cursor_col = col;
+}
+
+/* ';' and v in decimal at p; its length. */
+static int semi_u(char *p, unsigned v)
+{
+    *p = ';';
+    return 1 + put_u(p + 1, v);
 }
 
 /*
@@ -125,10 +133,10 @@ static int sgr_params(char *p, const RenderState *rs, bool inc,
         int      base = k ? 40 : 30;
         if (inc && c == (k ? rs->cur_bg : rs->cur_fg)) continue;
         if (c == COLOR_DEFAULT) {
-            if (inc) n += snprintf(p + n, 8, ";%d", base + 9);
-        } else if (c < 8)  n += snprintf(p + n, 8, ";%d", base + c);
-        else if (c < 16)   n += snprintf(p + n, 8, ";%d", base + 60 + c - 8);
-        else               n += snprintf(p + n, 16, ";%d;5;%d", base + 8, c);
+            if (inc) n += semi_u(p + n, base + 9);
+        } else if (c < 8)  n += semi_u(p + n, base + c);
+        else if (c < 16)   n += semi_u(p + n, base + 60 + c - 8);
+        else { n += semi_u(p + n, base + 8); n += semi_u(p + n, 5); n += semi_u(p + n, c); }
     }
     return n;
 }
@@ -377,8 +385,8 @@ static void scroll_lines(RenderState *rs, int rows, int shift)
     char buf[48];
     /* Setting the region homes the cursor, which is where DL/IL must act:
      * no move of our own is needed.  Resetting it homes the cursor again. */
-    int n = snprintf(buf, sizeof(buf), "\033[1;%dr\033[%d%c\033[r",
-                     rows, m, shift > 0 ? 'M' : 'L');
+    int n = (int)join(buf, sizeof buf, "\033[1;", DEC(rows), "r\033[", DEC(m),
+                      shift > 0 ? "M" : "L", "\033[r");
     out_raw(buf, n);
     rs->cursor_row = 0;              /* home: known */
     rs->cursor_col = 0;
