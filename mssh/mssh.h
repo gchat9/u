@@ -46,10 +46,8 @@ typedef struct {
     uint8_t *outq; size_t outq_len;
     int      eof_pending;
 
-    /* Saved verbatim payloads for exchange hash construction */
+    /* The two version strings, which the exchange hash takes in */
     char     client_ver[256], server_ver[256];
-    uint8_t *client_kexinit; size_t client_kexinit_len;
-    uint8_t *server_kexinit; size_t server_kexinit_len;
 
     /* Session state, see ssh_pump() */
     int client_eof, server_eof;      /* each side has sent EOF */

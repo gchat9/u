@@ -3,7 +3,7 @@
 # sources as mssh; only tty.c differs (this directory's). Needs /etc/bfnt/font2
 # at run time (make -C ../_font install), as xtmux does.
 TARGET     := xmssh
-SRCS       := mssh.c tty.c
+SRCS       := mssh.c tty.c resolve.c
 EXTRA_OBJS := xtty.o vt.o xterm_screen.o xterm.o
 include ../_mk/mssh.mk
 CFLAGS     += -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -DX11_BACKEND

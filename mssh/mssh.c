@@ -29,7 +29,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <netdb.h>
 #include <poll.h>
 #include <time.h>
 #include <stdarg.h>
@@ -56,6 +55,7 @@
 #include <sodium.h>
 
 #include "mssh.h"
+#include "resolve.h"
 
 /* ═══════════════════════ SSH message type constants ══════════════════════ */
 
@@ -130,6 +130,13 @@ static void hs_arm(void) {
     g_hs_active = 1;
     g_hs_deadline_ms = now_ms() + (long long)g_connect_timeout * 1000;
 }
+/* What is left of the handshake time, in ms, for the resolver; 0 if none is set. */
+static int hs_left_ms(void) {
+    long long left;
+    if (!g_hs_active) return 0;
+    left = g_hs_deadline_ms - now_ms();
+    return left < 1 ? 1 : left > 3600000 ? 3600000 : (int)left;
+}
 static void hs_pause(void)  { g_hs_active = 0; }   /* the user is being asked a question */
 static void hs_resume(void) { hs_arm(); }
 static void hs_done(int fd) {                      /* the session begins: no limit any more */
@@ -190,7 +197,7 @@ char *decstr(char *end, unsigned v) {
  * Buf serves two roles:
  *
  *   Writer  – append with buf_u8 / buf_u32 / buf_bytes / buf_str /
- *              buf_cstr / buf_mpint, then pass .b / .len to the send path.
+ *              buf_cstr, then pass .b / .len to the send path.
  *
  *   Reader  – wrap a received blob, advance .pos with rdu8 / rdu32 / rdstr.
  *
@@ -228,20 +235,33 @@ static void buf_str(Buf *b, const void *d, size_t n) {
 static void buf_cstr(Buf *b, const char *s) { buf_str(b, s, strlen(s)); }
 
 /*
- * SSH "mpint": big-endian positive integer, leading zeros stripped,
- * with a 0x00 prefix byte added when the high bit of the first remaining
- * byte is set (so the value is not misread as negative).
+ * SSH "mpint" of the 32 bytes of K (the DH shared secret from curve25519):
+ * big-endian positive integer, leading zeros stripped, with a 0x00 prefix
+ * byte added when the high bit of the first remaining byte is set (so the
+ * value is not misread as negative).  At most 4 + 1 + 32 = 37 bytes, in out,
+ * and its length is returned.
  *
- * Getting this right for K (the DH shared secret from curve25519) is the
- * single most common source of "MAC mismatch with no useful error" bugs.
+ * Getting this right is the single most common source of "MAC mismatch
+ * with no useful error" bugs.
  */
-static void buf_mpint(Buf *b, const uint8_t *p, size_t n) {
-    while (n > 1 && p[0] == 0) { p++; n--; }           /* strip leading zeros */
-    if (n == 1 && p[0] == 0) { buf_u32(b, 0); return; }/* encode zero */
-    int pad = (p[0] & 0x80) ? 1 : 0;
-    buf_u32(b, (uint32_t)(n + pad));
-    if (pad) buf_u8(b, 0);
-    buf_bytes(b, p, n);
+static size_t mpint32(uint8_t out[37], const uint8_t k[32]) {
+    size_t n = 32, o = 4;
+    while (n > 1 && k[0] == 0) { k++; n--; }           /* strip leading zeros */
+    if (n == 1 && k[0] == 0) { memset(out, 0, 4); return 4; }   /* encode zero */
+    int pad = (k[0] & 0x80) ? 1 : 0;
+    uint32_t l = (uint32_t)(n + pad);
+    out[0] = (uint8_t)(l >> 24); out[1] = (uint8_t)(l >> 16); out[2] = (uint8_t)(l >> 8); out[3] = (uint8_t)l;
+    if (pad) out[o++] = 0;
+    memcpy(out + o, k, n);
+    return o + n;
+}
+
+/* An SSH "string" into a hash: the exchange hash takes its fields as they are
+ * known, so that none of them is kept to be put together at the end. */
+static void hash_str(crypto_hash_sha256_state *h, const void *d, size_t n) {
+    uint8_t l[4] = { (uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n };
+    crypto_hash_sha256_update(h, l, 4);
+    crypto_hash_sha256_update(h, d, n);
 }
 
 /* Buffers carry K (mpint), the data to sign, and so on: wipe what was used. */
@@ -441,25 +461,24 @@ static void load_ed25519_key(const char *path,
 /* ════════════════════════════ TCP connect ════════════════════════════════ */
 
 static int tcp_connect(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res, *r;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc) die("getaddrinfo: ", gai_strerror(rc));
+    uint8_t addr[RES_MAX_ADDRS][4];
+    int n = resolve4(host, addr, RES_MAX_ADDRS, hs_left_ms());
+    if (n < 1) die("cannot resolve ", host, ": ", resolve_strerror(n));
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(port)) };
     int fd = -1, why = 0;
-    for (r = res; r; r = r->ai_next) {
-        fd = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
-        if (fd < 0) continue;
+    for (int i = 0; i < n; i++) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { why = errno; continue; }
         fcntl(fd, F_SETFD, FD_CLOEXEC);       /* a restarted client (xmssh) must not keep this one open */
         if (g_connect_timeout > 0) {          /* a blocking connect() honours SO_SNDTIMEO on Linux */
             struct timeval tv = { g_connect_timeout, 0 };
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         }
-        if (connect(fd, r->ai_addr, r->ai_addrlen) == 0) break;
+        memcpy(&sa.sin_addr, addr[i], 4);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) break;
         why = errno;
         close(fd); fd = -1;
     }
-    freeaddrinfo(res);
     if (fd < 0) die("connect to ", host, ":", port, " failed: ", strerror(why));
     int one = 1;                                   /* keystrokes must not wait for an ACK */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -472,15 +491,9 @@ static int tcp_connect(const char *host, const char *port) {
  * under sh -c, so anything else in them would be a shell command: only the
  * characters of host names, and digits for the port, are accepted (as OpenSSH
  * does).  IPv6 zone identifiers (fe80::1%eth0) are therefore refused.
+ * A name with a ':' is an IPv6 address, which tcp_connect() cannot connect to (the
+ * resolver is IPv4 only), but a ProxyCommand can: it is not refused here.
  */
-/* Appends s to the string of *n bytes in d, which has room for cap (with the NUL),
- * and says whether s did not fit: what is left out is left out. */
-static int cats(char *d, size_t cap, size_t *n, const char *s) {
-    while (*s && *n + 1 < cap) d[(*n)++] = *s++;
-    d[*n] = '\0';
-    return *s != '\0';
-}
-
 static int valid_host(const char *h) {
     size_t n = strlen(h);
     if (n == 0 || n > 255 || h[0] == '-') return 0;
@@ -493,7 +506,7 @@ static int valid_port(const char *p) {
     if (n == 0 || n > 5) return 0;
     for (size_t i = 0; i < n; i++)
         if (!isdigit((unsigned char)p[i])) return 0;
-    return 1;
+    return atoi(p) <= 65535;
 }
 
 /* ════════════════════════════ Proxy connect ═════════════════════════════
@@ -619,20 +632,37 @@ static void make_nonce(uint8_t n[8], uint32_t seq) {
     n[6] = (seq >>  8) & 0xff; n[7] =  seq        & 0xff;
 }
 
-static void pkt_send_plain(SSH *ssh, const uint8_t *pay, size_t plen) {
+/* The packet being sent: length, body, MAC.  There is one, for the same reason
+ * as for g_rx: a packet is at most MAX_PKT, and one is sent before the next is
+ * made.  The payload is given in two pieces, which are put side by side in it:
+ * the head and the rest (a CHANNEL_DATA is a head of 9 bytes and the data, which
+ * are in two places, and are not put together anywhere else). */
+static uint8_t g_tx[4 + MAX_PKT + 16];
+
+/* What longest payload can be sent: its packet, with the length of the packet
+ * and the padding (at most 11 bytes of it), is not above MAX_PKT. */
+#define MAX_PAYLOAD (MAX_PKT - 12)
+
+static void pkt_send_plain(SSH *ssh, const uint8_t *hd, size_t hn, const uint8_t *bd, size_t bn) {
+    size_t plen = hn + bn;
     uint8_t pad = (uint8_t)(8 - ((5 + plen) % 8));
     if (pad < 4) pad += 8;
     uint32_t pl = (uint32_t)(1 + plen + pad);
     /* One send() per packet: see pkt_send_enc. */
-    uint8_t *out = malloc(4 + (size_t)pl); if (!out) die("malloc");
+    uint8_t *out = g_tx;
     out[0] = pl>>24; out[1] = (pl>>16)&0xff; out[2] = (pl>>8)&0xff; out[3] = pl&0xff;
     out[4] = pad;
-    memcpy(out + 5, pay, plen);
+    memcpy(out + 5, hd, hn);
+    if (bn) memcpy(out + 5 + hn, bd, bn);
     memset(out + 5 + plen, 0, pad);
     xsend(ssh->fd, out, 4 + (size_t)pl);
-    free(out);
     ssh->send_seq++;
 }
+
+/* The packet being received: its bytes, then the MAC, or the padding.  There is
+ * one, since a packet is at most MAX_PKT, and what was received is done with
+ * before the next is (see pkt_recv()). */
+static uint8_t g_rx[MAX_PKT + 16];
 
 static uint8_t *pkt_recv_plain(SSH *ssh, size_t *plen) {
     uint8_t hdr[5]; xread(ssh->fd, hdr, 5);
@@ -644,18 +674,14 @@ static uint8_t *pkt_recv_plain(SSH *ssh, size_t *plen) {
      * Without this, pl - 1 - pad wraps to ~4 GiB (the server is not yet
      * authenticated here, so this is attacker-controlled). */
     if (pad < 4 || (uint32_t)pad > pl - 1) die("bad padding length");
-    uint8_t *tmp = malloc(pl - 1);
-    if (!tmp) die("malloc");
-    xread(ssh->fd, tmp, pl - 1);
+    xread(ssh->fd, g_rx, pl - 1);
     *plen = (size_t)(pl - 1 - pad);
-    uint8_t *r = malloc(*plen ? *plen : 1);
-    if (!r) die("malloc");
-    memcpy(r, tmp, *plen); free(tmp);
     ssh->recv_seq++;
-    return r;
+    return g_rx;
 }
 
-static void pkt_send_enc(SSH *ssh, const uint8_t *pay, size_t plen) {
+static void pkt_send_enc(SSH *ssh, const uint8_t *hd, size_t hn, const uint8_t *bd, size_t bn) {
+    size_t plen = hn + bn;
     /* The ChaCha20 nonce is the 32-bit sequence number: once it wraps, the
      * keystream and the Poly1305 key of an earlier packet are reused.  Refuse
      * instead; a rekey (or a new connection) is needed long before this. */
@@ -675,13 +701,14 @@ static void pkt_send_enc(SSH *ssh, const uint8_t *pay, size_t plen) {
      * Nagle's algorithm and the peer's delayed ACKs: in the re-key exchange,
      * which is a handful of small request/response packets, each costs
      * ~40-50 ms, and a re-key took most of a second. */
-    uint8_t *out = malloc(4 + (size_t)pl + 16); if (!out) die("malloc");
+    uint8_t *out = g_tx;
     uint8_t *cbody = out + 4;
     memcpy(out, elen, 4);
 
     /* Build plaintext body (in the output buffer; encrypted in place below) */
     cbody[0] = pad;
-    memcpy(cbody + 1, pay, plen);
+    memcpy(cbody + 1, hd, hn);
+    if (bn) memcpy(cbody + 1 + hn, bd, bn);
     randombytes_buf(cbody + 1 + plen, pad);
 
     /* Derive Poly1305 key: first 32 bytes of ChaCha20(K_main (key[0..31]), ic=0) */
@@ -701,7 +728,6 @@ static void pkt_send_enc(SSH *ssh, const uint8_t *pay, size_t plen) {
     sodium_memzero(poly_block, sizeof poly_block);
 
     xsend(ssh->fd, out, 4 + (size_t)pl + 16);
-    free(out);
     ssh->send_seq++;
 }
 
@@ -716,9 +742,9 @@ static uint8_t *pkt_recv_enc(SSH *ssh, size_t *plen) {
                 | ((uint32_t)dlen[2] <<  8) |  (uint32_t)dlen[3];
     if (!pl || pl > MAX_PKT) die("bad encrypted packet length");
 
-    uint8_t *cbody = malloc(pl); if (!cbody) die("malloc");
-    xread(ssh->fd, cbody, pl);
-    uint8_t mac[16]; xread(ssh->fd, mac, 16);
+    uint8_t *cbody = g_rx;                 /* pl bytes, and after them the MAC */
+    xread(ssh->fd, cbody, (size_t)pl + 16);
+    const uint8_t *mac = cbody + pl;
 
     /* Derive Poly1305 key: first 32 bytes of ChaCha20(K_main (key[0..31]), ic=0) */
     uint8_t poly_block[64] = {0};
@@ -735,24 +761,27 @@ static uint8_t *pkt_recv_enc(SSH *ssh, size_t *plen) {
     if (sodium_memcmp(cmac, mac, 16) != 0)
         die("MAC verification FAILED — sequence number drift or tampering");
 
-    /* Decrypt body with K_main (key[0..31]), ic=1 */
-    uint8_t *plain = malloc(pl); if (!plain) die("malloc");
-    crypto_stream_chacha20_xor_ic(plain, cbody, pl, nonce, 1,
+    /* Decrypt body with K_main (key[0..31]), ic=1: in place, as it has been
+     * authenticated and the ciphertext is of no use after. */
+    crypto_stream_chacha20_xor_ic(cbody, cbody, pl, nonce, 1,
                                    ssh->recv_key);
-    free(cbody);
 
-    uint8_t pad = plain[0];
+    uint8_t pad = cbody[0];
     if (pad < 4 || (uint32_t)pad > pl - 1) die("bad padding length in decrypted packet");
     *plen = (size_t)(pl - 1 - pad);
-    uint8_t *r = malloc(*plen ? *plen : 1); if (!r) die("malloc");
-    memcpy(r, plain + 1, *plen); free(plain);
     ssh->recv_seq++;
-    return r;
+    return cbody + 1;
+}
+
+/* Sends the payload hd[hn] followed by bd[bn] as one packet. */
+static void pkt_send2(SSH *ssh, const uint8_t *hd, size_t hn, const uint8_t *bd, size_t bn) {
+    if (hn > MAX_PAYLOAD || bn > MAX_PAYLOAD - hn) die("message too long to send");
+    if (ssh->send_enc) pkt_send_enc(ssh, hd, hn, bd, bn);
+    else               pkt_send_plain(ssh, hd, hn, bd, bn);
 }
 
 static void pkt_send(SSH *ssh, const uint8_t *pay, size_t plen) {
-    if (ssh->send_enc) pkt_send_enc(ssh, pay, plen);
-    else               pkt_send_plain(ssh, pay, plen);
+    pkt_send2(ssh, pay, plen, NULL, 0);
 }
 
 /*
@@ -770,7 +799,10 @@ static void server_text(char *dst, size_t dstsz, const uint8_t *src, size_t n) {
     dst[n] = '\0';
 }
 
-/* Skip IGNORE/DEBUG/GLOBAL_REQUEST; treat DISCONNECT as fatal */
+/* The next packet that is for the caller: its payload, which is in g_rx, and so
+ * is there until the next call of this (or of anything that calls it).  Every
+ * caller is done with the payload by then, or has copied what it keeps.
+ * Skips IGNORE/DEBUG/GLOBAL_REQUEST; treats DISCONNECT as fatal. */
 static uint8_t *pkt_recv(SSH *ssh, size_t *plen) {
     for (;;) {
         uint8_t *p;
@@ -786,10 +818,10 @@ static uint8_t *pkt_recv(SSH *ssh, size_t *plen) {
                        || p[0] == SSH_MSG_GLOBAL_REQUEST)
                 die("strict KEX violation: unexpected packet during key exchange");
         }
-        if (!*plen) { free(p); continue; }
+        if (!*plen) continue;
         switch (p[0]) {
             case SSH_MSG_IGNORE: case SSH_MSG_DEBUG:
-                free(p); continue;
+                continue;
             case SSH_MSG_DISCONNECT: {
                 Buf b = { p, *plen, *plen, 1 };
                 rdu32(&b); /* reason code */
@@ -812,7 +844,7 @@ static uint8_t *pkt_recv(SSH *ssh, size_t *plen) {
                         pkt_send(ssh, &fail, 1);
                     }
                 }
-                free(p); continue;
+                continue;
             }
             default: return p;
         }
@@ -881,14 +913,29 @@ static void derive_key(const uint8_t *K_mpint, size_t K_mpint_len,
 static const char *g_known_hosts_file = NULL;
 static const char *g_proxy_command     = NULL;
 
-static char *known_hosts_path(void) {
-    if (g_known_hosts_file) return strdup(g_known_hosts_file);
+/* Appends s to the string of *n bytes in d, which has room for cap (with the NUL),
+ * and says whether s did not fit: what is left out is left out. */
+static int cats(char *d, size_t cap, size_t *n, const char *s) {
+    while (*s && *n + 1 < cap) d[(*n)++] = *s++;
+    d[*n] = '\0';
+    return *s != '\0';
+}
+
+/* $HOME and the suffix, in buf, which has room for cap bytes. */
+static const char *home_path(char *buf, size_t cap, const char *suffix) {
     const char *home = getenv("HOME");
     if (!home) die("$HOME not set");
-    char *p = malloc(strlen(home) + 32);
-    if (!p) die("malloc");
-    strcpy(p, home); strcat(p, "/.ssh/known_hosts");
-    return p;
+    size_t n = strlen(home), m = strlen(suffix) + 1;         /* m: with the NUL */
+    if (n + m > cap) die("$HOME path too long");
+    memcpy(buf, home, n); memcpy(buf + n, suffix, m);
+    return buf;
+}
+
+/* Where known_hosts is.  The path is in buf (PATH_BUF bytes) or is the option's. */
+#define PATH_BUF 1024                  /* for a path made of $HOME: longer than any home */
+static const char *known_hosts_path(char *buf) {
+    if (g_known_hosts_file) return g_known_hosts_file;
+    return home_path(buf, PATH_BUF, "/.ssh/known_hosts");
 }
 
 /* Reads one SSH string at *pos of a blob; 0 if it does not fit (a malformed
@@ -936,17 +983,17 @@ static int kh_line(char *line, const char *host, const uint8_t *pubkey /* 32 byt
 
 /* Returns 1 if found and matches, 0 if not found, -1 if found but mismatch */
 static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
-    char *path = known_hosts_path();
+    char pbuf[PATH_BUF];
+    const char *path = known_hosts_path(pbuf);
     int fd = open(path, O_RDONLY);
     /* Only a file that does not exist means that no key is known.  Any other
      * failure (permissions, a directory, an I/O error) must not be taken for
      * "unknown host": that would ask the user about a host whose key is in the
      * file, and accept the answer. */
     if (fd < 0) {
-        if (errno == ENOENT) { free(path); return 0; }
+        if (errno == ENOENT) return 0;
         die(path, ": cannot open: ", strerror(errno));
     }
-    free(path);
 
     /* The file has a line for every host there has been, so it is not read
      * whole: pieces of 4 KiB, cut into lines here.  What is left of a piece
@@ -989,9 +1036,8 @@ static void ed25519_blob(const uint8_t pk[32], uint8_t out[ED25519_BLOB_LEN]) {
 
 static void kh_add(const char *host, const uint8_t pk[32])
 {
-    char *path = known_hosts_path();
-    int fd = open(path, O_RDWR | O_APPEND | O_CREAT, 0600);
-    free(path);
+    char pbuf[PATH_BUF];
+    int fd = open(known_hosts_path(pbuf), O_RDWR | O_APPEND | O_CREAT, 0600);
     if (fd < 0) { err("known_hosts: append failed\n"); return; }
     /* A file whose last line has no newline (edited by hand, say) would have
      * the new entry glued onto that line, and both would then be unusable. */
@@ -1035,8 +1081,8 @@ static void kh_add(const char *host, const uint8_t pk[32])
  */
 /*
  * The first key exchange (srv_init == NULL), or a re-key started by the
- * server, whose KEXINIT payload the caller has already read (srv_init; the
- * caller keeps ownership).  OpenSSH asks for one after 1 GiB of traffic, and
+ * server, whose KEXINIT payload the caller has already read (srv_init, which
+ * is copied before the next packet is received).  OpenSSH asks for one after 1 GiB of traffic, and
  * before this the session simply froze at that point.  A re-key differs in:
  * the server's KEXINIT is not read here; the strict-KEX marker is not sent
  * again; the host key is not asked about but must be the one accepted at
@@ -1046,6 +1092,11 @@ static void kh_add(const char *host, const uint8_t pk[32])
 static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t srv_init_len) {
     int rekey = srv_init != NULL;
     /* ── Send our KEXINIT ── */
+    /* The exchange hash, from the start: V_C, V_S, I_C, I_S, K_S, Q_C, Q_S, K. */
+    crypto_hash_sha256_state xh;
+    crypto_hash_sha256_init(&xh);
+    hash_str(&xh, ssh->client_ver, strlen(ssh->client_ver));
+    hash_str(&xh, ssh->server_ver, strlen(ssh->server_ver));
     Buf ck; buf_init(&ck);
     buf_u8(&ck, SSH_MSG_KEXINIT);
     uint8_t cookie[16]; randombytes_buf(cookie, 16);
@@ -1067,37 +1118,27 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
     buf_u8(&ck, 0);                                 /* first_kex_packet_follows */
     buf_u32(&ck, 0);                                /* reserved */
 
-    /* Save verbatim payload for the exchange hash */
-    free(ssh->client_kexinit);                      /* (a re-key replaces the first one's) */
-    ssh->client_kexinit = malloc(ck.len);
-    if (!ssh->client_kexinit) die("malloc");
-    memcpy(ssh->client_kexinit, ck.b, ck.len);
-    ssh->client_kexinit_len = ck.len;
+    hash_str(&xh, ck.b, ck.len);                    /* I_C: the payload as it is sent */
     send_buf(ssh, &ck);
 
     /* ── Receive server KEXINIT ── */
-    size_t sk_len; const uint8_t *sk_pkt; uint8_t *sk_own = NULL;
+    size_t sk_len; const uint8_t *sk_pkt;
     if (rekey) { sk_pkt = srv_init; sk_len = srv_init_len; }
     else {
-        sk_own = pkt_recv(ssh, &sk_len); sk_pkt = sk_own;
+        sk_pkt = pkt_recv(ssh, &sk_len);
         if (sk_pkt[0] != SSH_MSG_KEXINIT) die("expected KEXINIT, got ", DEC(sk_pkt[0]));
     }
     /* The strict-KEX scan below reads the name-lists after the type byte and
      * the 16-byte cookie.  A shorter payload would be read past its end. */
     if (sk_len < 17) die("server KEXINIT too short");
-    free(ssh->server_kexinit);
-    ssh->server_kexinit = malloc(sk_len);
-    if (!ssh->server_kexinit) die("malloc");
-    memcpy(ssh->server_kexinit, sk_pkt, sk_len);
-    ssh->server_kexinit_len = sk_len;
-    free(sk_own);
+    hash_str(&xh, sk_pkt, sk_len);              /* I_S (sk_pkt is last read in the scan below: more packets are received after) */
 
     /* Strict KEX is on if the server's kex_algorithms list has its marker.
      * Then its KEXINIT had to be the very first packet (nothing may have
      * been slipped in before it), and the sequence numbers restart at
      * NEWKEYS, below.  A server without it is served as before. */
     if (!rekey) {
-        Buf kb = { ssh->server_kexinit, sk_len, sk_len, 17 };   /* type + cookie */
+        Buf kb = { (uint8_t *)sk_pkt, sk_len, sk_len, 17 };   /* type + cookie */
         size_t kl; const uint8_t *kx = rdstr(&kb, &kl);
         static const char mark[] = "kex-strict-s-v00@openssh.com";
         size_t ml = sizeof mark - 1;
@@ -1159,19 +1200,16 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
      *   mpint(K)
      * )
      * Every field is length-prefixed per SSH "string" or "mpint" encoding.
+     * The first four went into xh above, as they were sent and received.
      */
-    Buf hb; buf_init(&hb);
-    buf_cstr(&hb, ssh->client_ver);
-    buf_cstr(&hb, ssh->server_ver);
-    buf_str(&hb, ssh->client_kexinit, ssh->client_kexinit_len);
-    buf_str(&hb, ssh->server_kexinit, ssh->server_kexinit_len);
-    buf_str(&hb, hkb, hkb_len);
-    buf_str(&hb, eph_pk, 32);
-    buf_str(&hb, srv_eph, 32);
-    buf_mpint(&hb, K_raw, 32);
+    hash_str(&xh, hkb, hkb_len);
+    hash_str(&xh, eph_pk, 32);
+    hash_str(&xh, srv_eph, 32);
+    uint8_t K_mpint[37]; size_t K_mpint_len = mpint32(K_mpint, K_raw);
+    crypto_hash_sha256_update(&xh, K_mpint, K_mpint_len);
 
-    uint8_t H[32]; crypto_hash_sha256(H, hb.b, hb.len);
-    buf_free(&hb);
+    uint8_t H[32]; crypto_hash_sha256_final(&xh, H);
+    sodium_memzero(&xh, sizeof xh);            /* its last block may hold part of K */
 
     /* Session ID is set from the *first* exchange hash and never changes */
     if (!ssh->have_session_id) {
@@ -1235,11 +1273,6 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
         }
         memcpy(ssh->host_pk, srv_pk, 32);
     }
-    free(reply);
-
-    /* ── Build the mpint-encoded K for key derivation ── */
-    Buf km; buf_init(&km);
-    buf_mpint(&km, K_raw, 32);
 
     /* ── Derive session keys ── */
     /*
@@ -1249,9 +1282,9 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
      * (Letters 'A'/'B' would be IVs; this cipher uses the seqno as its IV.)
      */
     uint8_t new_send[64], new_recv[64];
-    derive_key(km.b, km.len, H, 'C', ssh->session_id, new_send, 64);
-    derive_key(km.b, km.len, H, 'D', ssh->session_id, new_recv, 64);
-    buf_free(&km);
+    derive_key(K_mpint, K_mpint_len, H, 'C', ssh->session_id, new_send, 64);
+    derive_key(K_mpint, K_mpint_len, H, 'D', ssh->session_id, new_recv, 64);
+    sodium_memzero(K_mpint, sizeof K_mpint);
     sodium_memzero(K_raw, sizeof K_raw);
 
     /* ── Exchange NEWKEYS ── */
@@ -1263,7 +1296,6 @@ static void do_kex(SSH *ssh, const char *host, const uint8_t *srv_init, size_t s
 
     size_t nk_len; uint8_t *nk_pkt = pkt_recv(ssh, &nk_len);
     if (nk_pkt[0] != SSH_MSG_NEWKEYS) die("expected NEWKEYS, got ", DEC(nk_pkt[0]));
-    free(nk_pkt);
     memcpy(ssh->recv_key, new_recv, 64);
     if (ssh->strict_kex) ssh->recv_seq = 0;
     ssh->recv_enc = 1;   /* server side now encrypts too */
@@ -1284,7 +1316,6 @@ static uint8_t *pkt_recv_wait(SSH *ssh, size_t *plen) {
         uint8_t *p = pkt_recv(ssh, plen);
         if (*plen && p[0] == SSH_MSG_KEXINIT) {
             do_kex(ssh, NULL, p, *plen);
-            free(p);
             continue;
         }
         return p;
@@ -1299,7 +1330,6 @@ static void request_service(SSH *ssh, const char *name) {
 
     size_t rlen; uint8_t *r = pkt_recv_wait(ssh, &rlen);
     if (r[0] != SSH_MSG_SERVICE_ACCEPT) die("service request '", name, "' denied");
-    free(r);
 }
 
 /*
@@ -1321,7 +1351,6 @@ static uint8_t *auth_recv(SSH *ssh, size_t *rlen) {
             if (msg[i] == '\n') text[i] = '\n';
         err(text);
         err("\n");
-        free(r);
     }
 }
 
@@ -1368,7 +1397,6 @@ static void do_auth(SSH *ssh, const char *user,
     if (r[0] != SSH_MSG_USERAUTH_PK_OK && r[0] != SSH_MSG_USERAUTH_SUCCESS)
         die("unexpected auth response ", DEC(r[0]), " during probe");
     int already_ok = (r[0] == SSH_MSG_USERAUTH_SUCCESS);
-    free(r);
     if (already_ok) { buf_free(&pkblob); return; }
 
     /* ── Step 2: build signing blob, sign, send ── */
@@ -1409,7 +1437,6 @@ static void do_auth(SSH *ssh, const char *user,
             die("authentication failed — check key is in authorized_keys");
         die("unexpected auth response ", DEC(r[0]));
     }
-    free(r);
 }
 
 /* ════════════════════════ Channel / session ══════════════════════════════ */
@@ -1444,7 +1471,6 @@ static void open_session(SSH *ssh) {
     ssh->remote_maxpkt = rdu32(&rb);
     if (!ssh->remote_maxpkt) die("server announced a maximum packet size of 0");
     if (ssh->remote_maxpkt > 32768) ssh->remote_maxpkt = 32768;  /* ours is the lower limit anyway */
-    free(r);
 }
 
 /* The server's window only grows by what it says, and must not wrap. */
@@ -1474,18 +1500,17 @@ static int channel_request(SSH *ssh, const char *type, int want_reply, Buf *extr
      */
     for (;;) {
         size_t rlen; uint8_t *r = pkt_recv_wait(ssh, &rlen);
-        if (r[0] == SSH_MSG_CHANNEL_SUCCESS) { free(r); return 1; }
-        if (r[0] == SSH_MSG_CHANNEL_FAILURE) { free(r); return 0; }
+        if (r[0] == SSH_MSG_CHANNEL_SUCCESS) return 1;
+        if (r[0] == SSH_MSG_CHANNEL_FAILURE) return 0;
         if (r[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST && rlen >= 9) {
             /* honour window updates that arrive before our reply */
             Buf rb = { r, rlen, rlen, 1 };
             rdu32(&rb);
             add_window(ssh, rdu32(&rb));
-            free(r); continue;
+            continue;
         }
         /* Anything else (e.g. unexpected CHANNEL_REQUEST from server):
          * skip it and keep waiting — do not die. */
-        free(r);
     }
 }
 
@@ -1541,11 +1566,10 @@ void ssh_window_change(SSH *ssh) {
 
 /* One CHANNEL_DATA packet; the caller has checked n against window and maxpkt. */
 static void send_data(SSH *ssh, const uint8_t *data, size_t n) {
-    Buf b; buf_init(&b);
-    buf_u8(&b, SSH_MSG_CHANNEL_DATA);
-    buf_u32(&b, ssh->remote_chan);
-    buf_str(&b, data, n);
-    send_buf(ssh, &b);
+    uint32_t ch = ssh->remote_chan, dl = (uint32_t)n;
+    uint8_t head[9] = {                       /* type, channel, and the length of the data */
+        SSH_MSG_CHANNEL_DATA, ch >> 24, ch >> 16, ch >> 8, ch, dl >> 24, dl >> 16, dl >> 8, dl };
+    pkt_send2(ssh, head, sizeof head, data, n);
     ssh->remote_window -= (uint32_t)n;
 }
 
@@ -1660,7 +1684,7 @@ int ssh_keepalive(SSH *ssh) {
  */
 int ssh_pump(SSH *ssh) {
     size_t plen; uint8_t *pkt = pkt_recv(ssh, &plen);
-    if (!plen) { free(pkt); return 0; }
+    if (!plen) return 0;
 
     switch (pkt[0]) {
         case SSH_MSG_CHANNEL_DATA: {
@@ -1719,7 +1743,6 @@ int ssh_pump(SSH *ssh) {
             buf_u8(&b, SSH_MSG_CHANNEL_CLOSE);
             buf_u32(&b, ssh->remote_chan);
             send_buf(ssh, &b);
-            free(pkt);
             return 1;
         }
         case SSH_MSG_REQUEST_SUCCESS:
@@ -1738,7 +1761,6 @@ int ssh_pump(SSH *ssh) {
             }
             break;
     }
-    free(pkt);
 
     /* Over only at the server's CLOSE (handled above).  Ending when both sides
      * had sent EOF was wrong: sshd sends the command's EOF *before* its
@@ -1780,16 +1802,11 @@ static void ensure_std_fds(void) {
 char **ssh_argv;
 
 int main(int argc, char **argv) {
-    /* A copy of the arguments as given: the parsing below writes NULs into
-     * them ("-o Key=Value", "user@host"), so the originals no longer read
-     * as they were. */
-    ssh_argv = malloc(((size_t)argc + 1) * sizeof *ssh_argv);
-    if (!ssh_argv) { noret_write(STDERR_FILENO, "malloc\n", 7); return 1; }
-    for (int i = 0; i < argc; i++) {
-        ssh_argv[i] = strdup(argv[i]);
-        if (!ssh_argv[i]) { noret_write(STDERR_FILENO, "malloc\n", 7); return 1; }
-    }
-    ssh_argv[argc] = NULL;
+    /* The arguments as given, which are what a front-end starts the client
+     * afresh with.  Nothing below writes into them (getopt() does not move them,
+     * and "-o Key=Value" and "user@host" are taken apart without a NUL put in),
+     * so they need no copy. */
+    ssh_argv = argv;
 
     ensure_std_fds();
     if (sodium_init() < 0) die("libsodium init failed");
@@ -1814,11 +1831,16 @@ int main(int argc, char **argv) {
                  * Supported options:
                  *   UserKnownHostsFile=<path>
                  */
-                char *eq = strchr(optarg, '=');
+                const char *eq = strchr(optarg, '=');
                 if (!eq)
                     die("mssh: bad -o syntax (expected Key=Value): ", optarg);
-                *eq = '\0';
-                const char *key = optarg, *val = eq + 1;
+                /* The key, cut at 63 bytes (no option is as long; it is for the
+                 * comparison and the message), and the value, which is there. */
+                char key[64];
+                size_t kl = (size_t)(eq - optarg);
+                if (kl > sizeof key - 1) kl = sizeof key - 1;
+                memcpy(key, optarg, kl); key[kl] = '\0';
+                const char *val = eq + 1;
                 if (strcasecmp(key, "UserKnownHostsFile") == 0) {
                     g_known_hosts_file = val;
                 } else if (strcasecmp(key, "ProxyCommand") == 0) {
@@ -1851,12 +1873,18 @@ int main(int argc, char **argv) {
     }
 
     /* Parse [user@]host */
-    char *hostarg = argv[optind++];
+    const char *hostarg = argv[optind++];
     const char *user = getenv("USER");
     if (!user) user = "root";
     const char *host = hostarg;
-    char *at = strchr(hostarg, '@');
-    if (at) { *at = '\0'; user = hostarg; host = at + 1; }
+    char userbuf[256];
+    const char *at = strchr(hostarg, '@');
+    if (at) {
+        size_t ul = (size_t)(at - hostarg);
+        if (ul >= sizeof userbuf) die("mssh: user name too long");
+        memcpy(userbuf, hostarg, ul); userbuf[ul] = '\0';
+        user = userbuf; host = at + 1;
+    }
     if (!valid_host(host)) die("mssh: invalid host name: ", host);
     if (!valid_port(port)) die("mssh: invalid port: ", port);
 
@@ -1874,15 +1902,8 @@ int main(int argc, char **argv) {
     int have_command = (command[0] != '\0');
 
     /* Default identity: ~/.ssh/id_ed25519 */
-    char default_id[512];
-    if (!identity) {
-        const char *home = getenv("HOME");
-        if (!home) die("$HOME not set");
-        size_t n = 0;
-        if (cats(default_id, sizeof default_id, &n, home) |
-            cats(default_id, sizeof default_id, &n, "/.ssh/id_ed25519")) die("$HOME path too long");
-        identity = default_id;
-    }
+    char default_id[PATH_BUF];
+    if (!identity) identity = home_path(default_id, sizeof default_id, "/.ssh/id_ed25519");
 
     /* The terminal is set up from here on, so that what follows (errors, the
      * host key question) can be shown in it. */
@@ -1986,8 +2007,6 @@ int main(int argc, char **argv) {
     int status = tty_run(&ssh, got_pty, !have_command);
 
     /* Clean up */
-    free(ssh.client_kexinit);
-    free(ssh.server_kexinit);
     sodium_memzero(sk, sizeof(sk));
     close(fd);
     return status;
