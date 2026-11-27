@@ -1,16 +1,24 @@
+#define EXPORT_IMPLEMENTATIONS 1
+#include "../_sys/_.h"
+#include "../_lib/errstr.h"
+#include "sodium.h"
 #include "resolve.h"
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sodium.h>
-#include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
+/* The errno of a RES_SYSERR (a positive number), for resolve_strerror(). */
+static int sys_errno;
+
+/* The next word of a line, split at blanks, tabs and CRs (what strtok_r did
+ * with these delimiters): NULL when there is none.  *p is where to go on. */
+static char *next_word(char **p) {
+    char *s = *p;
+    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+    if (!*s) { *p = s; return 0; }
+    char *w = s;
+    while (*s && *s != ' ' && *s != '\t' && *s != '\r') s++;
+    if (*s) *s++ = '\0';
+    *p = s;
+    return w;
+}
 
 /* ═══════════════════════════════ Files ═══════════════════════════════════ */
 
@@ -21,14 +29,14 @@
  * whole: no line of /etc/hosts or /etc/resolv.conf that has a use is as long. */
 static int each_line(const char *path, int (*fn)(char *, void *), void *ctx)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY, 0);
     char buf[2048];
     size_t have = 0;
     int skip = 0, v = 0;
     if (fd < 0) return 0;
     for (;;) {
         ssize_t r = read(fd, buf + have, sizeof buf - 1 - have);
-        if (r < 0 && errno == EINTR) continue;
+        if (r == -EINTR) continue;
         if (r <= 0) {                       /* the end, or something that is read as the end */
             if (r == 0 && have && !skip) { buf[have] = '\0'; v = fn(buf, ctx); }
             break;
@@ -78,11 +86,11 @@ static int hosts_line(char *line, void *ctx)
 {
     struct hosts_q *q = ctx;
     uint8_t a[4];
-    char *save, *t, *h = strchr(line, '#');
+    char *p = line, *t, *h = strchr(line, '#');
     if (h) *h = '\0';
-    t = strtok_r(line, " \t\r", &save);
+    t = next_word(&p);
     if (!t || !dotted_quad(t, a)) return 0;             /* (the lines of IPv6 are not for this) */
-    while ((t = strtok_r(NULL, " \t\r", &save)))
+    while ((t = next_word(&p)))
         if (strcasecmp(t, q->name) == 0) {
             memcpy(q->addr[q->n++], a, 4);      /* (n < max: the line that makes it max is the last) */
             break;
@@ -95,9 +103,9 @@ static int hosts_line(char *line, void *ctx)
 /* "nameserver address": the first with an IPv4 address (an IPv6 one is passed over). */
 static int resolv_line(char *line, void *ctx)
 {
-    char *save, *t = strtok_r(line, " \t\r", &save);
+    char *p = line, *t = next_word(&p);
     if (!t || strcmp(t, "nameserver") != 0) return 0;
-    t = strtok_r(NULL, " \t\r", &save);
+    t = next_word(&p);
     return t && dotted_quad(t, ctx);
 }
 
@@ -198,13 +206,14 @@ static int ask(const uint8_t ns[4], int port, const uint8_t *q, size_t ql,
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     memcpy(&sa.sin_addr, ns, 4);
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return RES_SYSERR;
+    long e = socket(AF_INET, SOCK_DGRAM, 0);
+    if (e < 0) { sys_errno = (int)-e; return RES_SYSERR; }
+    fd = (int)e;
     /* connect(): the kernel then takes nothing that comes from another address or port. */
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { rc = RES_SYSERR; goto out; }
+    if ((e = connect(fd, (struct sockaddr *)&sa, sizeof sa)) < 0) { sys_errno = (int)-e; rc = RES_SYSERR; goto out; }
     for (attempt = 0; attempt < 3; attempt++) {
         long long end = now_ms() + each;
-        if (send(fd, q, ql, 0) < 0) { rc = RES_SYSERR; goto out; }
+        if ((e = sendto(fd, q, ql, 0, 0, 0)) < 0) { sys_errno = (int)-e; rc = RES_SYSERR; goto out; }
         for (;;) {
             uint8_t buf[1500];
             long long left = end - now_ms();
@@ -213,13 +222,13 @@ static int ask(const uint8_t ns[4], int port, const uint8_t *q, size_t ql,
             int pr;
             if (left <= 0) break;
             pr = poll(&p, 1, (int)left);
-            if (pr < 0 && errno == EINTR) continue;
-            if (pr < 0) { rc = RES_SYSERR; goto out; }
+            if (pr == -EINTR) continue;
+            if (pr < 0) { sys_errno = -pr; rc = RES_SYSERR; goto out; }
             if (pr == 0) break;
             r = recv(fd, buf, sizeof buf, 0);
             if (r < 0) {                                         /* nobody listens: ICMP, ECONNREFUSED */
-                if (errno == EINTR) continue;
-                rc = RES_SYSERR; goto out;
+                if (r == -EINTR) continue;
+                sys_errno = (int)-r; rc = RES_SYSERR; goto out;
             }
             rc = dns_answer(buf, (size_t)r, q, ql, addr, max);
             if (rc == RES_IGNORE) { rc = RES_TIMEOUT; continue; }
@@ -227,11 +236,7 @@ static int ask(const uint8_t ns[4], int port, const uint8_t *q, size_t ql,
         }
     }
 out:
-    {
-        int e = errno;
-        close(fd);
-        errno = e;
-    }
+    close(fd);
     return rc;
 }
 
@@ -269,7 +274,7 @@ const char *resolve_strerror(int code)
     case RES_NOTFOUND: return "no such host";
     case RES_TIMEOUT:  return "the nameserver does not answer";
     case RES_SERVFAIL: return "the nameserver's answer is an error";
-    case RES_SYSERR:   return strerror(errno);
+    case RES_SYSERR:   return errstr(sys_errno);
     }
     return "?";
 }

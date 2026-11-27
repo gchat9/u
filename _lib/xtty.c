@@ -1,5 +1,5 @@
-#include <fcntl.h>
-#include <string.h>
+#define EXPORT_IMPLEMENTATIONS 1
+#include "../_sys/_.h"
 
 #include "xtty.h"
 #include "xterm_screen.h"

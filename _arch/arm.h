@@ -92,8 +92,14 @@ static inline long lseek(int fd, long offset, int whence)
 static inline long getpid(void)
     { _syscall0(20); }
 
+static inline long kill(int pid, int sig)
+    { _syscall2(37, pid, sig); }
+
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(54, fd, request, arg); }
+
+static inline long fcntl(int fd, int cmd, long arg)
+    { _syscall3(55, fd, cmd, arg); }
 
 static inline int dup2(int oldfd, int newfd)
     { _syscall2(63, oldfd, newfd); }
@@ -137,6 +143,10 @@ static inline void *mremap(void *old_address, size_t old_size,
 static inline long poll(struct pollfd *fds, unsigned long nfds, int timeout)
     { _syscall3(168, fds, nfds, timeout); }
 
+static inline long prctl(int opt, unsigned long arg2, unsigned long arg3,
+                         unsigned long arg4, unsigned long arg5)
+    { _syscall5(172, opt, arg2, arg3, arg4, arg5); }
+
 static inline long rt_sigaction(int sig, const struct sigaction *act,
              struct sigaction *oact, size_t sigsetsize)
     { _syscall4(174, sig, act, oact, sigsetsize); }
@@ -158,6 +168,9 @@ static inline void *mmap(void *addr, size_t length, int prot, int flags,
                          int fd, long offset)
     { return (void *)mmap_raw(addr, length, prot, flags, fd, offset); }
 
+static inline long madvise(void *addr, size_t len, int advice)
+    { _syscall3(220, addr, len, advice); }
+
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(263, clk_id, tp); }
 
@@ -166,6 +179,9 @@ static inline long socket(int domain, int type, int protocol)
 
 static inline long connect(int sockfd, const struct sockaddr *addr, int addrlen)
     { _syscall3(283, sockfd, addr, addrlen); }
+
+static inline long socketpair(int domain, int type, int protocol, int sv[2])
+    { _syscall4(288, domain, type, protocol, sv); }
 
 static inline long sendto(int sockfd, const void *buf, size_t len, int flags,
        const struct sockaddr *dest_addr, int addrlen)
@@ -177,6 +193,9 @@ static inline long recv(int sockfd, void *buf, size_t len, int flags)
 static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
          struct sockaddr *src_addr, int *addrlen)
     { _syscall6(292, sockfd, buf, len, flags, src_addr, addrlen); }
+
+static inline long setsockopt(int fd, int level, int name, const void *val, unsigned int len)
+    { _syscall5(294, fd, level, name, val, len); }
 
 static inline long mkdirat(int dirfd, const char *pathname, mode_t mode)
     { _syscall3(323, dirfd, pathname, mode); }
@@ -204,6 +223,10 @@ static inline long statx(int dirfd, const char *pathname, int flags,
     { _syscall5(397, dirfd, pathname, flags, mask, statxbuf); }
 
 //////// main
+
+__attribute__((naked, unused)) static void sig_restorer(void)
+    { asm volatile("mov r7, #173\n\tsvc #0"); }
+#define SIG_RESTORER sig_restorer
 
 #ifdef EXPORT__START
 /*

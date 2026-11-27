@@ -1,8 +1,9 @@
 #include "vt.h"
+#define EXPORT_IMPLEMENTATIONS 1   /* the helpers of _lib/ and _sys/: see mem.h, str.h */
+#include "../_sys/_.h"
+#include "heap.h"
 #include "width.h"
 
-#include <stdlib.h>
-#include <string.h>
 
 /* ================================================================== */
 /* Helpers                                                              */
@@ -74,7 +75,7 @@ static Cell **alloc_cells(int rows, int cols)
 {
     size_t ptr_sz  = (size_t)rows * sizeof(Cell *);
     size_t data_sz = cells_data_bytes(rows, cols);
-    Cell **grid    = calloc(1, ptr_sz + data_sz);
+    Cell **grid    = heap_calloc(1, ptr_sz + data_sz);
     if (!grid) return NULL;
 
     Cell *data = cells_data(grid, rows);
@@ -91,13 +92,12 @@ static Cell **alloc_cells(int rows, int cols)
 static void free_cells(Cell **grid, int rows)
 {
     (void)rows;   /* no longer needed – single allocation */
-    free(grid);
+    heap_free(grid);
 }
 
 /* ---- madvise helpers (Linux only) ---- */
 
 #ifdef __linux__
-#include <sys/mman.h>
 
 /* Round a pointer UP to the next page boundary. */
 static inline void *page_align_up(void *p)
@@ -229,7 +229,7 @@ static int scratch_need(int cols)
 {
     if (cols <= vt_scr_cap) return 1;
     for (int i = 0; i < 2; i++) {
-        Cell *b = realloc(vt_scr[i], (size_t)cols * sizeof(Cell));
+        Cell *b = heap_realloc(vt_scr[i], (size_t)cols * sizeof(Cell));
         if (!b) return 0;
         vt_scr[i] = b;
     }
@@ -350,7 +350,7 @@ static int grid_new(Grid *g, int rows, int cols)
 #if VT_CELL_COMPACT
     if (vt_compact && scratch_need(cols)) {
         size_t cells = ((size_t)rows * cols * 2 + 3) & ~(size_t)3;
-        void **r = calloc(1, (size_t)rows * sizeof(void *) + cells + sizeof(CTab));
+        void **r = heap_calloc(1, (size_t)rows * sizeof(void *) + cells + sizeof(CTab));
         if (r) {
             uint16_t *d = (uint16_t *)(r + rows);
             for (int i = 0; i < rows; i++) r[i] = d + (size_t)i * cols;
@@ -370,7 +370,7 @@ static void grid_free(Grid *g, int rows, int cols)
 {
     if (g->row) {
         cells_dontneed(g, rows, cols);
-        free(g->row);               /* and the tables, if any: they are in it */
+        heap_free(g->row);               /* and the tables, if any: they are in it */
     }
     memset(g, 0, sizeof *g);
 }
@@ -765,9 +765,9 @@ static void scr_init(Screen *s, int rows, int cols, bool history)
     s->cols           = cols;
     grid_new(&s->g, rows, cols);
     /* s->ag: allocated lazily on first ?1047h/?1049h */
-    s->row_flags = calloc((size_t)rows, 1);
+    s->row_flags = heap_calloc((size_t)rows, 1);
 #if SCROLLBACK_ENABLED
-    s->scrollback     = history ? calloc(1, SCROLLBACK_BYTES) : NULL;
+    s->scrollback     = history ? heap_calloc(1, SCROLLBACK_BYTES) : NULL;
     s->scrollback_len = 0;
 #else
     (void)history;
@@ -795,7 +795,7 @@ static void alt_swap(Screen *s)
 static int alt_enter(Screen *s)
 {
     if (!s->ag.row && !grid_new(&s->ag, s->rows, s->cols)) return 0;
-    if (!s->alt_row_flags)  s->alt_row_flags  = calloc((size_t)s->rows, 1);
+    if (!s->alt_row_flags)  s->alt_row_flags  = heap_calloc((size_t)s->rows, 1);
     if (!s->alt_row_flags) return 0;
     alt_swap(s);
     memset(s->row_flags, 0, (size_t)s->rows);
@@ -811,12 +811,12 @@ static void alt_release(Screen *s)
 
 static void scr_free(Screen *s)
 {
-    free(s->alt_row_flags);
+    heap_free(s->alt_row_flags);
     s->alt_row_flags = NULL;
-    free(s->row_flags);
+    heap_free(s->row_flags);
     s->row_flags = NULL;
 #if SCROLLBACK_ENABLED
-    free(s->scrollback);
+    heap_free(s->scrollback);
     s->scrollback = NULL;
 #endif
     /* Hint to the kernel: these pages will not be read again.
@@ -1555,7 +1555,7 @@ static void dispatch_osc(VTParser *p)
     p->osc[p->osc_len < VT_MAX_OSC - 1 ? p->osc_len : VT_MAX_OSC - 1] = '\0';
     char *sep = strchr(p->osc, ';');
     if (!sep) return;
-    int cmd = atoi(p->osc);
+    int cmd = (int)strtol(p->osc, 0);
     if (cmd == 0 || cmd == 1 || cmd == 2) {
         size_t n = strlen(sep + 1);               /* cut where it does not fit */
         if (n > sizeof p->scr.title - 1) n = sizeof p->scr.title - 1;
@@ -1762,7 +1762,7 @@ static void resize_grid(Grid *g, int old_rows, int old_cols,
         }
 
         cells_dontneed(g, old_rows, old_cols);
-        free(g->row);
+        heap_free(g->row);
     }
     g->row = (void **)new_grid;
 }
@@ -1888,12 +1888,12 @@ static bool reflow(Screen *s, int nr, int nc)
     const int R = cl - cf + 1;
 
     /* Allocate everything first, so that failure changes nothing. */
-    Cell    *lin    = malloc(((size_t)or_ * oc + 2) * sizeof(Cell));
-    int     *lstart = malloc((size_t)or_ * sizeof(int));
-    int     *llen   = malloc((size_t)or_ * sizeof(int));
-    Cell    *tmp    = malloc(((size_t)nr * nc + 2) * sizeof(Cell));
+    Cell    *lin    = heap_alloc(((size_t)or_ * oc + 2) * sizeof(Cell));
+    int     *lstart = heap_alloc((size_t)or_ * sizeof(int));
+    int     *llen   = heap_alloc((size_t)or_ * sizeof(int));
+    Cell    *tmp    = heap_alloc(((size_t)nr * nc + 2) * sizeof(Cell));
     Cell   **ng     = alloc_cells(nr, nc);
-    uint8_t *nf     = calloc((size_t)nr, 1);
+    uint8_t *nf     = heap_calloc((size_t)nr, 1);
     if (!lin || !lstart || !llen || !tmp || !ng || !nf) goto fail;
 
     /* 1. The other lines of the screen, as logical lines in lin, without
@@ -1951,8 +1951,8 @@ static bool reflow(Screen *s, int nr, int nc)
      *    cursor's own rows (cut or padded), then the lines below it. */
     const int total = hrows + S;
     Cell    **tg = alloc_cells(total, nc);
-    uint8_t  *tf = calloc((size_t)total, 1);
-    if (!tg || !tf) { free_cells(tg, total); free(tf); goto fail; }
+    uint8_t  *tf = heap_calloc((size_t)total, 1);
+    if (!tg || !tf) { free_cells(tg, total); heap_free(tf); goto fail; }
     int row = 0;
     for (int p = pull; p < cut; ) {
         int e = p;
@@ -2007,14 +2007,14 @@ static bool reflow(Screen *s, int nr, int nc)
         nf[r] = tf[over + r];
     }
     free_cells(tg, total);
-    free(tf);
-    free(lin); free(lstart); free(llen); free(tmp);
+    heap_free(tf);
+    heap_free(lin); heap_free(lstart); heap_free(llen); heap_free(tmp);
 
     if (s->ag.row) resize_grid(&s->ag, or_, oc, nr, nc);
     cells_dontneed(&s->g, or_, oc);
-    free(s->g.row);
+    heap_free(s->g.row);
     s->g.row = (void **)ng;
-    free(s->row_flags);
+    heap_free(s->row_flags);
     s->row_flags = nf;
     s->rows = nr;
     s->scroll_top = 0;
@@ -2031,8 +2031,8 @@ static bool reflow(Screen *s, int nr, int nc)
     return true;
 
 fail:
-    free(lin); free(lstart); free(llen); free(tmp);
-    free_cells(ng, nr); free(nf);
+    heap_free(lin); heap_free(lstart); heap_free(llen); heap_free(tmp);
+    free_cells(ng, nr); heap_free(nf);
     return false;
 }
 #endif /* SCROLLBACK_ENABLED */
@@ -2056,7 +2056,7 @@ static void scr_resize_wide(Screen *s, int new_rows, int new_cols)
 
     /* Resize row_flags: realloc and zero any new rows */
     if (s->row_flags) {
-        s->row_flags = realloc(s->row_flags, (size_t)new_rows);
+        s->row_flags = heap_realloc(s->row_flags, (size_t)new_rows);
         if (s->row_flags && new_rows > old_rows)
             memset(s->row_flags + old_rows, 0,
                    (size_t)(new_rows - old_rows));
@@ -2108,7 +2108,7 @@ void vt_resize(VTParser *p, int rows, int cols)
     int old_rows = p->scr.rows;
     scr_resize(&p->scr, rows, cols);
     if (p->scr.alt_row_flags) {
-        uint8_t *f = realloc(p->scr.alt_row_flags, (size_t)rows);
+        uint8_t *f = heap_realloc(p->scr.alt_row_flags, (size_t)rows);
         if (f) {
             if (rows > old_rows) memset(f + old_rows, 0, (size_t)(rows - old_rows));
             p->scr.alt_row_flags = f;
@@ -2123,8 +2123,6 @@ void vt_resize(VTParser *p, int rows, int cols)
 /* Serialization                                                        */
 /* ================================================================== */
 
-#include <unistd.h>
-#include <errno.h>
 
 
 static int vt_write_all(int fd, const void *buf, size_t n)
@@ -2132,7 +2130,7 @@ static int vt_write_all(int fd, const void *buf, size_t n)
     const char *p = buf;
     while (n) {
         ssize_t r = write(fd, p, n);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r < 0) { if (r == -EINTR) continue; return -1; }
         p += r; n -= (size_t)r;
     }
     return 0;
@@ -2143,8 +2141,8 @@ static int vt_read_all(int fd, void *buf, size_t n)
     char *p = buf;
     while (n) {
         ssize_t r = read(fd, p, n);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
-        if (r == 0) { errno = ECONNRESET; return -1; }
+        if (r < 0) { if (r == -EINTR) continue; return -1; }
+        if (r == 0) return -1;
         p += r; n -= (size_t)r;
     }
     return 0;
@@ -2275,14 +2273,14 @@ int vt_serialize(const VTParser *p, int fd)
 static int read_grid(Screen *s, Grid *g, int fd)
 {
     size_t row_bytes = (size_t)s->cols * sizeof(Cell);
-    Cell *buf = malloc(row_bytes);
+    Cell *buf = heap_alloc(row_bytes);
     if (!buf) return -1;
     for (int r = 0; r < s->rows; r++) {
-        if (vt_read_all(fd, buf, row_bytes) < 0) { free(buf); return -1; }
+        if (vt_read_all(fd, buf, row_bytes) < 0) { heap_free(buf); return -1; }
         for (int c = 0; c < s->cols; c++) heal(buf, c, s->cols, blank_cell(s));
         row_store(s, g, r, buf);
     }
-    free(buf);
+    heap_free(buf);
     return 0;
 }
 

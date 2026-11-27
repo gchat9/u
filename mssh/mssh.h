@@ -11,9 +11,8 @@
  * Both implement the tty_* functions below; the client implements the
  * ssh_* ones they call.
  */
-#include <stddef.h>
-#include <stdint.h>
-#include <sys/types.h>
+#define EXPORT_IMPLEMENTATIONS 1     /* the helpers in _lib/: their bodies in every TU */
+#include "../_sys/_.h"
 #include <sodium.h>
 
 typedef struct {
@@ -43,7 +42,7 @@ typedef struct {
 
     /* Input that did not fit in remote_window yet, sent as the window opens;
      * eof_pending: the EOF follows it. */
-    uint8_t *outq; size_t outq_len;
+    uint8_t *outq; size_t outq_len, outq_cap;   /* outq_cap: the mapping's size, in bytes */
     int      eof_pending;
 
     /* The two version strings, which the exchange hash takes in */
@@ -74,7 +73,11 @@ char *decstr(char *end, unsigned v);
 /* The command line as main() got it, before anything was parsed: a front-end
  * that starts the client afresh (xmssh, on a keypress) execs it again. */
 extern char **ssh_argv;
+extern char **ssh_envp;                 /* and the environment, as main() got it */
 void err(const char *s);                                   /* a message for the user, see tty_msg */
+const char *getenv(const char *name);                     /* as the C library's: NULL if unset */
+void at_exit(void (*f)(void));                            /* f runs at exit_(), last registered first */
+void exit_(int code) __attribute__((noreturn));           /* the hooks, then the end of the process */
 void xwrite(int fd, const void *buf, size_t n);            /* write all, or die */
 void noret_write(int fd, const void *b, size_t n);         /* write, ignoring failure */
 

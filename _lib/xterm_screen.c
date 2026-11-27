@@ -6,9 +6,10 @@
  * (xterm.c) and the parser that fills the Screen (vt.c); used by xtmux, see
  * xterm_screen.h.
  */
-#include <stdlib.h>
+#define EXPORT_IMPLEMENTATIONS 1
+#include "../_sys/_.h"
+#include "heap.h"
 #include <stdint.h>
-#include <string.h>
 
 #include "xterm_screen.h"
 
@@ -348,7 +349,7 @@ static char *sel_extract(const Screen *s, size_t *len)
     int r1 = (int)(sel_hi >> 16), c1 = (int)(sel_hi & 0xFFFF);
     if (r1 >= s->rows) { r1 = s->rows - 1; c1 = s->cols - 1; }
     if (r0 > r1) return NULL;
-    char *buf = malloc((size_t)(r1 - r0 + 1) * ((size_t)s->cols * 4 + 1) + 1);
+    char *buf = heap_alloc((size_t)(r1 - r0 + 1) * ((size_t)s->cols * 4 + 1) + 1);
     if (!buf) return NULL;
     size_t n = 0;
     for (int r = r0; r <= r1; r++) {
@@ -464,8 +465,8 @@ int xscr_pointer(const Screen *s, int mode, int enc, int bracketed,
                     sel_drag = 0;
                     size_t len;
                     char *t = sel_on ? sel_extract(s, &len) : NULL;
-                    if (t && len) { xterm_selection_set(t, len); free(sel_buf); sel_buf = t; }
-                    else free(t);
+                    if (t && len) { xterm_selection_set(t, len); heap_free(sel_buf); sel_buf = t; }
+                    else heap_free(t);
                 }
             }
         } else {                                /* the program's gesture, or motion with no button */

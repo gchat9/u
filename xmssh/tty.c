@@ -10,15 +10,6 @@
  * is no cooked-mode terminal behind this window to echo and edit for a remote
  * program that has none.
  */
-#define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE
-
-#include <errno.h>
-#include <poll.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
 #include "../mssh/mssh.h"
 #include "../_lib/xtty.h"
 
@@ -90,9 +81,9 @@ static void space_input(const uint8_t *b, size_t n, void *ctx) {
  * old session survives in the new image.  Returns only if the exec failed. */
 static void reconnect(void) {
     window_close();
-    execv("/proc/self/exe", ssh_argv);
+    execve("/proc/self/exe", ssh_argv, ssh_envp);
     noret_write(STDERR_FILENO, "xmssh: cannot start again\n", strlen("xmssh: cannot start again\n"));
-    _exit(1);
+    exit(1);
 }
 
 /* With the window up after the session (or a failure): waits until the window
@@ -125,7 +116,7 @@ void tty_exit(int code) {
         wait_for_close_or_space();
     }
     window_close();
-    exit(code);
+    exit_(code);
 }
 
 /* ═════════════════════════ Main I/O loop ════════════════════════════════
@@ -147,7 +138,8 @@ int tty_run(SSH *ssh, int got_pty, int interactive) {
         fds[0].fd = closed ? -1 : xtty_fd();  fds[0].events = POLLIN;
         fds[1].fd = ssh->fd;                  fds[1].events = POLLIN;
 
-        if (poll(fds, 2, ssh_keepalive(ssh)) < 0 && errno != EINTR) die("poll failed");
+        int n = poll(fds, 2, ssh_keepalive(ssh));
+        if (n < 0 && n != -EINTR) die("poll failed");
 
         if (!closed && fds[0].revents) {
             xtty_poll(0, on_input, ssh);

@@ -24,7 +24,8 @@
  * randombytes_buf() is in randombytes.c, which cannot share a file with libc headers.
  * tests: test.py, which compares everything with libsodium.
  */
-#include <string.h>
+#define EXPORT_IMPLEMENTATIONS 1      /* the helpers of _lib/mem.h, as randombytes.c */
+#include "../../_sys/_.h"
 #include "sodium.h"
 
 typedef uint8_t  u8;

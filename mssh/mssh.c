@@ -23,39 +23,67 @@
  *   - Single blocking poll loop (fine; needs ring-buffers for production)
  */
 
-#define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE
-
-#include <arpa/inet.h>
-#include <ctype.h>
-#include <errno.h>
-#include <poll.h>
-#include <time.h>
+#define EXPORT__START 1           /* this TU holds _start, see _sys/_.h */
+#define EXPORT_IMPLEMENTATIONS 1
 #include <stdarg.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#if defined(__has_include)
-# if __has_include(<sys/prctl.h>)
-#  include <sys/prctl.h>
-#  define HAVE_PRCTL 1
-# endif
-#endif
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <strings.h>
-#include <sys/wait.h>
-#include <sodium.h>
-
 #include "mssh.h"
 #include "resolve.h"
+#include "../_lib/errstr.h"
+
+/* ═══════════════════ Process: environment, options, exit ═════════════════
+ * The program starts in _start (_sys/_.h), which hands over argc and argv:
+ * the environment is the array after them, and it is kept for getenv() and
+ * for the ProxyCommand's shell. */
+
+char **ssh_envp;
+
+const char *getenv(const char *name) {
+    for (char **e = ssh_envp; *e; e++) {
+        const char *a = *e, *b = name;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b && *a == '=') return a + 1;
+    }
+    return 0;
+}
+
+/* getopt for "i:p:o:t": the options come first, and the first operand (the
+ * host) ends them, as the usage line says; "--" ends them too.  Returns the
+ * letter, -1 when the options are over, '?' for a bad one or one without its
+ * argument.  An argument is the rest of its word or the next word. */
+static int optind = 1;
+static char *optarg;
+static int getopt_(int argc, char **argv, const char *spec) {
+    static int pos;                              /* the next letter of a bundle, as -tp22 */
+    if (!pos) {
+        if (optind >= argc || argv[optind][0] != '-' || !argv[optind][1]) return -1;
+        if (!strcmp(argv[optind], "--")) { optind++; return -1; }
+        pos = 1;
+    }
+    char *a = argv[optind];
+    int c = a[pos++];
+    const char *s = c == ':' ? 0 : strchr(spec, c);
+    if (!s) { if (!a[pos]) { optind++; pos = 0; } return '?'; }
+    if (s[1] == ':') {
+        if (a[pos]) optarg = a + pos;
+        else if (optind + 1 < argc) optarg = argv[++optind];
+        else { optind++; pos = 0; return '?'; }
+        optind++; pos = 0;
+        return c;
+    }
+    if (!a[pos]) { optind++; pos = 0; }
+    return c;
+}
+
+/* The hooks of exit_(): the restoring of the terminal and the wiping of the
+ * keys.  Last registered, first run; two are registered at most. */
+static void (*g_hooks[4])(void);
+static int g_nhooks;
+void at_exit(void (*f)(void)) { g_hooks[g_nhooks++] = f; }
+void exit_(int code) {
+    while (g_nhooks) g_hooks[--g_nhooks]();
+    exit(code);
+    __builtin_unreachable();
+}
 
 /* ═══════════════════════ SSH message type constants ══════════════════════ */
 
@@ -158,7 +186,7 @@ static void wait_readable(int fd) {
         struct pollfd p = { .fd = fd, .events = POLLIN };
         int r = poll(&p, 1, (int)left);
         if (r > 0) return;
-        if (r < 0 && errno != EINTR) die("poll failed");
+        if (r < 0 && r != -EINTR) die("poll failed");
     }
 }
 
@@ -210,11 +238,21 @@ typedef struct { uint8_t *b; size_t len, cap, pos; } Buf;
 
 static void buf_init(Buf *b) { b->b = NULL; b->len = b->cap = b->pos = 0; }
 
+/* Memory, without a heap: a block is a mapping of its own, whole pages,
+ * made by mmap() and grown by mremap().  The wrappers return -errno. */
+static uint8_t *mem_resize(uint8_t *p, size_t old, size_t n) {
+    void *q = p ? mremap(p, old, n, MREMAP_MAYMOVE)
+                : mmap(0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((uintptr_t)q > (uintptr_t)-4096) die("out of memory");
+    return q;
+}
+static void mem_free(uint8_t *p, size_t n) { if (p) munmap(p, n); }
+
 static void buf_grow(Buf *b, size_t n) {
     if (b->len + n <= b->cap) return;
-    size_t nc = b->cap ? b->cap * 2 : 256;
+    size_t nc = b->cap ? b->cap * 2 : 4096;
     while (nc < b->len + n) nc *= 2;
-    if (!(b->b = realloc(b->b, nc))) die("realloc failed");
+    b->b = mem_resize(b->b, b->cap, nc);
     b->cap = nc;
 }
 
@@ -265,7 +303,7 @@ static void hash_str(crypto_hash_sha256_state *h, const void *d, size_t n) {
 }
 
 /* Buffers carry K (mpint), the data to sign, and so on: wipe what was used. */
-static void buf_free(Buf *b) { if (b->b) sodium_memzero(b->b, b->len); free(b->b); buf_init(b); }
+static void buf_free(Buf *b) { if (b->b) sodium_memzero(b->b, b->len); mem_free(b->b, b->cap); buf_init(b); }
 
 /* Reader helpers — exit on underflow (MVP: protocol errors are fatal) */
 /* "n > len - pos", never "pos + n > len": pos <= len always holds, and the
@@ -352,7 +390,7 @@ static ssize_t b64dec(const char *in, size_t n, uint8_t *out, size_t outmax) {
 /* read(), which a signal does not make fail. */
 static ssize_t read_retry(int fd, void *buf, size_t n) {
     ssize_t r;
-    while ((r = read(fd, buf, n)) < 0 && errno == EINTR) {}
+    while ((r = read(fd, buf, n)) == -EINTR) {}
     return r;
 }
 
@@ -380,11 +418,11 @@ static void load_ed25519_key(const char *path,
                               uint8_t sk[crypto_sign_SECRETKEYBYTES],
                               uint8_t pk[crypto_sign_PUBLICKEYBYTES])
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) die(path, ": ", strerror(errno));
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) die(path, ": ", errstr(-fd));
     /* As OpenSSH: a key anyone else can read is no longer a secret. */
-    struct stat kst;
-    if (fstat(fd, &kst) == 0 && (kst.st_mode & 077))
+    struct statx kst;
+    if (statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &kst) == 0 && (kst.stx_mode & 077))
         die(path, ": unprotected private key file: remove group and other access (chmod 600)");
 
     /* The file is a few hundred bytes: read it whole, into a buffer that is
@@ -394,7 +432,7 @@ static void load_ed25519_key(const char *path,
     char buf[16384]; size_t len = 0;
     for (;;) {
         ssize_t r = read_retry(fd, buf + len, sizeof buf - len);
-        if (r < 0) die(path, ": ", strerror(errno));
+        if (r < 0) die(path, ": ", errstr((int)-r));
         if (r == 0) break;
         len += (size_t)r;
         if (len == sizeof buf) die("key file too large");
@@ -464,22 +502,23 @@ static int tcp_connect(const char *host, const char *port) {
     uint8_t addr[RES_MAX_ADDRS][4];
     int n = resolve4(host, addr, RES_MAX_ADDRS, hs_left_ms());
     if (n < 1) die("cannot resolve ", host, ": ", resolve_strerror(n));
-    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(port)) };
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)strtol(port, 0)) };
     int fd = -1, why = 0;
     for (int i = 0; i < n; i++) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) { why = errno; continue; }
-        fcntl(fd, F_SETFD, FD_CLOEXEC);       /* a restarted client (xmssh) must not keep this one open */
+        if (fd < 0) { why = -fd; continue; }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);    /* a restarted client (xmssh) must not keep this one open */
         if (g_connect_timeout > 0) {          /* a blocking connect() honours SO_SNDTIMEO on Linux */
             struct timeval tv = { g_connect_timeout, 0 };
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         }
         memcpy(&sa.sin_addr, addr[i], 4);
-        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) break;
-        why = errno;
+        long rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+        if (rc == 0) break;
+        why = (int)-rc;
         close(fd); fd = -1;
     }
-    if (fd < 0) die("connect to ", host, ":", port, " failed: ", strerror(why));
+    if (fd < 0) die("connect to ", host, ":", port, " failed: ", errstr(why));
     int one = 1;                                   /* keystrokes must not wait for an ACK */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
@@ -506,7 +545,7 @@ static int valid_port(const char *p) {
     if (n == 0 || n > 5) return 0;
     for (size_t i = 0; i < n; i++)
         if (!isdigit((unsigned char)p[i])) return 0;
-    return atoi(p) <= 65535;
+    return strtol(p, 0) <= 65535;
 }
 
 /* ════════════════════════════ Proxy connect ═════════════════════════════
@@ -543,22 +582,24 @@ static int proxy_connect(const char *cmd, const char *host, const char *port) {
     expanded[ei] = '\0';
 
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
-        die("socketpair: ", strerror(errno));
-    fcntl(sv[0], F_SETFD, FD_CLOEXEC);        /* the child's copies are dup2()ed to 0 and 1, which clears it */
+    long rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    if (rc < 0) die("socketpair: ", errstr((int)-rc));
+    fcntl(sv[0], F_SETFD, FD_CLOEXEC);     /* the child's copies are dup2()ed to 0 and 1, which clears it */
     fcntl(sv[1], F_SETFD, FD_CLOEXEC);
 
-    pid_t pid = fork();
-    if (pid < 0) die("fork: ", strerror(errno));
+    long pid = fork();
+    if (pid < 0) die("fork: ", errstr((int)-pid));
 
     if (pid == 0) {
-        /* Child: wire sv[1] to stdin and stdout, then exec */
+        /* Child: wire sv[1] to stdin and stdout, then exec.  Its exit is the
+         * raw one: the hooks in exit_() are the parent's, not the child's. */
         close(sv[0]);
-        if (dup2(sv[1], STDIN_FILENO)  < 0) _exit(127);
-        if (dup2(sv[1], STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(sv[1], STDIN_FILENO)  < 0) exit(127);
+        if (dup2(sv[1], STDOUT_FILENO) < 0) exit(127);
         if (sv[1] != STDIN_FILENO && sv[1] != STDOUT_FILENO) close(sv[1]);
-        execl("/bin/sh", "sh", "-c", expanded, (char *)NULL);
-        _exit(127);
+        char *const av[] = { "sh", "-c", expanded, 0 };
+        execve("/bin/sh", av, ssh_envp);
+        exit(127);
     }
 
     /* Parent: close child's end, return our end */
@@ -577,7 +618,7 @@ static void xread(int fd, void *buf, size_t n) {
     while (n > 0) {
         wait_readable(fd);
         ssize_t r = read(fd, p, n);
-        if (r < 0) die("read: ", strerror(errno));
+        if (r < 0) die("read: ", errstr((int)-r));
         if (r == 0) die("connection closed by remote");
         p += r; n -= r;
     }
@@ -586,7 +627,7 @@ void xwrite(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n > 0) {
         ssize_t r = write(fd, p, n);
-        if (r <= 0) die("write: ", strerror(errno));
+        if (r <= 0) die("write: ", errstr((int)-r));
         p += r; n -= r;
     }
 }
@@ -600,9 +641,9 @@ void xwrite(int fd, const void *buf, size_t n) {
 static void xsend(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n > 0) {
-        ssize_t r = send(fd, p, n, MSG_NOSIGNAL);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) die("write: ", strerror(errno));
+        ssize_t r = sendto(fd, p, n, MSG_NOSIGNAL, 0, 0);
+        if (r == -EINTR) continue;
+        if (r <= 0) die("write: ", errstr((int)-r));
         p += r; n -= (size_t)r;
     }
 }
@@ -985,14 +1026,14 @@ static int kh_line(char *line, const char *host, const uint8_t *pubkey /* 32 byt
 static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
     char pbuf[PATH_BUF];
     const char *path = known_hosts_path(pbuf);
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY, 0);
     /* Only a file that does not exist means that no key is known.  Any other
      * failure (permissions, a directory, an I/O error) must not be taken for
      * "unknown host": that would ask the user about a host whose key is in the
      * file, and accept the answer. */
     if (fd < 0) {
-        if (errno == ENOENT) return 0;
-        die(path, ": cannot open: ", strerror(errno));
+        if (fd == -ENOENT) return 0;
+        die(path, ": cannot open: ", errstr(-fd));
     }
 
     /* The file has a line for every host there has been, so it is not read
@@ -1002,7 +1043,7 @@ static int kh_check(const char *host, const uint8_t *pubkey /* 32 bytes */) {
     char buf[4096]; size_t have = 0; int skip = 0, v = 0;
     for (;;) {
         ssize_t r = read_retry(fd, buf + have, sizeof buf - 1 - have);
-        if (r < 0) die("known_hosts: cannot read: ", strerror(errno));
+        if (r < 0) die("known_hosts: cannot read: ", errstr((int)-r));
         have += (size_t)r;
         if (r == 0) {                    /* the end; the last line may have no line end */
             if (have && !skip) { buf[have] = '\0'; v = kh_line(buf, host, pubkey); }
@@ -1041,11 +1082,11 @@ static void kh_add(const char *host, const uint8_t pk[32])
     if (fd < 0) { err("known_hosts: append failed\n"); return; }
     /* A file whose last line has no newline (edited by hand, say) would have
      * the new entry glued onto that line, and both would then be unusable. */
-    struct stat st;
-    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+    struct statx st;
+    if (statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st) == 0 && st.stx_size > 0) {
         char last;
-        if (pread(fd, &last, 1, st.st_size - 1) == 1 && last != '\n')
-            noret_write(fd, "\n", 1);
+        if (lseek(fd, -1, SEEK_END) >= 0 && read(fd, &last, 1) == 1 && last != '\n')
+            noret_write(fd, "\n", 1);      /* O_APPEND: the write goes to the end anyway */
     }
     uint8_t blob[ED25519_BLOB_LEN]; ed25519_blob(pk, blob);
     char b64[128]; b64enc(blob, sizeof blob, b64);      /* 68 characters */
@@ -1598,7 +1639,7 @@ static void flush_outq(SSH *ssh) {
     }
     ssh->outq_len -= done;
     if (ssh->outq_len) memmove(ssh->outq, ssh->outq + done, ssh->outq_len);
-    else { free(ssh->outq); ssh->outq = NULL; }
+    else { mem_free(ssh->outq, ssh->outq_cap); ssh->outq = NULL; ssh->outq_cap = 0; }
     if (!ssh->outq_len && ssh->eof_pending) { ssh->eof_pending = 0; send_eof_packet(ssh); }
 }
 
@@ -1614,10 +1655,13 @@ void ssh_send_input(SSH *ssh, const uint8_t *data, size_t n) {
     if (!ssh->outq_len)                       /* nothing waiting ahead of it: send directly */
         while (n && (k = chunk_size(ssh, n)) > 0) { send_data(ssh, data, k); data += k; n -= k; }
     if (!n) return;
-    uint8_t *q = realloc(ssh->outq, ssh->outq_len + n);
-    if (!q) die("malloc");
-    memcpy(q + ssh->outq_len, data, n);
-    ssh->outq = q; ssh->outq_len += n;
+    if (ssh->outq_len + n > ssh->outq_cap) {
+        size_t nc = (ssh->outq_len + n + 4095) & ~(size_t)4095;
+        ssh->outq = mem_resize(ssh->outq, ssh->outq_cap, nc);
+        ssh->outq_cap = nc;
+    }
+    memcpy(ssh->outq + ssh->outq_len, data, n);
+    ssh->outq_len += n;
 }
 
 /* The terminal's input has ended: tell server we're done sending (after
@@ -1789,9 +1833,9 @@ static void wipe_secrets(void) {
  * descriptors that are closed are opened on /dev/null instead. */
 static void ensure_std_fds(void) {
     for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
-        if (fcntl(fd, F_GETFD) >= 0) continue;
-        int n = open("/dev/null", O_RDWR);
-        if (n < 0) die("/dev/null: ", strerror(errno));
+        if (fcntl(fd, F_GETFD, 0) >= 0) continue;
+        int n = open("/dev/null", O_RDWR, 0);
+        if (n < 0) die("/dev/null: ", errstr(-n));
         if (n != fd) {
             if (dup2(n, fd) < 0) die("dup2 failed");
             close(n);
@@ -1801,26 +1845,25 @@ static void ensure_std_fds(void) {
 
 char **ssh_argv;
 
-int main(int argc, char **argv) {
+__attribute__((noreturn)) static void main(int argc, char **argv) {
     /* The arguments as given, which are what a front-end starts the client
      * afresh with.  Nothing below writes into them (getopt() does not move them,
      * and "-o Key=Value" and "user@host" are taken apart without a NUL put in),
      * so they need no copy. */
     ssh_argv = argv;
+    ssh_envp = argv + argc + 1;
 
     ensure_std_fds();
     if (sodium_init() < 0) die("libsodium init failed");
-#if defined(HAVE_PRCTL) && defined(PR_SET_DUMPABLE)
     /* The process holds the private key and the session keys: no core file,
      * and no ptrace()/ /proc/PID/mem for other processes of the same user. */
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-#endif
 
     const char *identity = NULL;
     const char *port     = "22";
     int         force_pty = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "i:p:o:t")) != -1) {
+    while ((opt = getopt_(argc, argv, "i:p:o:t")) != -1) {
         switch (opt) {
             case 'i': identity = optarg; break;
             case 'p': port     = optarg; break;
@@ -1846,7 +1889,7 @@ int main(int argc, char **argv) {
                 } else if (strcasecmp(key, "ProxyCommand") == 0) {
                     g_proxy_command = val;
                 } else if (strcasecmp(key, "ConnectTimeout") == 0) {
-                    char *end; long v = strtol(val, &end, 10);
+                    char *end; long v = strtol(val, &end);
                     if (*val == '\0' || *end != '\0' || v < 0 || v > 3600)
                         die("mssh: bad ConnectTimeout (0-3600 seconds): ", val);
                     g_connect_timeout = (int)v;
@@ -1863,13 +1906,13 @@ int main(int argc, char **argv) {
                     "  UserKnownHostsFile=<path>\n"
                     "  ProxyCommand=<cmd>  (%h/%p expanded to host/port)\n"
                     "  ConnectTimeout=<s>  (handshake time limit, default 60; 0: none)\n");
-                return 1;
+                exit_(1);
         }
     }
     if (optind >= argc) {
         err("usage: mssh [-t] [-i identity] [-p port]\n"
             "            [-o Key=Value] [user@]host [command ...]\n");
-        return 1;
+        exit_(1);
     }
 
     /* Parse [user@]host */
@@ -1917,7 +1960,7 @@ int main(int argc, char **argv) {
     static uint8_t sk[crypto_sign_SECRETKEYBYTES];
     uint8_t pk[crypto_sign_PUBLICKEYBYTES];
     g_sk = sk;
-    atexit(wipe_secrets);
+    at_exit(wipe_secrets);
     load_ed25519_key(identity, sk, pk);
 
     /* ── Connect (direct TCP or ProxyCommand) ── */
@@ -1966,7 +2009,7 @@ int main(int argc, char **argv) {
             if (++pre_lines > MAX_PRE_BANNER_LINES) die("too many lines before the server's SSH version line");
             if (svlen > 0 && sv[svlen-1] == '\r') sv[--svlen] = '\0';
             else sv[svlen] = '\0';
-            if (strncmp(sv, "SSH-2.0", 7) == 0) break;
+            if (memcmp(sv, "SSH-2.0", 7) == 0) break;
             svlen = 0;  /* banner line — discard and keep reading */
         } else {
             if (svlen < sizeof(sv) - 1) sv[svlen++] = c;
@@ -2006,8 +2049,8 @@ int main(int argc, char **argv) {
     hs_done(fd);
     int status = tty_run(&ssh, got_pty, !have_command);
 
-    /* Clean up */
+    /* Clean up: the hooks wipe the keys and restore the terminal */
     sodium_memzero(sk, sizeof(sk));
     close(fd);
-    return status;
+    exit_(status);
 }

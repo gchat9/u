@@ -6,6 +6,12 @@
 #define AF_INET     2
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
+#define AF_UNIX     1
+#define SOL_SOCKET  1
+#define SO_SNDTIMEO 21
+#define IPPROTO_TCP 6
+#define TCP_NODELAY 1
+#define MSG_NOSIGNAL 0x4000
 
 typedef uint32_t in_addr_t;
 typedef uint32_t socklen_t;

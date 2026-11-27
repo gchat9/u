@@ -66,6 +66,9 @@ static inline long getcwd(char *buf, size_t size)
 static inline long dup2(int oldfd, int newfd)
     { _syscall3(24, oldfd, newfd, 0); }
 
+static inline long fcntl(int fd, int cmd, long arg)
+    { _syscall3(25, fd, cmd, arg); }
+
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(29, fd, request, arg); }
 
@@ -128,7 +131,7 @@ poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
 }
 
 static inline long readlink(const char *pathname, char *buf, size_t bufsize)
-    { _syscall2(78, pathname, buf); }
+    { _syscall4(78, -100, pathname, buf, bufsize); }   /* readlinkat(AT_FDCWD): no readlink here */
 
 static inline long readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
     { _syscall4(78, dirfd, pathname, buf, bufsize); }
@@ -145,12 +148,19 @@ static inline long nanosleep(const struct timespec *request, struct timespec *re
 static inline long clock_gettime(int clk_id, struct timespec *tp)
     { _syscall2(113, clk_id, tp); }
 
+static inline long kill(int pid, int sig)
+    { _syscall2(129, pid, sig); }
+
 static inline long rt_sigaction(int sig, const struct sigaction *act,
                                 struct sigaction *oact, size_t sigsetsize)
     { _syscall4(134, sig, act, oact, sigsetsize); }
 
 static inline pid_t setsid(void)
     { _syscall0(157); }
+
+static inline long prctl(int opt, unsigned long arg2, unsigned long arg3,
+                         unsigned long arg4, unsigned long arg5)
+    { _syscall5(167, opt, arg2, arg3, arg4, arg5); }
 
 static inline long getpid(void)
     { _syscall0(172); }
@@ -163,6 +173,9 @@ static inline long sysinfo(struct sysinfo *buf)
 
 static inline long socket(int domain, int type, int protocol)
     { _syscall3(198, domain, type, protocol); }
+
+static inline long socketpair(int domain, int type, int protocol, int sv[2])
+    { _syscall4(199, domain, type, protocol, sv); }
 
 static inline long connect(int sockfd, const struct sockaddr *addr, int addrlen)
     { _syscall3(203, sockfd, addr, addrlen); }
@@ -177,6 +190,9 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
 
 /* recv does not exist on riscv64; express via recvfrom with addr=NULL */
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
+
+static inline long setsockopt(int fd, int level, int name, const void *val, unsigned int len)
+    { _syscall5(208, fd, level, name, val, len); }
 
 static inline long munmap(void *addr, size_t length)
     { _syscall2(215, addr, length); }
@@ -201,6 +217,9 @@ static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
                             int fd, long offset)
     { _syscall6(222, addr, length, prot, flags, fd, offset); }
 
+static inline long madvise(void *addr, size_t len, int advice)
+    { _syscall3(233, addr, len, advice); }
+
 static inline long wait4(int pid, int *status, int options, void *rusage)
     { _syscall4(260, pid, status, options, rusage); }
 
@@ -218,24 +237,12 @@ static inline long statx(int dirfd, const char *pathname, int flags,
                          unsigned int mask, struct statx *statxbuf)
     { _syscall5(291, dirfd, pathname, flags, mask, statxbuf); }
 
-/* memset: the compiler calls it for large zero-initialisations, and on riscv64 that
- * call is left external. The one definition is in the program's main TU (EXPORT__START
- * below), so it is linked once; mem.h does not give memset a static definition here. */
-#define MEMSET_EXTERN 1
-void *memset(void *ptr, int c, size_t n);
-
 ////////////// main
+
+/* No SIG_RESTORER: the kernel supplies its own return path on this arch. */
 
 #ifdef EXPORT__START
 
-/* A byte loop, which gcc would turn back into a call to memset: hence the attribute. */
-__attribute__((optimize("no-tree-loop-distribute-patterns"), used))
-void *memset(void *ptr, int c, size_t n)
-{
-    unsigned char *p = (unsigned char *)ptr;
-    while (n--) *p++ = (unsigned char)c;
-    return ptr;
-}
 /*
  * At process entry on Linux/RISC-V:
  *

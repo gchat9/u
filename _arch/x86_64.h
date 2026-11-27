@@ -107,11 +107,11 @@ static inline void *mremap(void *old_address, size_t old_size,
                            size_t new_size, int flags)
     { return (void *)mremap_raw(old_address, old_size, new_size, flags); }
 
+static inline long madvise(void *addr, size_t len, int advice)
+    { _syscall3(28, addr, len, advice); }
+
 static inline long dup2(int oldfd, int newfd)
     { _syscall2(33, oldfd, newfd); }
-
-static inline pid_t setsid(void)
-    { _syscall0(112); }
 
 static inline long nanosleep(const struct timespec *request,
                              struct timespec *remain)
@@ -136,12 +136,15 @@ static inline long recvfrom(int sockfd, void *buf, size_t len, int flags,
                             struct sockaddr *src_addr, int *addrlen)
     { _syscall6(45, sockfd, buf, len, flags, src_addr, addrlen); }
 
+static inline long socketpair(int domain, int type, int protocol, int sv[2])
+    { _syscall4(53, domain, type, protocol, sv); }
+
+static inline long setsockopt(int fd, int level, int name, const void *val, unsigned int len)
+    { _syscall5(54, fd, level, name, val, len); }
+
 static inline long clone(unsigned long flags, void *stack, int *ptid,
                        int *ctid, unsigned long tls)
     { _syscall5(56, flags, stack, ptid, ctid, tls); }
-
-/* recv does not exist as separate syscall here; express via recvfrom */
-#define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
 static inline int execve(const char *pathname,
                           char *const argv[], char *const envp[])
@@ -149,6 +152,15 @@ static inline int execve(const char *pathname,
 
 static inline long wait4(int pid, int *status, int options, void *rusage)
     { _syscall4(61, pid, status, options, rusage); }
+
+static inline long kill(int pid, int sig)
+    { _syscall2(62, pid, sig); }
+
+/* recv does not exist as separate syscall here; express via recvfrom */
+#define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
+
+static inline long fcntl(int fd, int cmd, long arg)
+    { _syscall3(72, fd, cmd, arg); }
 
 static inline long getcwd(char *buf, size_t size)
     { _syscall2(79, buf, size); }
@@ -168,8 +180,15 @@ static inline long sysinfo(struct sysinfo *buf)
 static inline long getuid(void)
     { _syscall0(102); }
 
+static inline pid_t setsid(void)
+    { _syscall0(112); }
+
 static inline long statfs(const char *path, struct statfs *buf)
     { _syscall2(137, path, buf); }
+
+static inline long prctl(int opt, unsigned long arg2, unsigned long arg3,
+                         unsigned long arg4, unsigned long arg5)
+    { _syscall5(157, opt, arg2, arg3, arg4, arg5); }
 
 static inline long getdents64(int fd, void *dirp, size_t count)
     { _syscall3(217, fd, dirp, count); }
@@ -201,6 +220,11 @@ static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
 static inline long statx(int dirfd, const char *pathname, int flags,
                          unsigned int mask, struct statx *statxbuf)
     { _syscall5(332, dirfd, pathname, flags, mask, statxbuf); }
+
+/* The signal return trampoline: the kernel wants SA_RESTORER and this. */
+__attribute__((naked, unused)) static void sig_restorer(void)
+    { asm volatile("mov $15, %rax\n\tsyscall"); }
+#define SIG_RESTORER sig_restorer
 
 #ifdef EXPORT__START
 // prototype for main

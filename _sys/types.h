@@ -17,6 +17,10 @@ struct timespec {
     long tv_sec;   // seconds
     long tv_nsec;  // nanoseconds
 };
+struct timeval {
+    long tv_sec;
+    long tv_usec;
+};
 
 /* Linux statfs(2) result layout.  long deliberately follows the target ABI. */
 struct statfs {

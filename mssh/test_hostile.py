@@ -10,8 +10,8 @@
 # the packets it sends have valid MACs and mssh gets far enough to reach the code
 # under test. Each scenario then does one hostile thing. Needs the Python package
 # `cryptography`. Nothing is installed system-wide; everything lives in a temp dir.
-import base64, os, pty, select, shutil, socket, struct, subprocess, sys, tempfile
-import threading, time
+import base64, fcntl, os, pty, select, shutil, signal, socket, struct, subprocess, sys, tempfile
+import termios, threading, time
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -258,6 +258,10 @@ def sc_idle_session(c, hk):   # a session that is quiet for a while once it is r
     time.sleep(4)
     chan_data(c, ch, b"hello from test server\n"); close_with(c, ch, 7)
 
+def sc_hold_session(c, hk):   # a session that stays up, with nothing to say
+    handshake(c, hk); ch = serve_session(c)
+    time.sleep(30)
+
 def sc_banner_flood(c, hk):   # never sends SSH-2.0: the client must give up, not wait forever
     try:
         c.s.sendall(b"junk line\r\n" * 300000)
@@ -438,6 +442,96 @@ def t_bracketed_host_refused(env):
     rc, out, err = run(mssh_cmd(env, free_port(), extra=("-o", "ProxyCommand=false"), host="root@[a]"), timeout=15)
     return (rc == 1 and "invalid host name" in err), (rc, err.strip()[-120:])
 
+def t_proxy_command(env):
+    """ProxyCommand: the connection is the command's stdin and stdout (fork, socketpair, execve)."""
+    relay = os.path.join(env.dir, "relay.py")
+    open(relay, "w").write(
+        "import os, select, socket, sys\n"
+        "s = socket.create_connection((\"127.0.0.1\", int(sys.argv[1])))\n"
+        "in_open = True\n"
+        "while True:\n"
+        "    rd, _, _ = select.select([s] + ([0] if in_open else []), [], [])\n"
+        "    if 0 in rd:\n"
+        "        b = os.read(0, 65536)\n"
+        "        if not b: in_open = False; s.shutdown(socket.SHUT_WR)\n"
+        "        else: s.sendall(b)\n"
+        "    if s in rd:\n"
+        "        b = s.recv(65536)\n"
+        "        if not b: break\n"
+        "        os.write(1, b)\n")
+    port = free_port(); t = run_server_scenario(env, sc_hello, port); time.sleep(0.2)
+    cmd = mssh_cmd(env, port, extra=("-o", "ProxyCommand=%s %s %%p" % (sys.executable, relay)))
+    rc, out, err = run(cmd, timeout=15)
+    return (rc == 7 and "hello from test server" in out), (rc, err.strip()[-120:])
+
+def pty_start(args):
+    """mssh on a pseudo-terminal of 24 x 80, started as the leader of its session."""
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(MSSH, args)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    return pid, fd
+
+def pty_read(fd, secs):
+    buf = b""; end = time.time() + secs
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if fd in r:
+            try: d = os.read(fd, 4096)
+            except OSError: break
+            if not d: break
+            buf += d
+    return buf
+
+def pty_wait(pid, timeout):
+    """The exit status (-N: killed by signal N) or \"HANG\"."""
+    end = time.time() + timeout
+    while time.time() < end:
+        p, st = os.waitpid(pid, os.WNOHANG)
+        if p: return os.waitstatus_to_exitcode(st)
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
+    return "HANG"
+
+def t_sigwinch_survives(env):
+    """A window size change in a running session is handled (the handler returns through the
+    signal trampoline: on i386 and armhf that needs SA_SIGINFO) and the session goes on."""
+    port = free_port(); t = run_server_scenario(env, sc_idle_session, port); time.sleep(0.2)
+    pid, fd = pty_start(mssh_cmd(env, port, extra=("-t",)))
+    out = pty_read(fd, 1.0)
+    for i in range(5):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30 + i, 100 + i, 0, 0))
+        out += pty_read(fd, 0.1)
+    out += pty_read(fd, 6)
+    rc = pty_wait(pid, 10)
+    return (rc == 7 and b"hello from test server" in out), (rc, out[-100:])
+
+def t_fatal_signal_restores_terminal(env):
+    """SIGTERM, SIGHUP, SIGINT and SIGQUIT end the client by that signal, with the terminal
+    out of raw mode again."""
+    bad = []
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+        port = free_port(); t = run_server_scenario(env, sc_hold_session, port); time.sleep(0.2)
+        pid, fd = pty_start(mssh_cmd(env, port, extra=("-t",)))
+        pty_read(fd, 1.0)
+        raw = not (termios.tcgetattr(fd)[3] & (termios.ICANON | termios.ECHO))
+        os.kill(pid, sig)
+        rc = pty_wait(pid, 5)
+        lflag = termios.tcgetattr(fd)[3]
+        if not (raw and rc == -sig and (lflag & termios.ICANON) and (lflag & termios.ECHO)):
+            bad.append((signal.Signals(sig).name, "raw" if raw else "NOT raw", rc, hex(lflag)))
+        os.close(fd)
+    return not bad, bad
+
+def t_connect_timeout_wraparound(env):
+    """A number that does not fit in a long is out of range, not a small one (long is 32 bits
+    on i386 and armhf: 4294967297 must not come out as 1)."""
+    bad = []
+    for v in ("4294967297", "4294967296", "99999999999", "18446744073709551617"):
+        rc, out, err = run(mssh_cmd(env, free_port(), extra=("-o", "ConnectTimeout=" + v)), timeout=15)
+        if not (rc == 1 and "bad ConnectTimeout" in err): bad.append((v, rc, err.strip()[-60:]))
+    return not bad, bad
+
 def t_malformed_known_hosts_line(env):
     """A malformed line before the right entry is skipped; the right entry is used."""
     kh = os.path.join(env.dir, "kh_malformed_%d" % time.monotonic_ns())
@@ -527,6 +621,10 @@ KEEPALIVE_TESTS = [
 
 CLIENT_TESTS = [
     ("known_hosts unreadable is an error",   t_unreadable_known_hosts),
+    ("ProxyCommand reaches the server",      t_proxy_command),
+    ("window size change is survived",       t_sigwinch_survives),
+    ("fatal signals restore the terminal",   t_fatal_signal_restores_terminal),
+    ("ConnectTimeout does not wrap around",  t_connect_timeout_wraparound),
     ("first use: answer piped, refused",     t_piped_answer_is_refused),
     ("first use: typed yes connects",        t_typed_yes_on_terminal),
     ("first use: typed no refused",          t_typed_no_on_terminal),

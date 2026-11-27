@@ -86,8 +86,14 @@ static inline long lseek(int fd, long offset, int whence)
 static inline long getpid(void)
     { _syscall0(20); }
 
+static inline long kill(int pid, int sig)
+    { _syscall2(37, pid, sig); }
+
 static inline int ioctl(int fd, unsigned long request, void *arg)
     { _syscall3(54, fd, request, arg); }
+
+static inline long fcntl(int fd, int cmd, long arg)
+    { _syscall3(55, fd, cmd, arg); }
 
 static inline int dup2(int oldfd, int newfd)
     { _syscall2(63, oldfd, newfd); }
@@ -133,6 +139,10 @@ static inline long poll(struct pollfd *fds, unsigned long nfds,
                                   int timeout)
     { _syscall3(168, fds, nfds, timeout); }
 
+static inline long prctl(int opt, unsigned long arg2, unsigned long arg3,
+                         unsigned long arg4, unsigned long arg5)
+    { _syscall5(172, opt, arg2, arg3, arg4, arg5); }
+
 static inline long rt_sigaction(int sig, const struct sigaction *act,
                                           struct sigaction *oact, size_t sigsetsize)
     { _syscall4(174, sig, act, oact, sigsetsize); }
@@ -146,6 +156,9 @@ static inline long mmap_raw(void *addr, size_t length, int prot, int flags,
 
 static inline long getuid(void)
     { _syscall0(199); }
+
+static inline long madvise(void *addr, size_t len, int advice)
+    { _syscall3(219, addr, len, advice); }
 
 static inline long getdents64(int fd, void *dirp, size_t count)
     { _syscall3(220, fd, dirp, count); }
@@ -181,9 +194,15 @@ static inline long getrandom(void *buf, size_t buflen, unsigned int flags)
 static inline long socket(int domain, int type, int protocol)
     { _syscall3(359, domain, type, protocol); }
 
+static inline long socketpair(int domain, int type, int protocol, int sv[2])
+    { _syscall4(360, domain, type, protocol, sv); }
+
 static inline long connect(int sockfd,
                            const struct sockaddr *addr, int addrlen)
     { _syscall3(362, sockfd, addr, addrlen); }
+
+static inline long setsockopt(int fd, int level, int name, const void *val, unsigned int len)
+    { _syscall5(366, fd, level, name, val, len); }
 
 static inline long sendto(int sockfd,
                           const void *buf, size_t len, int flags,
@@ -202,6 +221,10 @@ static inline long statx(int dirfd, const char *pathname, int flags,
 #define recv(sockfd, buf, len, flags) recvfrom(sockfd, buf, len, flags, 0, 0)
 
 ////////////// main
+
+__attribute__((naked, unused)) static void sig_restorer(void)
+    { asm volatile("movl $173, %eax\n\tint $0x80"); }
+#define SIG_RESTORER sig_restorer
 
 #ifdef EXPORT__START
 // prototype for main

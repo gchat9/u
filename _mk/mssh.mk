@@ -8,42 +8,38 @@
 #                has mssh.c from there and a tty.c of its own)
 #   EXTRA_OBJS   objects beyond SRCS (xmssh: the xterm layer)
 #
-# The cryptography is _lib/sodium_lite: the few libsodium functions the client
-# calls, in 650 lines (the client is compiled against its sodium.h unchanged).
-# For checking against the real thing:  make SODIUM=system   (libsodium-dev;
-# glibc, as dietlibc cannot link the system libsodium.a).
+# Freestanding, as the small tools are (see common.mk): no C library, no libc
+# headers; _sys/_.h is the system call layer, and the client's own helpers are
+# in _lib/. The cryptography is _lib/sodium_lite: the few libsodium functions
+# the client calls, in 650 lines (the client is compiled against its sodium.h
+# unchanged). It is checked against the real libsodium by _lib/sodium_lite/
+# test.py; the client itself cannot be linked with the system library, which
+# needs a C library.
 
-SODIUM ?= lite
-
-ifeq ($(SODIUM),system)
-CC      := cc
-CFLAGS  = -O2 -Wall -Wextra -MMD -MP
-LDLIBS  = -lsodium
-else
-CC      := diet gcc
-CFLAGS  = -Wall -Wextra -Wno-unused-result -g -O2 -MMD -MP -I../_lib/sodium_lite
-LDFLAGS = -static
-SODIUM_OBJS := sodium_lite.o randombytes.o
+CC      := gcc
+# Size is the point of this project: -Os, one section per function and datum
+# for --gc-sections, and no stack protector or unwind tables (nothing here
+# unwinds), and no frame pointer: the i386 six-argument system calls take ebp,
+# see _arch/i386.h. -Wno-attributes: the naked return trampolines, see _arch/.
+CFLAGS  = -Wall -Wextra -Wno-unused-result -Wno-attributes -g -Os -ffreestanding \
+          -fno-stack-protector -fno-asynchronous-unwind-tables -fomit-frame-pointer \
+          -ffunction-sections -fdata-sections -MMD -MP -I../_lib/sodium_lite
+ifneq ($(shell $(CC) -dM -E - < /dev/null | egrep __arm__),)
+    CFLAGS += -mcpu=cortex-a15 -mthumb
 endif
+LDSCRIPT := ../_sys/cleanup-re+rw.ld
+LDFLAGS  = -static -nostdlib -fno-pic -fno-pie -no-pie \
+           -Wl,-z,max-page-size=0x1000 -Wl,--build-id=none \
+           -Wl,--gc-sections -Wl,-T,$(LDSCRIPT)
 
 .DEFAULT_GOAL := $(TARGET)
 
 vpath %.c ../mssh ../_lib/sodium_lite
 
-OBJS := $(SRCS:.c=.o) $(EXTRA_OBJS) $(SODIUM_OBJS)
-
-ifeq ($(SODIUM),system)
-# A readable message instead of "sodium.h: No such file" (and `make clean`
-# must work without libsodium, so this is only a prerequisite of the build).
-.PHONY: check-sodium
-check-sodium:
-	@echo '#include <sodium.h>' | $(CC) -E -x c - >/dev/null 2>&1 || \
-	    { echo "$(TARGET): libsodium headers not found: install libsodium-dev" >&2; exit 1; }
-$(OBJS): | check-sodium
-endif
+OBJS := $(SRCS:.c=.o) $(EXTRA_OBJS) sodium_lite.o randombytes.o
 
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
 .PHONY: clean
 clean:
