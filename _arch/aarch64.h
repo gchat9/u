@@ -180,6 +180,9 @@ static inline long socket(int domain, int type, int protocol)
 static inline long socketpair(int domain, int type, int protocol, int sv[2])
     { _syscall4(199, domain, type, protocol, sv); }
 
+static inline long bind(int sockfd, const struct sockaddr *addr, int addrlen)
+    { _syscall3(200, sockfd, addr, addrlen); }
+
 static inline long connect(int sockfd, const struct sockaddr *addr, int addrlen)
     { _syscall3(203, sockfd, addr, addrlen); }
 

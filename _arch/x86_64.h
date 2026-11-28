@@ -127,6 +127,9 @@ static inline long connect(int sockfd,
                            const struct sockaddr *addr, int addrlen)
     { _syscall3(42, sockfd, addr, addrlen); }
 
+static inline long bind(int sockfd, const struct sockaddr *addr, int addrlen)
+    { _syscall3(43, sockfd, addr, addrlen); }
+
 static inline long sendto(int sockfd,
                           const void *buf, size_t len, int flags,
                           const struct sockaddr *dest_addr, int addrlen)

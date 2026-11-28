@@ -177,6 +177,9 @@ static inline long clock_gettime(int clk_id, struct timespec *tp)
 static inline long socket(int domain, int type, int protocol)
     { _syscall3(281, domain, type, protocol); }
 
+static inline long bind(int sockfd, const struct sockaddr *addr, int addrlen)
+    { _syscall3(282, sockfd, addr, addrlen); }
+
 static inline long connect(int sockfd, const struct sockaddr *addr, int addrlen)
     { _syscall3(283, sockfd, addr, addrlen); }
 
